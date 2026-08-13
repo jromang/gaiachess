@@ -2,7 +2,7 @@
 
 A free and strong UCI chess engine written in Rust.
 
-> See also: [gaiachess.fr](http://gaiachess.free.fr/) — the original Gaia website
+> See also: [gaiachess.free.fr](http://gaiachess.free.fr/) — the original Gaia website
 
 **Gaia 4** is a complete rewrite from C to Rust — not a single line of the original code survived. Back after 20 years.
 
