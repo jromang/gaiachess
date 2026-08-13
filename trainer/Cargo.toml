@@ -1,0 +1,14 @@
+[package]
+name = "gaiachess-trainer5"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "train5"
+path = "src/main.rs"
+
+[dependencies]
+bullet_lib = { git = "https://github.com/jw1912/bullet", rev = "dad475f06eb63b17fa6e6e275a77b6a97593fd24" }
+bulletformat = "1.8.0"
+sfbinpack = "0.6.0"
+rand = "0.9"

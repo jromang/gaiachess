@@ -1,0 +1,301 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # ================================================================
+  # Job 0: Create GitHub release (empty, other jobs upload binaries)
+  # ================================================================
+  create-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Create GitHub Release
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
+
+          gh release create "$TAG" \
+            --title "GaiaChess $VERSION" \
+            --notes "$(cat <<'NOTES'
+          ## Download
+
+          Pick the binary matching your CPU. **Windows** binaries end in `.exe`, **Linux** and **macOS** have no extension.
+
+          ### Which binary should I use?
+
+          | CPU | Recommended binary |
+          |-----|-------------------|
+          | **AMD Ryzen 9000** (Zen 5) | `znver5` or `avx512vnni` |
+          | **AMD Ryzen 7000** (Zen 4) | `znver4` or `avx512` |
+          | **AMD Ryzen 5000** (Zen 3) | `znver3` or `bmi2` |
+          | **AMD Ryzen 1000–3000** (Zen 1/2) | `avx2` |
+          | **Intel 12th gen+** (Alder Lake+) | `avx512vnni` |
+          | **Intel 10th–11th gen** | `avx512` or `bmi2` |
+          | **Intel Haswell–Coffee Lake** | `bmi2` |
+          | **Apple M1/M2/M3/M4** | `apple-silicon` |
+          | **Linux ARM64** (RPi 4+, Graviton) | `neon` |
+          | **Older CPUs** (pre-2013) | `sse4-popcnt`, `ssse3`, or `x86-64` |
+
+          When in doubt, use **`bmi2`** (x86) or **`neon`** (ARM).
+
+          ### Binary details
+
+          | Suffix | SIMD | Eval | Target CPUs |
+          |--------|------|------|-------------|
+          | `x86-64` | — | PeSTO | Any x86-64 CPU (2003+) |
+          | `ssse3` | SSSE3 | PeSTO | Core 2+ (2006+) |
+          | `sse4-popcnt` | SSE4 + POPCNT | PeSTO | Nehalem+ (2008+) |
+          | `avx2` | AVX2 | NNUE | Haswell+, Zen 1/2 (no fast PEXT) |
+          | `bmi2` | AVX2 + PEXT | NNUE | Haswell+, Zen 3+ |
+          | `avx512` | AVX-512 | NNUE | Skylake-X, Zen 4 |
+          | `avx512vnni` | AVX-512 + VNNI | NNUE | Ice Lake+, Zen 5 |
+          | `znver3` | AVX2 + PEXT | NNUE | AMD Ryzen 5000 (tuned) |
+          | `znver4` | AVX-512 | NNUE | AMD Ryzen 7000 (tuned) |
+          | `znver5` | AVX-512 + VNNI | NNUE | AMD Ryzen 9000 (tuned) |
+          | `neon` | NEON | NNUE | ARM64 Linux |
+          | `apple-silicon` | NEON | NNUE | macOS Apple Silicon |
+
+          All x86-64 binaries are compiled with **PGO** (Profile-Guided Optimization) for maximum performance.
+          The AVX-512 variants are profiled under Intel SDE, since no CI runner is guaranteed to support AVX-512.
+          NNUE binaries embed the neural network — no external file needed.
+          PeSTO binaries (x86-64, ssse3, sse4-popcnt) use a classical evaluation for older hardware.
+          NOTES
+          )"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ================================================================
+  # Job 1: Linux x86-64 (10 variants, PGO)
+  # ================================================================
+  linux-x86:
+    needs: create-release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang
+
+      # PGO has to RUN the instrumented binary to collect profiles, and GitHub
+      # cannot guarantee an AVX-512 runner (actions/runner-images#3389). The pool
+      # is a per-job lottery — EPYC 7763 has no AVX-512, EPYC 9V74 has it masked
+      # out of CPUID by Azure — so without emulation the AVX-512 binaries ship
+      # with or without PGO at random. Intel SDE removes the lottery (standard
+      # practice for AVX-512 CI). Pinned to a SHA: third-party action, release path.
+      - name: Setup Intel SDE
+        uses: petarpetrovt/setup-sde@6d2773bc0ef3005fd52e0ae0bb91782321793aec # v6.0
+        with:
+          environmentVariableName: SDE_PATH
+          sdeVersion: 10.13.1
+
+      - name: Download net
+        run: |
+          NET=$(grep '^DEFAULT_NET=' defaults.conf | head -1 | sed 's/DEFAULT_NET=//;s/"//g')
+          echo "net=$NET" >> "$GITHUB_ENV"
+          mkdir -p $(dirname "$NET")
+          curl --fail --retry 3 -L -o "$NET" "https://huggingface.co/jromanghf/gaiachess-networks/resolve/main/$(basename $NET)"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build all x86-64 variants (PGO)
+        run: |
+          export OUTPUT_DIR="$GITHUB_WORKSPACE/output"
+          ./tools/pgo/build-release.sh --linux-only
+        env:
+          # Fail the build rather than silently publish a non-PGO AVX-512 binary.
+          PGO_SDE: require
+
+      - name: Upload binaries to release
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          echo "=== Uploading Linux x86-64 binaries ==="
+          ls -lh output/
+          gh release upload "$TAG" output/gaiachess-linux-* --clobber
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ================================================================
+  # Job 2: Windows x86-64 (NATIVE build on a Windows runner, PGO)
+  # ================================================================
+  # This job used to cross-compile from Linux, profiling a native Linux build
+  # and feeding those profiles to the Windows binary. That never worked: Rust
+  # mangled names embed a crate hash derived from -C metadata, which includes
+  # the target triple, so the profiles matched nothing and -Cprofile-use was a
+  # silent no-op. (Measured: same 86 function paths on both sides, zero overlap
+  # — gaiachess::see::see is ..17hb1bdbe35..E on Linux, ..17hb7dc437a..E on
+  # Windows.) The assumption holds in C++ (where cross-profiling is common),
+  # but not in Rust. Windows must profile itself.
+  windows-x86:
+    needs: create-release
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          # MSVC, not mingw: -Cprofile-generate needs the profiler_builtins
+          # crate, and the x86_64-pc-windows-gnu rust-std does not ship it
+          # ("can't find crate for `profiler_builtins`"), so the gnu target
+          # cannot be PGO-built at all. build-common.sh adds +crt-static so the
+          # .exe stays self-contained, with no VC++ redistributable to install.
+          components: llvm-tools-preview
+
+      - name: Add clang to PATH
+        run: |
+          # build.rs compiles src/pyrrhic/tbprobe.c with clang.
+          echo "C:\Program Files\LLVM\bin" >> "$GITHUB_PATH"
+
+      - name: Setup Intel SDE
+        uses: petarpetrovt/setup-sde@6d2773bc0ef3005fd52e0ae0bb91782321793aec # v6.0
+        with:
+          environmentVariableName: SDE_PATH
+          sdeVersion: 10.13.1
+
+      - name: Verify toolchain
+        run: |
+          gcc --version | head -1
+          clang --version | head -1
+          rustc -vV | sed -n 's/^host: /rustc host: /p'
+          ls "$SDE_PATH"
+
+      - name: Download net
+        run: |
+          NET=$(grep '^DEFAULT_NET=' defaults.conf | head -1 | sed 's/DEFAULT_NET=//;s/"//g')
+          echo "net=$NET" >> "$GITHUB_ENV"
+          mkdir -p $(dirname "$NET")
+          curl --fail --retry 3 -L -o "$NET" "https://huggingface.co/jromanghf/gaiachess-networks/resolve/main/$(basename $NET)"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build all x86-64 variants for Windows (native PGO)
+        run: |
+          export OUTPUT_DIR="$GITHUB_WORKSPACE/output"
+          # Keep the profile directory free of spaces: the flags are joined with
+          # spaces into CARGO_TARGET_<TRIPLE>_RUSTFLAGS, which cargo re-splits.
+          export PGO_DIR="$GITHUB_WORKSPACE/pgo-data"
+          ./tools/pgo/build-release.sh --windows-only
+        env:
+          # Fail the build rather than silently publish a non-PGO AVX-512 binary.
+          PGO_SDE: require
+
+      - name: Upload binaries to release
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          echo "=== Uploading Windows x86-64 binaries ==="
+          ls -lh output/
+          gh release upload "$TAG" output/gaiachess-windows-*.exe --clobber
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ================================================================
+  # Job 3: Linux ARM64 (cross-compile, no PGO)
+  # ================================================================
+  linux-arm:
+    needs: create-release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-gnu
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang gcc-aarch64-linux-gnu
+
+      - name: Download net
+        run: |
+          NET=$(grep '^DEFAULT_NET=' defaults.conf | head -1 | sed 's/DEFAULT_NET=//;s/"//g')
+          echo "net=$NET" >> "$GITHUB_ENV"
+          mkdir -p $(dirname "$NET")
+          curl --fail --retry 3 -L -o "$NET" "https://huggingface.co/jromanghf/gaiachess-networks/resolve/main/$(basename $NET)"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build ARM64 (no PGO)
+        run: |
+          export OUTPUT_DIR="$GITHUB_WORKSPACE/output"
+          ./tools/pgo/build-release-arm.sh
+
+      - name: Upload binary to release
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          echo "=== Uploading Linux ARM64 binary ==="
+          ls -lh output/
+          gh release upload "$TAG" output/gaiachess-linux-neon --clobber
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ================================================================
+  # Job 4: macOS Apple Silicon (native build, no PGO)
+  # ================================================================
+  macos-arm:
+    needs: create-release
+    runs-on: macos-14
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Download net
+        run: |
+          NET=$(grep '^DEFAULT_NET=' defaults.conf | head -1 | sed 's/DEFAULT_NET=//;s/"//g')
+          echo "net=$NET" >> "$GITHUB_ENV"
+          mkdir -p $(dirname "$NET")
+          curl --fail --retry 3 -L -o "$NET" "https://huggingface.co/jromanghf/gaiachess-networks/resolve/main/$(basename $NET)"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build macOS Apple Silicon (no PGO)
+        run: |
+          NET="${{ env.net }}"
+          FEATURES="nnue,syzygy,nalimov,gaiatb,online-tb"
+
+          # PGO disabled on macOS: build.rs SIGSEGV under PGO instrumentation
+          MODEL="$NET" RUSTFLAGS="-C target-cpu=apple-m1" \
+            cargo build --release --features "$FEATURES"
+
+          mkdir -p output
+          cp target/release/gaiachess output/gaiachess-macos-apple-silicon
+
+      - name: Upload binary to release
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          echo "=== Uploading macOS Apple Silicon binary ==="
+          ls -lh output/
+          gh release upload "$TAG" output/gaiachess-macos-apple-silicon --clobber
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
