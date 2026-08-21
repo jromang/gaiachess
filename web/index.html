@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no" />
+    <title>GaiaChess</title>
+    <meta name="author" content="Jean-François Romang" />
+    <!-- GaiaChess — © 2003-2026 Jean-François Romang. Free software under the GNU
+         General Public Licence, version 3 or later; it comes with no warranty. The
+         source is at https://github.com/jromang/gaiachess — read it, change it, pass it
+         on under the same terms. gl.js is miniquad's and keeps its own MIT terms; see
+         LICENSE-miniquad-MIT beside this file. -->
+    <!-- Both sizes named, and on purpose: a browser shows the favicon at 16 in a tab
+         and at 32 in a bookmark bar, and left to choose it would shrink the big one
+         rather than use the small one. Shrinking this artwork does not work — see
+         tools/gui_assets/make_icon.py. -->
+    <link rel="icon" type="image/png" sizes="16x16" href="favicon16.png" />
+    <link rel="icon" type="image/png" sizes="32x32" href="favicon32.png" />
+    <style>
+      /* The board is 176x210 pixels of artwork. The canvas is given whatever the frame
+         allows and the module letterboxes inside it, snapping to a whole multiple so
+         every artwork pixel stays the same size. Embedded on itch at 528x630 there is
+         nothing to snap: that is exactly three times the artwork. */
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        background: #000;
+        overflow: hidden;
+      }
+      canvas {
+        display: block;
+        width: 100%;
+        height: 100%;
+        /* Keeps the browser from smoothing the upscale, which would undo the point of
+           drawing pixel art in the first place. */
+        image-rendering: pixelated;
+        /* The interface draws its own hand where the pointer is. */
+        cursor: none;
+        touch-action: none;
+      }
+      #status {
+        position: fixed;
+        left: 0;
+        right: 0;
+        bottom: 1.2rem;
+        text-align: center;
+        font: 14px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace;
+        color: #c8c8c8;
+        text-shadow: 0 1px 2px #000;
+        pointer-events: none;
+      }
+      #status.failed {
+        color: #ff8080;
+      }
+    </style>
+  </head>
+  <body>
+    <canvas id="glcanvas" tabindex="1"></canvas>
+    <div id="status"></div>
+
+    <!-- miniquad's own loader, vendored: it is not published anywhere fetchable and its
+         version is checked against the module at load time. See gl.js.README. -->
+    <script src="gl.js"></script>
+    <script src="host.js"></script>
+  </body>
+</html>

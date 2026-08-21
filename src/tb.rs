@@ -335,8 +335,12 @@ fn probe_root_wdl(pos: &Position) -> Option<Vec<(Move, i32, i32)>> {
 ///
 /// `dtz_available = true` → cardinality should be 0 (no in-tree probing needed).
 /// `dtz_available = false` → WDL only, may need in-tree probing.
+/// Each root move with its rank and score, and whether DTZ produced the ranking.
 #[cfg(feature = "syzygy")]
-pub fn rank_root_moves(pos: &Position) -> Option<(Vec<(Move, i32, i32)>, bool)> {
+pub type RootRanking = (Vec<(Move, i32, i32)>, bool);
+
+#[cfg(feature = "syzygy")]
+pub fn rank_root_moves(pos: &Position) -> Option<RootRanking> {
     if pos.occupied().count_ones() > max_pieces() || pos.castling_rights != 0 {
         return None;
     }

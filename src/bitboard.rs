@@ -357,7 +357,8 @@ fn magic_rook_attacks(sq: Square, occupied: u64) -> u64 {
 // PEXT attack tables (BMI2) — ~840 KB heap, initialized once at startup
 // ============================================================
 
-#[cfg(target_feature = "bmi2")]
+#[cfg(target_arch = "x86_64")]
+#[allow(dead_code)] // read by the static-BMI2 arm or the gaia_dist runtime election
 mod pext {
     #![allow(unsafe_op_in_unsafe_fn)]
 
@@ -470,11 +471,29 @@ mod pext {
         TABLES.get_or_init(init);
     }
 
+    /// The tables are read without checking they exist, which is what keeps these two
+    /// functions branchless and is worth a noticeable slice of the node rate. The
+    /// engine earns that by building them in `main` before anything can search.
+    ///
+    /// A unit-test binary has no `main` of ours, so nothing would build them and the
+    /// first slider attack in a test would read an unbuilt table. Test builds therefore
+    /// build them on demand; the shipped engine keeps the branchless read.
+    #[inline(always)]
+    fn tables() -> &'static PextTables {
+        #[cfg(test)]
+        return TABLES.get_or_init(init);
+        #[cfg(not(test))]
+        unsafe {
+            debug_assert!(TABLES.get().is_some(), "slider tables read before init_pext");
+            TABLES.get().unwrap_unchecked()
+        }
+    }
+
     #[target_feature(enable = "bmi2")]
     #[inline]
     pub unsafe fn rook_attacks(sq: Square, occupied: u64) -> u64 {
         use std::arch::x86_64::_pext_u64;
-        let tables = TABLES.get().unwrap_unchecked();
+        let tables = tables();
         let entry = tables.rook.get_unchecked(sq.index());
         let idx = _pext_u64(occupied, entry.mask) as usize + entry.offset as usize;
         *tables.attacks.get_unchecked(idx)
@@ -484,44 +503,90 @@ mod pext {
     #[inline]
     pub unsafe fn bishop_attacks(sq: Square, occupied: u64) -> u64 {
         use std::arch::x86_64::_pext_u64;
-        let tables = TABLES.get().unwrap_unchecked();
+        let tables = tables();
         let entry = tables.bishop.get_unchecked(sq.index());
         let idx = _pext_u64(occupied, entry.mask) as usize + entry.offset as usize;
         *tables.attacks.get_unchecked(idx)
     }
 }
 
-#[cfg(target_feature = "bmi2")]
+/// Build the PEXT tables (idempotent). `soft_pext` does the enumeration, so
+/// this works — and is only called — when the *running* CPU was elected for
+/// PEXT, whatever the build target.
+#[cfg(target_arch = "x86_64")]
 pub fn init_pext() { pext::ensure_init(); }
 
+/// Whether slider attacks go through hardware PEXT — decided once at startup
+/// by `cpu::init` (BMI2 present, and not an AMD generation that microcodes
+/// PDEP/PEXT), then read as a plain load on a never-rewritten line. Defaults
+/// to false so binaries that skipped init (unit tests) stay correct on the
+/// portable path: every attack kind returns identical bitboards.
+///
+/// Only distribution builds (`--cfg gaia_dist`) take this runtime branch: the
+/// check costs a measurable slice of the node rate in the attack getters, and
+/// a build made for one machine can pin the answer at compile time instead.
+#[cfg(all(target_arch = "x86_64", gaia_dist))]
+static USE_PEXT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Elect (or retire) the PEXT path. Build the tables BEFORE electing: the
+/// branchless `tables()` read in the attack getters relies on it.
+#[cfg(all(target_arch = "x86_64", gaia_dist))]
+pub fn set_use_pext(enabled: bool) {
+    if enabled {
+        init_pext();
+    }
+    USE_PEXT.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(all(target_arch = "x86_64", gaia_dist))]
+#[inline(always)]
+fn use_pext() -> bool {
+    USE_PEXT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Bishop attacks: PEXT (BMI2) > AVX2 BLSMSK > magic bitboards.
+/// Distribution builds elect PEXT at runtime; others pin it at compile time.
 #[inline(always)]
 pub fn bishop_attacks(sq: Square, occupied: u64) -> u64 {
-    #[cfg(target_feature = "bmi2")]
+    #[cfg(all(target_arch = "x86_64", gaia_dist))]
+    if use_pext() {
+        return unsafe { pext::bishop_attacks(sq, occupied) };
+    }
+    #[cfg(all(target_feature = "bmi2", not(gaia_dist)))]
     return unsafe { pext::bishop_attacks(sq, occupied) };
-    #[cfg(all(target_feature = "avx2", not(target_feature = "bmi2")))]
+    #[cfg(all(target_feature = "avx2", any(not(target_feature = "bmi2"), gaia_dist)))]
     return crate::simd_attacks::bishop_attacks(sq, occupied);
     #[cfg(not(target_feature = "avx2"))]
     magic_bishop_attacks(sq, occupied)
 }
 
 /// Rook attacks: PEXT (BMI2) > AVX2 BLSMSK > magic bitboards.
+/// Distribution builds elect PEXT at runtime; others pin it at compile time.
 #[inline(always)]
 pub fn rook_attacks(sq: Square, occupied: u64) -> u64 {
-    #[cfg(target_feature = "bmi2")]
+    #[cfg(all(target_arch = "x86_64", gaia_dist))]
+    if use_pext() {
+        return unsafe { pext::rook_attacks(sq, occupied) };
+    }
+    #[cfg(all(target_feature = "bmi2", not(gaia_dist)))]
     return unsafe { pext::rook_attacks(sq, occupied) };
-    #[cfg(all(target_feature = "avx2", not(target_feature = "bmi2")))]
+    #[cfg(all(target_feature = "avx2", any(not(target_feature = "bmi2"), gaia_dist)))]
     return crate::simd_attacks::rook_attacks(sq, occupied);
     #[cfg(not(target_feature = "avx2"))]
     magic_rook_attacks(sq, occupied)
 }
 
 /// Queen attacks (bishop | rook): PEXT > AVX2 BLSMSK > magic.
+/// Distribution builds elect PEXT at runtime; others pin it at compile time.
 #[inline(always)]
 pub fn queen_attacks(sq: Square, occupied: u64) -> u64 {
-    #[cfg(target_feature = "bmi2")]
+    #[cfg(all(target_arch = "x86_64", gaia_dist))]
+    if use_pext() {
+        return unsafe { pext::bishop_attacks(sq, occupied) | pext::rook_attacks(sq, occupied) };
+    }
+    #[cfg(all(target_feature = "bmi2", not(gaia_dist)))]
     return unsafe { pext::bishop_attacks(sq, occupied) | pext::rook_attacks(sq, occupied) };
-    #[cfg(all(target_feature = "avx2", not(target_feature = "bmi2")))]
+    #[cfg(all(target_feature = "avx2", any(not(target_feature = "bmi2"), gaia_dist)))]
     return crate::simd_attacks::queen_attacks(sq, occupied);
     #[cfg(not(target_feature = "avx2"))]
     { magic_bishop_attacks(sq, occupied) | magic_rook_attacks(sq, occupied) }

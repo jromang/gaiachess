@@ -127,6 +127,11 @@ pub struct MovePicker {
     bad_cap_index: usize,
     /// Search depth (used for quiet sort threshold).
     depth: i32,
+    /// When armed (LMP/FP/HP triggered), quiet stages are skipped entirely:
+    /// killers, countermove and quiets are never yielded, jumping straight
+    /// to bad captures. Skipped quiets thus never inflate the caller's
+    /// move count.
+    skip_quiets: bool,
 }
 
 impl MovePicker {
@@ -143,7 +148,14 @@ impl MovePicker {
             index: 0,
             bad_cap_index: MAX_MOVES,
             depth,
+            skip_quiets: false,
         }
+    }
+
+    /// Arm quiet skipping: all remaining quiet stages (killers, countermove,
+    /// generation, quiets) are bypassed, only bad captures are still yielded.
+    pub fn skip_quiet_moves(&mut self) {
+        self.skip_quiets = true;
     }
 
     /// Create a move picker for quiescence search (captures only).
@@ -159,6 +171,7 @@ impl MovePicker {
             index: 0,
             bad_cap_index: MAX_MOVES,
             depth: 0,
+            skip_quiets: false,
         }
     }
 
@@ -167,6 +180,9 @@ impl MovePicker {
     ///
     /// `QSEARCH`: const generic — when true, the compiler eliminates all quiet/killer/bad-capture
     /// stages, generating a specialized qsearch version with no dead code.
+    /// The history tables are borrowed individually rather than through the thread
+    /// data, so the move picker can be driven from a test with tables of its own.
+    #[allow(clippy::too_many_arguments)]
     pub fn next<const QSEARCH: bool>(
         &mut self,
         pos: &Position,
@@ -179,6 +195,20 @@ impl MovePicker {
         stm: Color,
     ) -> Move {
         loop {
+            // Quiet skipping armed: bypass every quiet-yielding stage
+            if !QSEARCH
+                && self.skip_quiets
+                && matches!(
+                    self.stage,
+                    Stage::Killer1
+                        | Stage::Killer2
+                        | Stage::Countermove
+                        | Stage::GenerateQuiets
+                        | Stage::Quiets
+                )
+            {
+                self.stage = Stage::BadCaptures;
+            }
             match self.stage {
                 Stage::TTMove => {
                     self.stage = Stage::GenerateCaptures;

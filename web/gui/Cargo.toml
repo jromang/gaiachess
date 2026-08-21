@@ -1,0 +1,9 @@
+[package]
+name = "gaia-web-gui"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+macroquad = "0.4"
+gaiachess = { path = "../..", default-features = false, features = ["nnue", "gui-core"] }

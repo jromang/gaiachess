@@ -118,26 +118,18 @@ pub unsafe fn add_i32(a: __m512i, b: __m512i) -> __m512i {
 
 /// Dot product of unsigned bytes × signed bytes, accumulated into i32.
 ///
-/// Uses native VNNI `vpdpbusd` when available (1 instruction),
-/// otherwise emulates with maddubs+madd+add (3 instructions).
+/// Emulates VNNI `dpbusd` with maddubs+madd+add (3 instructions); the
+/// `avx512vnni` backend shadows this with the native single instruction.
 #[inline(always)]
 pub unsafe fn dpbusd(acc: __m512i, u8s: __m512i, i8s: __m512i) -> __m512i {
-    #[cfg(target_feature = "avx512vnni")]
-    {
-        _mm512_dpbusd_epi32(acc, u8s, i8s)
-    }
-    #[cfg(not(target_feature = "avx512vnni"))]
-    {
-        let pairwise = _mm512_maddubs_epi16(u8s, i8s);
-        let widened = _mm512_madd_epi16(pairwise, _mm512_set1_epi16(1));
-        _mm512_add_epi32(acc, widened)
-    }
+    let pairwise = _mm512_maddubs_epi16(u8s, i8s);
+    let widened = _mm512_madd_epi16(pairwise, _mm512_set1_epi16(1));
+    _mm512_add_epi32(acc, widened)
 }
 
 /// Double dpbusd: process two pairs in one call.
 ///
-/// With VNNI: two chained native `vpdpbusd` instructions.
-/// Without: combine pairwise products before widening (saves one madd).
+/// Combines pairwise products before widening (saves one madd).
 #[inline(always)]
 pub unsafe fn double_dpbusd(
     acc: __m512i,
@@ -146,17 +138,10 @@ pub unsafe fn double_dpbusd(
     u8s2: __m512i,
     i8s2: __m512i,
 ) -> __m512i {
-    #[cfg(target_feature = "avx512vnni")]
-    {
-        _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(acc, u8s1, i8s1), u8s2, i8s2)
-    }
-    #[cfg(not(target_feature = "avx512vnni"))]
-    {
-        let pw1 = _mm512_maddubs_epi16(u8s1, i8s1);
-        let pw2 = _mm512_maddubs_epi16(u8s2, i8s2);
-        let widened = _mm512_madd_epi16(_mm512_add_epi16(pw1, pw2), _mm512_set1_epi16(1));
-        _mm512_add_epi32(acc, widened)
-    }
+    let pw1 = _mm512_maddubs_epi16(u8s1, i8s1);
+    let pw2 = _mm512_maddubs_epi16(u8s2, i8s2);
+    let widened = _mm512_madd_epi16(_mm512_add_epi16(pw1, pw2), _mm512_set1_epi16(1));
+    _mm512_add_epi32(acc, widened)
 }
 
 /// Extract bitmask of non-zero i32 lanes (16 bits, one per lane).

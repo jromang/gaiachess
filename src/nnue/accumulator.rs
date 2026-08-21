@@ -1,3 +1,7 @@
+// Hand-vectorised code: the loop index is the point. It walks several arrays in
+// lockstep, steps by a SIMD lane count, and feeds raw pointer arithmetic — an
+// iterator would hide the arithmetic these kernels exist to control.
+#![allow(clippy::needless_range_loop)]
 //! NNUE accumulator: dual-perspective i16 vector with incremental updates.
 //!
 //! **PST Accumulator** (`Accumulator`): HalfKA piece-square features (i16 weights).
@@ -16,8 +20,8 @@ use crate::position::Position;
 use crate::types::*;
 
 use super::features;
+use super::kernels::dispatch;
 use super::network::{self, Aligned};
-use super::simd;
 use super::{INPUT_BUCKETS, L1_SIZE};
 
 // ============================================================
@@ -167,13 +171,13 @@ impl Accumulator {
     /// Recompute the accumulator for `perspective` from scratch using the current position.
     ///
     /// Starts from the FT bias and adds weight columns for every piece on the board.
-    /// Uses SIMD register blocking: loads bias into SIMD regs, adds all features, stores once.
+    /// Reference implementation for tests: plain element-wise loops, no kernel involved,
+    /// so it is one of the two sides every incremental-vs-refresh comparison stands on.
     #[allow(dead_code)] // Used in tests only
     pub fn refresh(&mut self, pos: &Position, perspective: Color) {
         let pov = perspective.index();
         let king_sq = pos.king_sq(perspective);
-        let acc = self.values.0[pov].as_mut_ptr();
-        let bias = network::params().ft_biases.0.as_ptr();
+        let params = network::params();
 
         // Collect all active feature indices first
         let mut feat_indices = [0usize; 32];
@@ -199,15 +203,12 @@ impl Accumulator {
             }
         }
 
-        // SIMD register blocking: process I16_LANES elements per iteration
-        for i in (0..L1_SIZE).step_by(simd::I16_LANES) {
-            unsafe {
-                let mut v = *bias.add(i).cast();
-                for f in 0..n_features {
-                    let w = network::params().ft_pst_weights.0[feat_indices[f]].as_ptr();
-                    v = simd::add_i16(v, *w.add(i).cast());
-                }
-                *acc.add(i).cast() = v;
+        let acc = &mut self.values.0[pov];
+        *acc = params.ft_biases.0;
+        for f in 0..n_features {
+            let w = &params.ft_pst_weights.0[feat_indices[f]];
+            for i in 0..L1_SIZE {
+                acc[i] = acc[i].wrapping_add(w[i]);
             }
         }
 
@@ -305,7 +306,7 @@ impl Accumulator {
     }
 
     // ============================================================
-    // SIMD apply functions — step_by(I16_LANES) with pointer casts
+    // Kernel entry points — the loops live in `nnue::kernels`
     // ============================================================
 
     /// Normal move: one feature added, one removed.
@@ -313,16 +314,7 @@ impl Accumulator {
     fn apply_add1_sub1(&mut self, prev: &Accumulator, pov: usize, add1: usize, sub1: usize) {
         let vacc = self.values.0[pov].as_mut_ptr();
         let vprev = prev.values.0[pov].as_ptr();
-        let vadd = network::params().ft_pst_weights.0[add1].as_ptr();
-        let vsub = network::params().ft_pst_weights.0[sub1].as_ptr();
-        for i in (0..L1_SIZE).step_by(simd::I16_LANES) {
-            unsafe {
-                let mut v = *vprev.add(i).cast();
-                v = simd::add_i16(v, *vadd.add(i).cast());
-                v = simd::sub_i16(v, *vsub.add(i).cast());
-                *vacc.add(i).cast() = v;
-            }
-        }
+        unsafe { dispatch::acc_add1_sub1(vprev, vacc, add1, sub1) };
     }
 
     /// Capture / EP: one feature added, two removed.
@@ -333,18 +325,7 @@ impl Accumulator {
     ) {
         let vacc = self.values.0[pov].as_mut_ptr();
         let vprev = prev.values.0[pov].as_ptr();
-        let vadd = network::params().ft_pst_weights.0[add1].as_ptr();
-        let vsub1 = network::params().ft_pst_weights.0[sub1].as_ptr();
-        let vsub2 = network::params().ft_pst_weights.0[sub2].as_ptr();
-        for i in (0..L1_SIZE).step_by(simd::I16_LANES) {
-            unsafe {
-                let mut v = *vprev.add(i).cast();
-                v = simd::add_i16(v, *vadd.add(i).cast());
-                v = simd::sub_i16(v, *vsub1.add(i).cast());
-                v = simd::sub_i16(v, *vsub2.add(i).cast());
-                *vacc.add(i).cast() = v;
-            }
-        }
+        unsafe { dispatch::acc_add1_sub2(vprev, vacc, add1, sub1, sub2) };
     }
 
     /// Castling: two features added, two removed.
@@ -355,20 +336,7 @@ impl Accumulator {
     ) {
         let vacc = self.values.0[pov].as_mut_ptr();
         let vprev = prev.values.0[pov].as_ptr();
-        let vadd1 = network::params().ft_pst_weights.0[add1].as_ptr();
-        let vadd2 = network::params().ft_pst_weights.0[add2].as_ptr();
-        let vsub1 = network::params().ft_pst_weights.0[sub1].as_ptr();
-        let vsub2 = network::params().ft_pst_weights.0[sub2].as_ptr();
-        for i in (0..L1_SIZE).step_by(simd::I16_LANES) {
-            unsafe {
-                let mut v = *vprev.add(i).cast();
-                v = simd::add_i16(v, *vadd1.add(i).cast());
-                v = simd::add_i16(v, *vadd2.add(i).cast());
-                v = simd::sub_i16(v, *vsub1.add(i).cast());
-                v = simd::sub_i16(v, *vsub2.add(i).cast());
-                *vacc.add(i).cast() = v;
-            }
-        }
+        unsafe { dispatch::acc_add2_sub2(vprev, vacc, add1, add2, sub1, sub2) };
     }
 
     // ============================================================
@@ -437,7 +405,7 @@ impl Accumulator {
         }
 
         // Apply delta with SIMD register blocking
-        unsafe { apply_changes(entry, &adds[..n_adds], &subs[..n_subs]) };
+        unsafe { dispatch::finny_apply(entry.values.0.as_mut_ptr(), &adds[..n_adds], &subs[..n_subs]) };
 
         // Update cache bitboards
         entry.pieces = pos.pieces;
@@ -445,57 +413,6 @@ impl Accumulator {
         // Copy cached values to current accumulator
         self.values.0[pov] = entry.values.0;
         self.accurate[pov] = true;
-    }
-}
-
-// ============================================================
-// Finny table SIMD apply — register-blocked batched add/sub
-// ============================================================
-
-/// Number of SIMD registers to hold in flight during apply_changes.
-/// Must divide L1_SIZE / I16_LANES for all SIMD widths (1, 8, 16, 32).
-/// With L1_SIZE=640: 640 % (4*32) = 0 ✓
-const FINNY_REGISTERS: usize = 4;
-const _: () = assert!(L1_SIZE % (FINNY_REGISTERS * simd::I16_LANES) == 0);
-
-/// Apply batched feature additions and subtractions to a Finny cache entry.
-///
-/// Uses register blocking: loads FINNY_REGISTERS SIMD vectors, applies all
-/// adds/subs, then stores back. This minimizes memory round-trips.
-/// Minimizes memory round-trips via register blocking.
-unsafe fn apply_changes(entry: &mut FinnyEntry, adds: &[usize], subs: &[usize]) {
-    unsafe {
-        let mut regs: [_; FINNY_REGISTERS] = std::mem::zeroed();
-
-        for offset in (0..L1_SIZE).step_by(FINNY_REGISTERS * simd::I16_LANES) {
-            let out = entry.values.0.as_mut_ptr().add(offset);
-
-            // Load current values into registers
-            for (i, r) in regs.iter_mut().enumerate() {
-                *r = *out.add(i * simd::I16_LANES).cast();
-            }
-
-            // Apply all additions
-            for &idx in adds {
-                let w = network::params().ft_pst_weights.0[idx].as_ptr().add(offset);
-                for (i, r) in regs.iter_mut().enumerate() {
-                    *r = simd::add_i16(*r, *w.add(i * simd::I16_LANES).cast());
-                }
-            }
-
-            // Apply all subtractions
-            for &idx in subs {
-                let w = network::params().ft_pst_weights.0[idx].as_ptr().add(offset);
-                for (i, r) in regs.iter_mut().enumerate() {
-                    *r = simd::sub_i16(*r, *w.add(i * simd::I16_LANES).cast());
-                }
-            }
-
-            // Store back
-            for (i, r) in regs.into_iter().enumerate() {
-                *out.add(i * simd::I16_LANES).cast() = r;
-            }
-        }
     }
 }
 

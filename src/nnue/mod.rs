@@ -28,7 +28,8 @@
 
 pub mod accumulator;
 pub mod features;
-mod forward;
+pub(crate) mod forward;
+pub(crate) mod kernels;
 pub mod network;
 pub mod simd;
 pub mod threats;
@@ -297,12 +298,7 @@ impl Network {
 
         // Use threat accumulator (incrementally updated or full recomputed)
         let threats = &self.threat_acc[self.index].values;
-        let ft_out = forward::activate_ft(acc, threats, stm);
-
-        let (nnz_indices, nnz_count) = forward::find_nnz(&ft_out);
-        let l1_out = forward::propagate_l1(&ft_out, &nnz_indices[..nnz_count], bucket);
-        let l2_out = forward::propagate_l2(&l1_out, bucket);
-        let l3_out = forward::propagate_l3(&l2_out, &l1_out, bucket);
+        let l3_out = unsafe { kernels::dispatch::forward_dense(acc, threats, stm, bucket) };
 
         (l3_out * NETWORK_SCALE as f32) as i32
     }
@@ -326,7 +322,7 @@ impl Clone for Network {
 /// Select the output bucket based on the number of pieces on the board.
 fn output_bucket(pos: &Position) -> usize {
     let count = pos.occupied().count_ones() as usize;
-    debug_assert!(count >= 2 && count <= 32,
+    debug_assert!((2..=32).contains(&count),
         "output_bucket: piece count {} out of range", count);
     let bucket = OUTPUT_BUCKET_MAP[count.min(32)];
     debug_assert!(bucket < OUTPUT_BUCKETS,
@@ -348,7 +344,7 @@ mod tests {
     fn test_network_new() {
         let net = Network::new();
         assert_eq!(net.index, 0);
-        assert!(net.accumulators.len() > 0);
+        assert!(!net.accumulators.is_empty());
     }
 
     #[test]

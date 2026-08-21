@@ -6,7 +6,7 @@
 
 use crate::bitboard;
 use crate::position::Position;
-use crate::types::{Color, Piece};
+use crate::types::{Color, Piece, PieceType};
 
 /// Middlegame piece base values.
 const MG_VALUE: [i32; 6] = [82, 337, 365, 477, 1025, 0];
@@ -312,6 +312,32 @@ pub fn is_material_draw(pos: &Position) -> bool {
     false
 }
 
+/// What the pieces are worth, and nothing about where they stand.
+///
+/// The bottom of the skill ladder judges with this and no more (see [`crate::skill`]).
+/// Someone who has just learned the moves knows a queen beats a knight and very little
+/// else; handing them piece squares as well would produce a beginner who develops
+/// soundly and castles early, which is not a beginner.
+///
+/// Tapered on the same phase as the full evaluation, so blending the two is a straight
+/// interpolation, and from the side to move's perspective. No tempo bonus: the value of
+/// having the move is exactly the sort of thing this level of play does not know.
+pub fn material_eval(pos: &Position) -> i32 {
+    let (mut mg, mut eg) = (0, 0);
+    for pt in [PieceType::Pawn, PieceType::Knight, PieceType::Bishop, PieceType::Rook, PieceType::Queen] {
+        let count = pos.piece_type_bb(pt, Color::White).count_ones() as i32
+            - pos.piece_type_bb(pt, Color::Black).count_ones() as i32;
+        mg += MG_VALUE[pt as usize] * count;
+        eg += EG_VALUE[pt as usize] * count;
+    }
+
+    let mg_phase = pos.game_phase.min(TOTAL_PHASE);
+    let eg_phase = TOTAL_PHASE - mg_phase;
+    debug_assert!(mg_phase >= 0 && eg_phase >= 0, "phase {mg_phase} out of range");
+    let score = (mg * mg_phase + eg * eg_phase) / TOTAL_PHASE;
+    if pos.side_to_move == Color::White { score } else { -score }
+}
+
 /// Evaluate the position from the side-to-move's perspective.
 ///
 /// Returns a score in centipawns using tapered evaluation between middlegame
@@ -360,6 +386,39 @@ pub fn evaluate(pos: &Position) -> i32 {
 mod tests {
     use super::*;
     use crate::position::Position;
+
+    /// Material only: even at the start, blind to the tempo the full eval sees.
+    #[test]
+    fn material_eval_counts_pieces_and_nothing_else() {
+        let start = Position::from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1").unwrap();
+        assert_eq!(material_eval(&start), 0, "an even position is even, tempo included");
+
+        // A move that the full eval rewards for its piece square is worth nothing here.
+        let developed = Position::from_fen("rnbqkbnr/pppppppp/8/8/8/4PN2/PPPP1PPP/RNBQKB1R b KQkq - 0 1").unwrap();
+        assert_eq!(material_eval(&developed), 0, "piece squares must not leak in");
+
+        let up_a_queen = Position::from_fen("rnb1kbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1").unwrap();
+        assert!(material_eval(&up_a_queen) > 800, "{}", material_eval(&up_a_queen));
+
+        // The same board seen from the other side is the same score, negated.
+        let same_from_black = Position::from_fen("rnb1kbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR b KQkq - 0 1").unwrap();
+        assert_eq!(material_eval(&same_from_black), -material_eval(&up_a_queen));
+    }
+
+    /// The endgame values differ from the middlegame ones, so what a piece is worth has
+    /// to follow the phase — a pawn is worth more once the queens are gone.
+    #[test]
+    fn material_eval_tapers_like_the_full_eval() {
+        // Nothing but kings and a pawn: phase zero, so the endgame value, exactly.
+        let bare = Position::from_fen("4k3/8/8/8/8/8/P7/4K3 w - - 0 1").unwrap();
+        assert_eq!(material_eval(&bare), EG_VALUE[PieceType::Pawn as usize]);
+
+        // The same pawn with a full board around it is worth its middlegame value.
+        let opening = Position::from_fen("rnbqkbnr/1ppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1").unwrap();
+        let full_phase = material_eval(&opening);
+        assert_eq!(full_phase, MG_VALUE[PieceType::Pawn as usize]);
+        assert!(full_phase < EG_VALUE[PieceType::Pawn as usize], "a pawn grows as pieces come off");
+    }
 
     #[test]
     fn test_startpos_eval_symmetric() {

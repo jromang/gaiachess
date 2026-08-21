@@ -269,16 +269,6 @@ impl Square {
         1u64 << self.0
     }
 
-    /// Converts to algebraic notation (e.g., "e4"). Returns "-" for `NONE`.
-    pub fn to_string(self) -> String {
-        if self == Square::NONE {
-            return "-".to_string();
-        }
-        let file = (b'a' + self.file()) as char;
-        let rank = (b'1' + self.rank()) as char;
-        format!("{}{}", file, rank)
-    }
-
     /// Parses algebraic notation (e.g., "e4") into a square.
     pub fn from_string(s: &str) -> Option<Square> {
         let bytes = s.as_bytes();
@@ -292,6 +282,18 @@ impl Square {
         } else {
             None
         }
+    }
+}
+
+/// Algebraic notation (e.g. "e4"), or "-" for `NONE`. Written as `Display` rather than
+/// an inherent `to_string`, so a square drops into a format string as it stands — and
+/// `to_string()` still works, through the blanket impl.
+impl std::fmt::Display for Square {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if *self == Square::NONE {
+            return f.write_str("-");
+        }
+        write!(f, "{}{}", (b'a' + self.file()) as char, (b'1' + self.rank()) as char)
     }
 }
 
@@ -343,7 +345,10 @@ impl Move {
         )
     }
 
+    /// Origin square. `from`/`to` are the chess sense here, not the Rust conversion
+    /// convention that the name would otherwise suggest.
     #[inline(always)]
+    #[allow(clippy::wrong_self_convention)]
     pub const fn from_sq(self) -> Square {
         Square(((self.0 >> 6) & 0x3F) as u8)
     }
@@ -376,7 +381,7 @@ impl Move {
     pub fn to_uci(self) -> String {
         let from = self.from_sq();
         let to = self.to_sq();
-        let mut s = format!("{}{}", from.to_string(), to.to_string());
+        let mut s = format!("{from}{to}");
         if self.move_type() == MT_PROMOTION {
             let promo = match self.promo_type() {
                 PieceType::Knight => 'n',

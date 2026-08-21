@@ -13,6 +13,12 @@ const SEE_VALUE: [i32; 7] = [100, 320, 330, 500, 900, 20000, 0];
 /// Uses the swap algorithm: iteratively simulates captures on the target square,
 /// alternating sides, picking the least valuable attacker each time.
 /// X-ray attacks are revealed as pieces are removed from the board.
+///
+/// The chain that finds the least valuable attacker assigns inside its conditions on
+/// purpose: the whole point of the chain is that a piece type's mask is only looked at
+/// once every cheaper type has come up empty. Hoisting the bindings above the chain, as
+/// the lint would have it, would compute all six of them every time round the loop.
+#[allow(clippy::blocks_in_conditions)]
 pub fn see(pos: &Position, m: Move, threshold: i32) -> bool {
     debug_assert!(m.from_sq().0 < 64 && m.to_sq().0 < 64,
         "SEE: squares OOB from={} to={}", m.from_sq().0, m.to_sq().0);

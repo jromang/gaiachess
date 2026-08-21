@@ -1,19 +1,36 @@
+[workspace]
+# The browser build needs a second artefact, and it has to be its own crate: a
+# `cdylib` on this one would be relinked on every native build, network and all.
+members = [".", "web/engine", "web/gui"]
+# Plain `cargo build` stays the engine and nothing else.
+default-members = ["."]
+
 [package]
 name = "gaiachess"
-version = "4.2.2"
+version = "4.2.3"
 edition = "2024"
+authors = ["Jean-François Romang"]
 license = "GPL-3.0-or-later"
 repository = "https://github.com/jromang/gaiachess"
 
 [features]
-default = ["syzygy", "gaiatb", "online-tb", "nalimov"]
+default = ["syzygy", "gaiatb", "online-tb", "nalimov", "gui", "progress"]
 nnue = []
 spsa = []
 syzygy = []
 gaiatb = ["dep:zstd"]
 nalimov = ["dep:nalimov-tb"]
 online-tb = ["dep:ureq", "dep:serde", "dep:serde_json"]
-datagen = ["dep:time", "dep:ctrlc", "dep:viriformat"]
+datagen = ["dep:time", "dep:ctrlc", "dep:viriformat", "progress"]
+stats = []
+tree = []
+# The scenes, the framebuffer and the sound synthesis — everything both builds share.
+gui-core = ["dep:macroquad", "dep:sfxr"]
+# The desktop interface: the same, plus rodio to drive a sound card and the system
+# locale, which the browser build gets from the page instead.
+gui = ["gui-core", "dep:rodio", "dep:sys-locale"]
+# Progress bars for the long-running commands. Off in a build with no terminal.
+progress = ["dep:indicatif"]
 
 [dependencies]
 bpaf = { version = "0.9", features = ["derive"] }
@@ -25,8 +42,21 @@ serde = { version = "1", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }
 nalimov-tb = { version = "0.2", optional = true, package = "nalimov" }
 viriformat = { version = "2.0", optional = true }
-indicatif = "0.18"
-ruzstd = "0.8"
+macroquad = { version = "0.4", optional = true }
+indicatif = { version = "0.18", optional = true }
+ruzstd = "0.9"
+# Audio for the interface. macroquad's own audio is deliberately not enabled:
+# its mixer starts every sound at a buffer boundary, so sounds asked for within
+# the same 93 ms collapse onto one instant. Only `playback` is taken — the clips
+# are our own PCM and are read without a decoder.
+rodio = { version = "0.22.2", optional = true, default-features = false, features = ["playback"] }
+# Which language the machine is set to, for the interface to open in. No transitive
+# dependencies on any desktop platform; the browser build asks the page instead, so this
+# hangs off `gui` rather than `gui-core`.
+sys-locale = { version = "0.3", optional = true }
+# The sounds are generated rather than shipped: a handful of numbers each, rendered at
+# start-up. Nothing derived from anyone else's work is embedded.
+sfxr = { version = "0.1.4", optional = true }
 
 [build-dependencies]
 zstd = "0.13"

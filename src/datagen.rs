@@ -29,153 +29,6 @@ use crate::types::*;
 use crate::see;
 
 // ============================================================
-// Bulletformat ChessBoard (32 bytes)
-// ============================================================
-
-/// Bullet trainer `ChessBoard` format: 32 bytes per position.
-///
-/// Everything is **STM-relative**: when Black is to move, the board is
-/// vertically flipped and colors are swapped.
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct ChessBoard {
-    /// Occupancy bitboard (STM perspective).
-    occ: u64,
-    /// Packed piece nibbles: 2 per byte, in ascending square order of `occ`.
-    /// Nibble = `(color << 3) | piece_type` where color 0 = friendly, 1 = enemy.
-    pcs: [u8; 16],
-    /// Centipawn evaluation, STM-relative.
-    score: i16,
-    /// Game result from STM perspective: 0=loss, 1=draw, 2=win.
-    result: u8,
-    /// Friendly king square (STM perspective).
-    ksq: u8,
-    /// Opponent king square XOR 56.
-    opp_ksq: u8,
-    /// Reserved (zeroed).
-    extra: [u8; 3],
-}
-
-impl ChessBoard {
-    /// Create a ChessBoard from the engine's Position + eval + result.
-    ///
-    /// `score_white`: centipawn eval from White's perspective.
-    /// `result_white`: 2=white win, 1=draw, 0=white loss.
-    fn from_position(pos: &Position, score_white: i16, result_white: u8) -> Self {
-        let stm = pos.side_to_move;
-        let is_black = stm == Color::Black;
-
-        // Build the 8 bitboards: [white, black, pawn, knight, bishop, rook, queen, king]
-        let mut bbs = [0u64; 8];
-        bbs[0] = pos.color_bb(Color::White);
-        bbs[1] = pos.color_bb(Color::Black);
-        for pt in 0..6 {
-            let pt_enum = match pt {
-                0 => PieceType::Pawn,
-                1 => PieceType::Knight,
-                2 => PieceType::Bishop,
-                3 => PieceType::Rook,
-                4 => PieceType::Queen,
-                _ => PieceType::King,
-            };
-            bbs[2 + pt] = pos.piece_type_bb(pt_enum, Color::White)
-                | pos.piece_type_bb(pt_enum, Color::Black);
-        }
-
-        // If Black to move: flip board vertically, swap colors
-        if is_black {
-            for bb in &mut bbs {
-                *bb = bb.swap_bytes();
-            }
-            bbs.swap(0, 1);
-        }
-
-        let occ = bbs[0] | bbs[1];
-
-        // Score and result: convert to STM-relative
-        let score = if is_black { -(score_white as i32) as i16 } else { score_white };
-        let result = if is_black { 2 - result_white } else { result_white };
-
-        // Pack pieces in order of ascending square in occupancy
-        let mut pcs = [0u8; 16];
-        let mut occ_copy = occ;
-        let mut idx = 0;
-        while occ_copy != 0 {
-            let sq = occ_copy.trailing_zeros() as usize;
-            occ_copy &= occ_copy - 1;
-
-            let sq_bb = 1u64 << sq;
-
-            // Determine piece type
-            let piece_type = if bbs[2] & sq_bb != 0 {
-                0 // Pawn
-            } else if bbs[3] & sq_bb != 0 {
-                1 // Knight
-            } else if bbs[4] & sq_bb != 0 {
-                2 // Bishop
-            } else if bbs[5] & sq_bb != 0 {
-                3 // Rook
-            } else if bbs[6] & sq_bb != 0 {
-                4 // Queen
-            } else {
-                5 // King
-            };
-
-            // Color: 0 = friendly (STM), 1 = opponent
-            let color = if bbs[0] & sq_bb != 0 { 0u8 } else { 1u8 };
-
-            let nibble = (color << 3) | piece_type;
-            if idx & 1 == 0 {
-                pcs[idx / 2] = nibble;
-            } else {
-                pcs[idx / 2] |= nibble << 4;
-            }
-            idx += 1;
-        }
-
-        // King squares
-        let friendly_king_bb = bbs[0] & bbs[7];
-        let opponent_king_bb = bbs[1] & bbs[7];
-        debug_assert!(friendly_king_bb.count_ones() == 1,
-            "datagen: {} friendly kings", friendly_king_bb.count_ones());
-        debug_assert!(opponent_king_bb.count_ones() == 1,
-            "datagen: {} opponent kings", opponent_king_bb.count_ones());
-        let ksq = friendly_king_bb.trailing_zeros() as u8;
-        let opp_ksq = opponent_king_bb.trailing_zeros() as u8 ^ 56;
-        debug_assert!(ksq < 64, "datagen: ksq {} OOB", ksq);
-        debug_assert!((opp_ksq ^ 56) < 64, "datagen: opp_ksq raw {} OOB", opp_ksq ^ 56);
-        debug_assert!(result <= 2, "datagen: result {} > 2", result);
-        debug_assert!((score as i32).abs() < 30000,
-            "datagen: score {} suspicious", score);
-        debug_assert!(idx >= 2 && idx <= 32,
-            "datagen: piece count {} invalid", idx);
-
-        ChessBoard {
-            occ,
-            pcs,
-            score,
-            result,
-            ksq,
-            opp_ksq,
-            extra: [0; 3],
-        }
-    }
-
-    /// Serialize to 32 raw bytes (little-endian).
-    fn to_bytes(&self) -> [u8; 32] {
-        let mut buf = [0u8; 32];
-        buf[0..8].copy_from_slice(&self.occ.to_le_bytes());
-        buf[8..24].copy_from_slice(&self.pcs);
-        buf[24..26].copy_from_slice(&self.score.to_le_bytes());
-        buf[26] = self.result;
-        buf[27] = self.ksq;
-        buf[28] = self.opp_ksq;
-        // buf[29..32] = extra = [0, 0, 0]
-        buf
-    }
-}
-
-// ============================================================
 // Datagen configuration
 // ============================================================
 
@@ -189,8 +42,6 @@ struct DatagenConfig {
     random_moves: usize,
     /// Maximum |eval| to accept opening position.
     max_opening_eval: i32,
-    /// Maximum |eval| for position recording.
-    max_record_eval: i32,
     /// Win adjudication: |score| >= this for N consecutive plies.
     win_adj_score: i32,
     /// Win adjudication: consecutive plies.
@@ -199,8 +50,6 @@ struct DatagenConfig {
     draw_adj_score: i32,
     /// Draw adjudication: consecutive plies.
     draw_adj_plies: usize,
-    /// Minimum ply before recording positions.
-    min_record_ply: usize,
 }
 
 impl Default for DatagenConfig {
@@ -210,12 +59,10 @@ impl Default for DatagenConfig {
             soft_nodes: 5000,
             random_moves: 8,
             max_opening_eval: 1000,
-            max_record_eval: 20000,
             win_adj_score: 2500,
             win_adj_plies: 4,
             draw_adj_score: 4,
             draw_adj_plies: 12,
-            min_record_ply: 16,
         }
     }
 }
@@ -353,6 +200,9 @@ fn to_viri_outcome(result_white: u8) -> GameOutcome {
     }
 }
 
+/// The two sides each bring their own thread data and shared state, which is what
+/// makes the list long; they are borrowed, not owned, so there is nothing to bundle.
+#[allow(clippy::too_many_arguments)]
 fn play_game(
     td_white: &mut ThreadData,
     td_black: &mut ThreadData,
@@ -395,7 +245,7 @@ fn play_game(
             SearchLimits::Depth(config.depth + 2)
         };
         let td = if pos.side_to_move == Color::White { &mut *td_white } else { &mut *td_black };
-        let shared = if pos.side_to_move == Color::White { &*shared_white } else { &*shared_black };
+        let shared = if pos.side_to_move == Color::White { shared_white } else { shared_black };
 
         STOP.store(false, Ordering::Relaxed);
         prepare_datagen_search(td, &pos, &limits);
@@ -404,10 +254,10 @@ fn play_game(
         // Per-thread deadline hit: skip this game (position is too tactical for PeSTO)
         if td.stopped {
             EXPLOSIONS.fetch_add(1, Ordering::Relaxed);
-            if let Ok(mut fens) = explosion_fens.lock() {
-                if fens.len() < MAX_EXPLOSION_FENS {
-                    fens.push(pos.to_fen());
-                }
+            if let Ok(mut fens) = explosion_fens.lock()
+                && fens.len() < MAX_EXPLOSION_FENS
+            {
+                fens.push(pos.to_fen());
             }
             return None;
         }
@@ -457,17 +307,16 @@ fn play_game(
         #[cfg(feature = "syzygy")]
         if crate::tb::max_pieces() > 0
             && pos.occupied().count_ones() <= crate::tb::max_pieces()
+            && let Some(wdl) = crate::tb::probe_wdl(&pos)
         {
-            if let Some(wdl) = crate::tb::probe_wdl(&pos) {
-                // WDL is STM-relative, convert to white-relative result
-                result = match (wdl, pos.side_to_move) {
-                    (crate::tb::Wdl::Win, Color::White) | (crate::tb::Wdl::Loss, Color::Black) => 2,
-                    (crate::tb::Wdl::Loss, Color::White) | (crate::tb::Wdl::Win, Color::Black) => 0,
-                    (crate::tb::Wdl::Draw, _) => 1,
-                };
-                TB_ADJUDICATIONS.fetch_add(1, Ordering::Relaxed);
-                break;
-            }
+            // WDL is STM-relative, convert to white-relative result
+            result = match (wdl, pos.side_to_move) {
+                (crate::tb::Wdl::Win, Color::White) | (crate::tb::Wdl::Loss, Color::Black) => 2,
+                (crate::tb::Wdl::Loss, Color::White) | (crate::tb::Wdl::Win, Color::Black) => 0,
+                (crate::tb::Wdl::Draw, _) => 1,
+            };
+            TB_ADJUDICATIONS.fetch_add(1, Ordering::Relaxed);
+            break;
         }
 
         // Search for best move
@@ -478,9 +327,9 @@ fn play_game(
         };
 
         let (td, shared) = if pos.side_to_move == Color::White {
-            (&mut *td_white, &*shared_white)
+            (&mut *td_white, shared_white)
         } else {
-            (&mut *td_black, &*shared_black)
+            (&mut *td_black, shared_black)
         };
 
         STOP.store(false, Ordering::Relaxed);
@@ -490,10 +339,10 @@ fn play_game(
         // Per-thread deadline hit: skip this game (position too tactical for PeSTO)
         if td.stopped {
             EXPLOSIONS.fetch_add(1, Ordering::Relaxed);
-            if let Ok(mut fens) = explosion_fens.lock() {
-                if fens.len() < MAX_EXPLOSION_FENS {
-                    fens.push(pos.to_fen());
-                }
+            if let Ok(mut fens) = explosion_fens.lock()
+                && fens.len() < MAX_EXPLOSION_FENS
+            {
+                fens.push(pos.to_fen());
             }
             return None;
         }
@@ -567,12 +416,6 @@ fn play_game(
     Some(game)
 }
 
-/// Check if a move is tactical (capture, promotion, or en passant).
-fn is_tactical(pos: &Position, m: Move) -> bool {
-    let mt = m.move_type();
-    mt == MT_PROMOTION || mt == MT_EN_PASSANT || pos.board[m.to_sq().index()] != Piece::NONE
-}
-
 // ============================================================
 // ETA formatting helpers
 // ============================================================
@@ -612,6 +455,10 @@ fn format_finish_time(eta_secs: u64) -> String {
 // ============================================================
 
 /// One datagen worker thread.
+///
+/// Everything a worker needs is passed in rather than read from a global, so the list
+/// is long by design: a worker owns no state of its own.
+#[allow(clippy::too_many_arguments)]
 fn worker(
     thread_id: usize,
     target_positions: u64,
@@ -645,8 +492,8 @@ fn worker(
         && !DATAGEN_STOP.load(Ordering::Relaxed)
     {
         let game = play_game(
-            &mut *td_white,
-            &mut *td_black,
+            &mut td_white,
+            &mut td_black,
             &shared_white,
             &shared_black,
             config,
@@ -741,10 +588,10 @@ pub fn run(threads: usize, target_positions: u64, depth: i32, output: &str, book
     eprintln!();
 
     // Create output directory if needed
-    if let Some(parent) = std::path::Path::new(output).parent() {
-        if !parent.as_os_str().is_empty() {
-            let _ = std::fs::create_dir_all(parent);
-        }
+    if let Some(parent) = std::path::Path::new(output).parent()
+        && !parent.as_os_str().is_empty()
+    {
+        let _ = std::fs::create_dir_all(parent);
     }
 
     // Check for existing output files and count positions already generated
@@ -796,7 +643,7 @@ pub fn run(threads: usize, target_positions: u64, depth: i32, output: &str, book
     }
 
     // Set up Ctrl+C handler
-    let _ = ctrlc_handler();
+    ctrlc_handler();
 
     // Progress bar (starts from existing positions count)
     let pb = ProgressBar::new(target_positions);
@@ -942,103 +789,4 @@ fn ctrlc_handler() {
             }
         }
     });
-}
-
-// ============================================================
-// Tests
-// ============================================================
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::position::Position;
-
-    #[test]
-    fn test_chessboard_startpos_white() {
-        let pos = Position::from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1")
-            .unwrap();
-        let cb = ChessBoard::from_position(&pos, 15, 2); // +15cp, white win
-
-        // White to move: no flipping
-        assert_eq!(cb.occ, pos.occupied());
-        assert_eq!(cb.score, 15);
-        assert_eq!(cb.result, 2);
-        assert_eq!(cb.ksq, Square::E1.0);
-        assert_eq!(cb.opp_ksq, Square::E8.0 ^ 56);
-    }
-
-    #[test]
-    fn test_chessboard_black_flips() {
-        let pos = Position::from_fen("rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq e3 0 1")
-            .unwrap();
-        let cb = ChessBoard::from_position(&pos, 30, 2); // +30 white, white win
-
-        // Black to move: score negated, result inverted
-        assert_eq!(cb.score, -30);
-        assert_eq!(cb.result, 0); // 2 - 2 = 0 (loss from black's perspective)
-
-        // Board should be flipped: black pieces are now "friendly" on ranks 1-2
-        // occ should be the flipped occupancy
-        let expected_occ = pos.occupied().swap_bytes();
-        assert_eq!(cb.occ, expected_occ);
-    }
-
-    #[test]
-    fn test_chessboard_size() {
-        assert_eq!(std::mem::size_of::<ChessBoard>(), 32);
-    }
-
-    #[test]
-    fn test_chessboard_piece_count() {
-        let pos = Position::from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1")
-            .unwrap();
-        let cb = ChessBoard::from_position(&pos, 0, 1);
-
-        // Count pieces: 32 pieces in startpos
-        let piece_count = cb.occ.count_ones();
-        assert_eq!(piece_count, 32);
-
-        // All 16 bytes should be used (32 nibbles = 16 bytes)
-        // Each byte should have two valid nibbles
-        for i in 0..16 {
-            let low = cb.pcs[i] & 0x0F;
-            let high = cb.pcs[i] >> 4;
-            assert!(low <= 13, "invalid low nibble at byte {i}: {low}");
-            assert!(high <= 13, "invalid high nibble at byte {i}: {high}");
-        }
-    }
-
-    #[test]
-    fn test_chessboard_draw_result() {
-        let pos = Position::from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1")
-            .unwrap();
-        let cb = ChessBoard::from_position(&pos, 0, 1); // draw
-        assert_eq!(cb.result, 1);
-
-        // From black perspective, draw is still draw
-        let pos_b = Position::from_fen("rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq e3 0 1")
-            .unwrap();
-        let cb_b = ChessBoard::from_position(&pos_b, 0, 1);
-        assert_eq!(cb_b.result, 1); // 2 - 1 = 1
-    }
-
-    #[test]
-    fn test_to_bytes_roundtrip() {
-        let pos = Position::from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1")
-            .unwrap();
-        let cb = ChessBoard::from_position(&pos, -42, 0);
-        let bytes = cb.to_bytes();
-        assert_eq!(bytes.len(), 32);
-
-        // Verify score encoding
-        let score = i16::from_le_bytes([bytes[24], bytes[25]]);
-        assert_eq!(score, -42);
-
-        // Verify result
-        assert_eq!(bytes[26], 0);
-
-        // Verify occ
-        let occ = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
-        assert_eq!(occ, cb.occ);
-    }
 }

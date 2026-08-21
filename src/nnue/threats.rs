@@ -1,4 +1,8 @@
 #![allow(unsafe_op_in_unsafe_fn)]
+// Hand-vectorised code: the loop index is the point. It walks several arrays in
+// lockstep, steps by a SIMD lane count, and feeds raw pointer arithmetic — an
+// iterator would hide the arithmetic these kernels exist to control.
+#![allow(clippy::needless_range_loop)]
 //! Threat features for NNUE (GaiaNet-T1 filtered pairwise encoding).
 //!
 //! 41,272 features encoding "piece A on square S attacks/defends piece B on square T",
@@ -30,85 +34,9 @@ use crate::types::{
 };
 
 use super::accumulator::AccDelta;
+use super::kernels::dispatch::threat_batch;
 use super::network::{self, Aligned};
-#[allow(unused_imports)] // scalar accumulate paths don't use simd
-use super::simd;
 use super::{L1_SIZE, THREAT_INPUT_SIZE};
-
-// ============================================================
-// SIMD accumulation
-// ============================================================
-
-/// Add an i8 weight row (L1_SIZE elements) into an i16 accumulator using SIMD.
-/// AVX-512: 20 iterations (32 i8 → 32 i16 per vector), vs 640 scalar iterations.
-#[inline(always)]
-#[cfg(target_feature = "avx512f")]
-unsafe fn accumulate_i8_row(weights: *const i8, acc: *mut i16) {
-    for j in (0..L1_SIZE).step_by(simd::I16_LANES) {
-        let w = simd::load_i8_as_i16(weights.add(j));
-        let a = *(acc.add(j) as *const std::arch::x86_64::__m512i);
-        *(acc.add(j) as *mut std::arch::x86_64::__m512i) = simd::add_i16(a, w);
-    }
-}
-
-#[inline(always)]
-#[cfg(all(target_feature = "avx2", not(target_feature = "avx512f")))]
-unsafe fn accumulate_i8_row(weights: *const i8, acc: *mut i16) {
-    for j in (0..L1_SIZE).step_by(simd::I16_LANES) {
-        let w = simd::load_i8_as_i16(weights.add(j));
-        let a = *(acc.add(j) as *const std::arch::x86_64::__m256i);
-        *(acc.add(j) as *mut std::arch::x86_64::__m256i) = simd::add_i16(a, w);
-    }
-}
-
-#[inline(always)]
-#[cfg(not(any(target_feature = "avx2", target_feature = "avx512f")))]
-unsafe fn accumulate_i8_row(weights: *const i8, acc: *mut i16) {
-    for j in 0..L1_SIZE {
-        *acc.add(j) += *weights.add(j) as i16;
-    }
-}
-
-/// Subtract an i8 weight row (L1_SIZE elements) from an i16 accumulator using SIMD.
-#[inline(always)]
-#[cfg(target_feature = "avx512f")]
-unsafe fn subtract_i8_row(weights: *const i8, acc: *mut i16) {
-    for j in (0..L1_SIZE).step_by(simd::I16_LANES) {
-        let w = simd::load_i8_as_i16(weights.add(j));
-        let a = *(acc.add(j) as *const std::arch::x86_64::__m512i);
-        *(acc.add(j) as *mut std::arch::x86_64::__m512i) = simd::sub_i16(a, w);
-    }
-}
-
-#[inline(always)]
-#[cfg(all(target_feature = "avx2", not(target_feature = "avx512f")))]
-unsafe fn subtract_i8_row(weights: *const i8, acc: *mut i16) {
-    for j in (0..L1_SIZE).step_by(simd::I16_LANES) {
-        let w = simd::load_i8_as_i16(weights.add(j));
-        let a = *(acc.add(j) as *const std::arch::x86_64::__m256i);
-        *(acc.add(j) as *mut std::arch::x86_64::__m256i) = simd::sub_i16(a, w);
-    }
-}
-
-#[inline(always)]
-#[cfg(not(any(target_feature = "avx2", target_feature = "avx512f")))]
-unsafe fn subtract_i8_row(weights: *const i8, acc: *mut i16) {
-    for j in 0..L1_SIZE {
-        *acc.add(j) -= *weights.add(j) as i16;
-    }
-}
-
-/// Prefetch the first cache line of a weight row to trigger hardware streaming.
-#[inline(always)]
-#[cfg(target_arch = "x86_64")]
-unsafe fn prefetch_weight_row(weights_base: *const [i8; L1_SIZE], feat: usize) {
-    let ptr = (*weights_base.add(feat)).as_ptr();
-    std::arch::x86_64::_mm_prefetch(ptr as *const i8, std::arch::x86_64::_MM_HINT_T1);
-}
-
-#[inline(always)]
-#[cfg(not(target_arch = "x86_64"))]
-unsafe fn prefetch_weight_row(_weights_base: *const [i8; L1_SIZE], _feat: usize) {}
 
 // ============================================================
 // Constants
@@ -491,102 +419,6 @@ impl DirtyFeatures {
     }
 }
 
-/// Register-batched accumulation: loads acc into ZMM registers, applies all
-/// add/sub weight rows on registers, stores once. Eliminates N-1 intermediate
-/// load/store pairs of the accumulator.
-///
-/// `input_acc`: source accumulator (null = zero-init for full recompute).
-/// `output_acc`: destination accumulator.
-#[cfg(target_feature = "avx512f")]
-unsafe fn register_batch_apply(
-    input_acc: *const i16,
-    output_acc: *mut i16,
-    weights_base: *const [i8; L1_SIZE],
-    adds: &[u32],
-    subs: &[u32],
-) {
-    use std::arch::x86_64::*;
-    const N: usize = L1_SIZE / 32; // 20 ZMM registers for 640 i16
-
-    // Load accumulator into ZMM registers (or zero-init)
-    let mut regs: [__m512i; N] = [_mm512_setzero_si512(); N];
-    if !input_acc.is_null() {
-        for i in 0..N {
-            regs[i] = _mm512_loadu_si512(input_acc.add(i * 32) as *const __m512i);
-        }
-    }
-
-    const PF: usize = 4;
-
-    // Prefetch initial subs
-    for d in 0..PF.min(subs.len()) {
-        prefetch_weight_row(weights_base, subs[d] as usize);
-    }
-    // Apply subtractions
-    for i in 0..subs.len() {
-        let pf_idx = i + PF;
-        if pf_idx < subs.len() {
-            prefetch_weight_row(weights_base, subs[pf_idx] as usize);
-        } else if pf_idx - subs.len() < adds.len() {
-            prefetch_weight_row(weights_base, adds[pf_idx - subs.len()] as usize);
-        }
-        let w_ptr = (*weights_base.add(subs[i] as usize)).as_ptr();
-        for j in 0..N {
-            let w = simd::load_i8_as_i16(w_ptr.add(j * 32));
-            regs[j] = simd::sub_i16(regs[j], w);
-        }
-    }
-
-    // Prefetch remaining initial adds
-    let pf_done = if subs.len() >= PF { PF } else { PF - subs.len() };
-    for d in pf_done..PF.min(adds.len()) {
-        prefetch_weight_row(weights_base, adds[d] as usize);
-    }
-    // Apply additions
-    for i in 0..adds.len() {
-        if i + PF < adds.len() {
-            prefetch_weight_row(weights_base, adds[i + PF] as usize);
-        }
-        let w_ptr = (*weights_base.add(adds[i] as usize)).as_ptr();
-        for j in 0..N {
-            let w = simd::load_i8_as_i16(w_ptr.add(j * 32));
-            regs[j] = simd::add_i16(regs[j], w);
-        }
-    }
-
-    // Store registers to output accumulator
-    for i in 0..N {
-        _mm512_storeu_si512(output_acc.add(i * 32) as *mut __m512i, regs[i]);
-    }
-}
-
-/// Fallback for non-AVX-512: per-feature with prefetch.
-#[cfg(not(target_feature = "avx512f"))]
-unsafe fn register_batch_apply(
-    input_acc: *const i16,
-    output_acc: *mut i16,
-    weights_base: *const [i8; L1_SIZE],
-    adds: &[u32],
-    subs: &[u32],
-) {
-    if !input_acc.is_null() {
-        std::ptr::copy_nonoverlapping(input_acc, output_acc, L1_SIZE);
-    } else {
-        std::ptr::write_bytes(output_acc, 0, L1_SIZE);
-    }
-    const PF: usize = 4;
-    for d in 0..PF.min(subs.len()) { prefetch_weight_row(weights_base, subs[d] as usize); }
-    for i in 0..subs.len() {
-        if i + PF < subs.len() { prefetch_weight_row(weights_base, subs[i + PF] as usize); }
-        subtract_i8_row((*weights_base.add(subs[i] as usize)).as_ptr(), output_acc);
-    }
-    for d in 0..PF.min(adds.len()) { prefetch_weight_row(weights_base, adds[d] as usize); }
-    for i in 0..adds.len() {
-        if i + PF < adds.len() { prefetch_weight_row(weights_base, adds[i + PF] as usize); }
-        accumulate_i8_row((*weights_base.add(adds[i] as usize)).as_ptr(), output_acc);
-    }
-}
-
 /// Compute full threat features for both perspectives (standalone, no caching).
 ///
 /// Used as reference implementation for debug_assert validation and for
@@ -608,7 +440,7 @@ pub fn compute_full_threats(pos: &Position) -> Aligned<[[i16; L1_SIZE]; 2]> {
         let acc = result.0[pov].as_mut_ptr();
         let weights_base = params.ft_threat_weights.0.as_ptr();
         unsafe {
-            register_batch_apply(
+            threat_batch(
                 std::ptr::null(), acc, weights_base,
                 &features[..n], &[],
             );
@@ -694,7 +526,7 @@ impl ThreatAccumulator {
         let old_board = reconstruct_old_board(pos, delta);
 
         // Determine piece changes
-        let (removes, n_rem, adds, n_add) = piece_changes(delta);
+        let ((removes, n_rem), (adds, n_add)) = piece_changes(delta);
 
         // Build bitmasks for exclusion and x-ray filtering
         let mut remove_bb = 0u64;
@@ -756,7 +588,7 @@ impl ThreatAccumulator {
 
             // === Apply all collected features with register batching ===
             unsafe {
-                register_batch_apply(
+                threat_batch(
                     parent.values.0[pov].as_ptr(),
                     self.values.0[pov].as_mut_ptr(),
                     weights_base,
@@ -794,6 +626,11 @@ impl ThreatAccumulator {
 // ============================================================
 
 /// Collect all threat features involving piece@sq into dirty list.
+///
+/// The position is passed as the pieces of it this needs — occupancy, bitboards, the
+/// side being encoded — rather than as a `&Position`, so the caller can hand it the
+/// old board and the new one in the same call.
+#[allow(clippy::too_many_arguments)]
 fn collect_piece_threats(
     dirty: &mut DirtyFeatures,
     pov: usize,
@@ -870,6 +707,7 @@ fn collect_pairwise_threat(
 }
 
 /// Collect x-ray slider changes between old and new occupancy.
+#[allow(clippy::too_many_arguments)]
 fn collect_xray_changes(
     dirty: &mut DirtyFeatures,
     pov: usize,
@@ -960,11 +798,12 @@ impl Clone for ThreatAccumulator {
 
 /// Determine which pieces were removed/added by a move.
 ///
-/// Returns (removed, n_removed, added, n_added).
-/// Each entry is (Piece, Square). Max 4 changes (castling: 2 removes + 2 adds).
-fn piece_changes(
-    delta: &AccDelta,
-) -> ([(Piece, Square); 4], usize, [(Piece, Square); 4], usize) {
+/// Up to four pieces and how many of the four are real. Castling is the worst case:
+/// two squares vacated, two filled.
+type PieceSet = ([(Piece, Square); 4], usize);
+
+/// Returns (removed, added).
+fn piece_changes(delta: &AccDelta) -> (PieceSet, PieceSet) {
     let mv = delta.mv;
     let mt = mv.move_type();
     let from = mv.from_sq();
@@ -1026,7 +865,7 @@ fn piece_changes(
         _ => {}
     }
 
-    (removes, n_rem, adds, n_add)
+    ((removes, n_rem), (adds, n_add))
 }
 
 /// Get rook from/to squares for a castling move.
@@ -1296,8 +1135,6 @@ mod tests {
     /// PST i16 bounded ±300 (avoids i16 overflow in debug), threats full-range i8.
     fn load_random_network() {
         use std::io::Write;
-        #[cfg(target_feature = "bmi2")]
-        crate::bitboard::init_pext(); // required for slider attacks in BMI2 builds
         let path = "/tmp/gaianet_t1_random_test.bin";
         let mut state = 0x9E3779B97F4A7C15u64;
         let mut next = move || {
@@ -1349,11 +1186,6 @@ mod tests {
     #[ignore]
     fn test_threats_incremental_random_net() {
         load_random_network();
-
-        let scenarios: &[(&str, &[(u8, u8, u16)])] = &[
-            // (from, to, move_type<<14|promo) — encoded via helper below
-        ];
-        let _ = scenarios;
 
         // Rich sequence from kiwipete (captures, castling)
         let mut pos = Position::from_fen(

@@ -471,10 +471,8 @@ impl Position {
             let blockers = between & !sniper_sq.bb();
             if blockers == 0 {
                 checkers |= sniper_sq.bb();
-            } else if !more_than_one(blockers) {
-                if blockers & self.color_bb(us) != 0 {
-                    pinned |= blockers;
-                }
+            } else if !more_than_one(blockers) && blockers & self.color_bb(us) != 0 {
+                pinned |= blockers;
             }
         }
 
@@ -1412,37 +1410,37 @@ impl Position {
         }
 
         // 7. Castling rights coherence (king + rook on starting squares)
-        if self.castling_rights & WHITE_OO != 0 {
-            if self.board[Square::E1.index()] != Piece::WHITE_KING
-                || self.board[Square::H1.index()] != Piece::WHITE_ROOK {
-                return Err(FenParseError::CastlingRightsIncoherent {
-                    detail: "white O-O requires king on e1 and rook on h1",
-                });
-            }
+        if self.castling_rights & WHITE_OO != 0
+            && (self.board[Square::E1.index()] != Piece::WHITE_KING
+                || self.board[Square::H1.index()] != Piece::WHITE_ROOK)
+        {
+            return Err(FenParseError::CastlingRightsIncoherent {
+                detail: "white O-O requires king on e1 and rook on h1",
+            });
         }
-        if self.castling_rights & WHITE_OOO != 0 {
-            if self.board[Square::E1.index()] != Piece::WHITE_KING
-                || self.board[Square::A1.index()] != Piece::WHITE_ROOK {
-                return Err(FenParseError::CastlingRightsIncoherent {
-                    detail: "white O-O-O requires king on e1 and rook on a1",
-                });
-            }
+        if self.castling_rights & WHITE_OOO != 0
+            && (self.board[Square::E1.index()] != Piece::WHITE_KING
+                || self.board[Square::A1.index()] != Piece::WHITE_ROOK)
+        {
+            return Err(FenParseError::CastlingRightsIncoherent {
+                detail: "white O-O-O requires king on e1 and rook on a1",
+            });
         }
-        if self.castling_rights & BLACK_OO != 0 {
-            if self.board[Square::E8.index()] != Piece::BLACK_KING
-                || self.board[Square::H8.index()] != Piece::BLACK_ROOK {
-                return Err(FenParseError::CastlingRightsIncoherent {
-                    detail: "black O-O requires king on e8 and rook on h8",
-                });
-            }
+        if self.castling_rights & BLACK_OO != 0
+            && (self.board[Square::E8.index()] != Piece::BLACK_KING
+                || self.board[Square::H8.index()] != Piece::BLACK_ROOK)
+        {
+            return Err(FenParseError::CastlingRightsIncoherent {
+                detail: "black O-O requires king on e8 and rook on h8",
+            });
         }
-        if self.castling_rights & BLACK_OOO != 0 {
-            if self.board[Square::E8.index()] != Piece::BLACK_KING
-                || self.board[Square::A8.index()] != Piece::BLACK_ROOK {
-                return Err(FenParseError::CastlingRightsIncoherent {
-                    detail: "black O-O-O requires king on e8 and rook on a8",
-                });
-            }
+        if self.castling_rights & BLACK_OOO != 0
+            && (self.board[Square::E8.index()] != Piece::BLACK_KING
+                || self.board[Square::A8.index()] != Piece::BLACK_ROOK)
+        {
+            return Err(FenParseError::CastlingRightsIncoherent {
+                detail: "black O-O-O requires king on e8 and rook on a8",
+            });
         }
 
         // 8. En passant square requires an enemy pawn behind it

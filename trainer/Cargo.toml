@@ -8,7 +8,7 @@ name = "train5"
 path = "src/main.rs"
 
 [dependencies]
-bullet_lib = { git = "https://github.com/jw1912/bullet", rev = "dad475f06eb63b17fa6e6e275a77b6a97593fd24" }
+bullet_lib = { git = "https://github.com/jw1912/bullet", rev = "feab6443fc523c9d349427bca2d5bb3c04369420" }
 bulletformat = "1.8.0"
 sfbinpack = "0.6.0"
 rand = "0.9"

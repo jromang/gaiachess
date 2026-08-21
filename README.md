@@ -1,10 +1,84 @@
 # ♚ Gaia Chess Engine
 
-A free and strong UCI chess engine written in Rust.
+A free and strong chess engine written in Rust, with a board to play on in the same
+executable — and twenty levels of play, from a child's first game to a grandmaster.
+
+![The board mid-game: an Italian, the hand carrying the bishop to e6](docs/screenshot.png)
 
 > See also: [gaiachess.free.fr](http://gaiachess.free.fr/) — the original Gaia website
 
 **Gaia 4** is a complete rewrite from C to Rust — not a single line of the original code survived. Back after 20 years.
+
+## Play in your browser
+
+**[Play it now on itch.io](https://jromang.itch.io/gaiachess)** — the whole game as a
+web page, with nothing to install. The first load fetches the neural network, about
+22 MB, cached by the browser afterwards, and the menu is usable while it arrives.
+
+Levels 1 to 19 are bounded by search depth and never by a clock, so they play exactly
+the same in a tab as on a desktop, however slow the machine. Level 20 is the exception:
+in a browser it is boxed in by what WebAssembly and a single worker allow, and it is
+worth meeting on a downloaded build instead.
+
+## Play against it
+
+A pixel-art interface ships in the same binary, built in by default: run `gaiachess`
+with nothing after it and the board opens.
+
+**One binary, two ways to run it.** Started on its own, `gaiachess` listens for two
+seconds; if nothing speaks UCI in that time it opens the board. A chess interface that
+launches it says `uci` straight away and gets the engine, with no delay and no window.
+`gaiachess --no-gui` skips the wait and speaks UCI at once, and `gaiachess gui` opens the
+board without listening at all. The board is never opened when there is no display to
+open it on, so an engine running under a match manager over SSH is unaffected.
+
+Play with the mouse — the hand becomes the cursor, and pieces are dragged and dropped
+— or with the arrow keys and `X`. Whichever you touch last is the one in charge, so
+the keyboard is never taken away from you by a mouse you did not move. `Z` opens the
+in-game menu, `F` turns the board round, `Tab` changes the colour scheme. The menu
+sets who plays each side, the level, the clock and the colours; **about** carries the
+credits, the licence and an explanation of what the twenty levels do.
+
+## Twenty opponents, not one engine turned down
+
+Levels 1 to 19 run from someone's first game of chess to grandmaster strength, roughly
+a hundred and twenty rating points a rung; level 20 is the engine at full strength. The
+board's menu shows each level's rating and who it plays like as you pick it, and any UCI
+interface can set the same thing with the `Skill Level` option.
+
+| Level | Rating | Plays like | | Level | Rating | Plays like |
+|---|---|---|---|---|---|---|
+| 1 | 580 | just learned the moves | | 11 | 1750 | strong club player |
+| 2 | 700 | learning the pieces | | 12 | 1840 | tournament player |
+| 3 | 820 | first few games | | 13 | 1970 | tournament regular |
+| 4 | 940 | beginner | | 14 | 2090 | candidate master |
+| 5 | 1060 | improving beginner | | 15 | 2200 | expert |
+| 6 | 1180 | casual player | | 16 | 2310 | national master |
+| 7 | 1300 | keen amateur | | 17 | 2420 | strong master |
+| 8 | 1420 | club player | | 18 | 2530 | international master |
+| 9 | 1540 | solid club player | | 19 | 2640 | grandmaster |
+| 10 | 1660 | steady club player | | 20 | — | full strength |
+
+**Searching less far is not enough.** A network judging positions one ply deep already
+plays around 1500, so no cut in depth on its own reaches a beginner — and an engine that
+plays the best move of a crude evaluation is dull, never careless. Below full strength
+five things give at once: the engine looks less far ahead, judges positions more crudely
+(material alone at the bottom of the ladder, then piece squares, then the network),
+misjudges them on purpose — usually a little, occasionally by a piece — picks among the
+root moves worth playing instead of always the same one, and simply fails to notice some
+moves at all. That last one, applied in the quiescence as well as in the search, is what
+makes the low levels leave a piece hanging; nothing else does.
+
+Treat the ratings as estimates, but they were anchored outside the engine rather than left
+to self-play: levels 8 to 14 were played against networks trained to imitate human play,
+which run as bots and so carry a rating earned against people over hundreds of thousands
+of games. The two independent anchors agreed to within about a hundred points; the two
+ends of the ladder are extrapolated from that line.
+
+Nothing depends on the machine: a level is never a time or a node budget, and every choice
+is drawn from the position's own hash, so a level misjudges the same position the same way
+every time — stable blind spots rather than a tremor. A given level is the same opponent
+on a laptop as on a server.
 
 ## Features
 
@@ -31,8 +105,8 @@ A free and strong UCI chess engine written in Rust.
 ### Evaluation
 
 - **NNUE**: GaiaNet threat-feature architecture (12 king buckets × 768 PST + filtered threat features, ~41K inputs → 640 → CReLU+pairwise → 16 → 32 → 1), 8 output buckets, trained with [Bullet](https://github.com/jw1912/bullet) on self-play data
-- **SIMD**: compile-time dispatch AVX-512 / AVX2 / scalar
-- **Movegen**: per-piece PEXT (BMI2) / AVX2 BLSMSK / magic; setwise AVX-512 Kogge-Stone / scalar — compile-time selected
+- **SIMD**: runtime dispatch AVX-512+VNNI / AVX-512 / AVX2 / scalar — one binary, resolved from CPUID at startup (NEON on ARM)
+- **Movegen**: per-piece PEXT (BMI2) / AVX2 BLSMSK / magic; setwise AVX-512 Kogge-Stone / scalar — runtime-elected too, with PEXT skipped on the AMD generations that microcode it
 
 ### UCI
 
@@ -40,26 +114,25 @@ Full UCI protocol support. Compatible with [Arena](https://www.playwitharena.de/
 
 ## Which binary should I use?
 
-Releases ship one binary per CPU family. **Windows** binaries end in `.exe`, **Linux** and **macOS** have no extension.
+One binary per platform. **Windows** binaries end in `.exe`, **Linux** and **macOS** have no extension.
+On x86-64 the engine selects its SIMD paths at startup from your CPU — AVX2 up to AVX-512+VNNI for the
+neural network, PEXT or AVX2 for move generation — so there is nothing to choose.
 
-| CPU | Recommended binary |
-|-----|-------------------|
-| **AMD Ryzen 9000** (Zen 5) | `znver5` or `avx512vnni` |
-| **AMD Ryzen 7000** (Zen 4) | `znver4` or `avx512` |
-| **AMD Ryzen 5000** (Zen 3) | `znver3` or `bmi2` |
-| **AMD Ryzen 1000–3000** (Zen 1/2) | `avx2` |
-| **Intel 12th gen+** (Alder Lake+) | `avx512vnni` |
-| **Intel 10th–11th gen** | `avx512` or `bmi2` |
-| **Intel Haswell–Coffee Lake** | `bmi2` |
-| **Apple M1/M2/M3/M4** | `apple-silicon` |
-| **Linux ARM64** (RPi 4+, Graviton) | `neon` |
-| **Older CPUs** (pre-2013) | `sse4-popcnt`, `ssse3`, or `x86-64` |
+| Binary | Platform | Runs on |
+|--------|----------|---------|
+| `universal` | Windows / Linux x86-64 | Any CPU from ~2013 (Intel Haswell+, AMD Zen+) |
+| `compat` | Windows / Linux x86-64 | Any x86-64 CPU (2003+) |
+| `neon` | Linux ARM64 | RPi 4+, Graviton... |
+| `apple-silicon` | macOS | M1 and later |
 
-When in doubt, use **`bmi2`** (x86) or **`neon`** (ARM). If it crashes on startup, fall back to `avx2`, then `x86-64`.
+Take **`universal`**. Take `compat` only if `universal` does not start (a CPU older than ~2013):
+same engine, portable code paths — slower search, a scalar network below AVX2 — but the same chess.
 
-All x86-64 binaries are built with Profile-Guided Optimization. NNUE binaries embed the neural network and the GaiaTB tablebases — no external file needed.
+`gaiachess info` prints which paths were selected on your machine; `GAIA_SIMD=scalar|avx2|avx512|vnni512`
+and `GAIA_PEXT=0|1` cap the selection for benchmarking or troubleshooting.
 
-> The NNUE binaries are several hundred Elo stronger than the PeSTO fallbacks (`x86-64`, `ssse3`, `sse4-popcnt`), but require AVX2 for the SIMD inference.
+All x86-64 binaries are built with Profile-Guided Optimization, every selectable SIMD tier profiled.
+The neural network and the GaiaTB tablebases are embedded — no external file needed.
 
 ## UCI Options
 
@@ -74,6 +147,9 @@ All x86-64 binaries are built with Profile-Guided Optimization. NNUE binaries em
 | SyzygyPath | string | \<empty\> | Path(s) to Syzygy tablebase files (`:`-separated) |
 | NalimovPath | string | \<empty\> | Path to Nalimov tablebase files |
 | OnlineTB | check | false | Probe online endgame tablebases at the root |
+| OwnBook | check | true | Vary the openings played below full strength |
+| Skill Level | spin | 20 | Playing strength, 1 (a beginner's opponent) to 20 (full strength) |
+| Skill Seed | spin | 0 | Which weakened opponent a level is; 0 keeps the built-in one |
 
 ## The Story
 
@@ -97,10 +173,25 @@ Gaia 4 stands on the shoulders of the chess programming community. Special thank
 
 - [Bullet](https://github.com/jw1912/bullet) — NNUE trainer
 - [Chess Programming Wiki](https://www.chessprogramming.org/) — invaluable knowledge base
+- [lichess-org/chess-openings](https://github.com/lichess-org/chess-openings) — the ECO
+  catalogue the built-in openings are taken from, released into the public domain under
+  CC0 1.0
+
+The graphical interface uses chess pieces drawn by **DrSmey**; its sounds are not files
+but a few numbers each, synthesised at start-up. What a board should feel like was learnt
+from [Pico Checkmate](https://www.lexaloffle.com/bbs/?tid=31213), a PICO-8 cartridge by
+**Krystman** (Lazy Devs). See `src/gui/assets/ATTRIBUTION.md` for the full credits and
+licence status of each asset.
 
 ## Building from source
 
-Requires a Rust toolchain (edition 2024), `clang` (for the Syzygy probing code), `curl`, and a NNUE network file:
+Requires a Rust toolchain (edition 2024), `clang` (for the Syzygy probing code), `curl`, and a NNUE network file.
+
+**On Linux, the interface's sound links against ALSA**, so building the default feature
+set needs `libasound2-dev` (Debian/Ubuntu) or `alsa-lib` (Arch), and running the result
+needs `libasound2`. That is the one thing a headless server may be missing; a build with
+no interface in it at all (below) has no such dependency and links against nothing but
+libc. Windows and macOS need nothing extra.
 
 ```bash
 # Download the network (see https://huggingface.co/jromanghf/gaiachess-networks)
@@ -110,8 +201,23 @@ curl -L -o nets/gaianet.bin \
 # Build with the network embedded
 MODEL=nets/gaianet.bin RUSTFLAGS="-C target-cpu=native" cargo build --release --features nnue
 
+# Same, without the graphical interface — and without ALSA to link against
+MODEL=nets/gaianet.bin RUSTFLAGS="-C target-cpu=native" cargo build --release \
+  --no-default-features --features "nnue,syzygy,gaiatb,online-tb,nalimov"
+
 # Fallback build without NNUE (PeSTO evaluation, much weaker)
 cargo build --release
+```
+
+A `target-cpu=native` build pins every SIMD path at compile time for the machine it was
+built on — fastest, and what the command above gives you. The release binaries are built
+differently: a portable baseline plus `--cfg gaia_dist`, which turns on the runtime
+CPUID dispatch so one binary carries every SIMD tier. To reproduce one:
+
+```bash
+# A `universal`-style binary: runs on any x86-64 CPU from ~2013, picks its paths at startup
+MODEL=nets/gaianet.bin RUSTFLAGS="-C target-cpu=x86-64-v3 --cfg gaia_dist" \
+  cargo build --release --features nnue
 ```
 
 Run `cargo test` for the test suite and `cargo run --release -- bench` for the search benchmark.

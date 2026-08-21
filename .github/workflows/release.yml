@@ -17,7 +17,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Create GitHub Release
         run: |
@@ -29,53 +29,54 @@ jobs:
             --notes "$(cat <<'NOTES'
           ## Download
 
-          Pick the binary matching your CPU. **Windows** binaries end in `.exe`, **Linux** and **macOS** have no extension.
+          One binary per platform. **Windows** binaries end in `.exe`, **Linux** and **macOS** have no extension.
+          On x86-64 the engine selects its SIMD paths at startup from your CPU — AVX2 up to AVX-512+VNNI for the
+          neural network, PEXT or AVX2 for move generation — so there is nothing to choose.
 
-          ### Which binary should I use?
+          | Binary | Platform | Runs on |
+          |--------|----------|---------|
+          | `universal` | Windows / Linux x86-64 | Any CPU from ~2013 (Intel Haswell+, AMD Zen+) |
+          | `compat` | Windows / Linux x86-64 | Any x86-64 CPU (2003+) |
+          | `neon` | Linux ARM64 | RPi 4+, Graviton... |
+          | `apple-silicon` | macOS | M1 and later |
 
-          | CPU | Recommended binary |
-          |-----|-------------------|
-          | **AMD Ryzen 9000** (Zen 5) | `znver5` or `avx512vnni` |
-          | **AMD Ryzen 7000** (Zen 4) | `znver4` or `avx512` |
-          | **AMD Ryzen 5000** (Zen 3) | `znver3` or `bmi2` |
-          | **AMD Ryzen 1000–3000** (Zen 1/2) | `avx2` |
-          | **Intel 12th gen+** (Alder Lake+) | `avx512vnni` |
-          | **Intel 10th–11th gen** | `avx512` or `bmi2` |
-          | **Intel Haswell–Coffee Lake** | `bmi2` |
-          | **Apple M1/M2/M3/M4** | `apple-silicon` |
-          | **Linux ARM64** (RPi 4+, Graviton) | `neon` |
-          | **Older CPUs** (pre-2013) | `sse4-popcnt`, `ssse3`, or `x86-64` |
+          Take **`universal`**. Take `compat` only if `universal` does not start (a CPU older
+          than ~2013): it is the same engine on portable code paths — slower search, and a
+          scalar network below AVX2 — but it plays the same chess.
 
-          When in doubt, use **`bmi2`** (x86) or **`neon`** (ARM).
+          `gaiachess info` prints which paths were selected on your machine. The environment
+          variables `GAIA_SIMD=scalar|avx2|avx512|vnni512` and `GAIA_PEXT=0|1` cap the
+          selection, for benchmarking or troubleshooting.
 
-          ### Binary details
+          ### Running on Linux
 
-          | Suffix | SIMD | Eval | Target CPUs |
-          |--------|------|------|-------------|
-          | `x86-64` | — | PeSTO | Any x86-64 CPU (2003+) |
-          | `ssse3` | SSSE3 | PeSTO | Core 2+ (2006+) |
-          | `sse4-popcnt` | SSE4 + POPCNT | PeSTO | Nehalem+ (2008+) |
-          | `avx2` | AVX2 | NNUE | Haswell+, Zen 1/2 (no fast PEXT) |
-          | `bmi2` | AVX2 + PEXT | NNUE | Haswell+, Zen 3+ |
-          | `avx512` | AVX-512 | NNUE | Skylake-X, Zen 4 |
-          | `avx512vnni` | AVX-512 + VNNI | NNUE | Ice Lake+, Zen 5 |
-          | `znver3` | AVX2 + PEXT | NNUE | AMD Ryzen 5000 (tuned) |
-          | `znver4` | AVX-512 | NNUE | AMD Ryzen 7000 (tuned) |
-          | `znver5` | AVX-512 + VNNI | NNUE | AMD Ryzen 9000 (tuned) |
-          | `neon` | NEON | NNUE | ARM64 Linux |
-          | `apple-silicon` | NEON | NNUE | macOS Apple Silicon |
+          The binary is both the engine and the board: started on its own it opens the
+          interface, and a chess GUI that speaks UCI to it gets the engine instead.
+          Because it carries the interface's sound, **Linux binaries need `libasound2`**
+          (`alsa-lib` on Arch) — present on any desktop, sometimes missing from minimal
+          server images and containers. Windows and macOS need nothing extra.
 
-          All x86-64 binaries are compiled with **PGO** (Profile-Guided Optimization) for maximum performance.
-          The AVX-512 variants are profiled under Intel SDE, since no CI runner is guaranteed to support AVX-512.
-          NNUE binaries embed the neural network — no external file needed.
-          PeSTO binaries (x86-64, ssse3, sse4-popcnt) use a classical evaluation for older hardware.
+          All x86-64 binaries are compiled with **PGO** (Profile-Guided Optimization); every
+          SIMD tier the binary can select is profiled, the AVX-512 ones under Intel SDE.
+          The neural network is embedded — no external file needed.
+
+          ### Play in a browser
+
+          The whole game is a web page too, with nothing to install:
+          **https://jromang.itch.io/gaiachess**
+
+          `gaiachess-web.zip` is that page, for anyone who would rather serve it from
+          their own static host. Two things it wants: an embed of **528x630** (three times
+          the artwork, so nothing is scaled), and cross-origin isolation —
+          `COOP`/`COEP` headers — without which a search can only be abandoned, never
+          cut short.
           NOTES
           )"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   # ================================================================
-  # Job 1: Linux x86-64 (10 variants, PGO)
+  # Job 1: Linux x86-64 (universal + compat, runtime dispatch, PGO)
   # ================================================================
   linux-x86:
     needs: create-release
@@ -83,17 +84,19 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           components: llvm-tools-preview
 
+      # libasound2-dev: the board ships as a default feature, and its sound pulls
+      # alsa-sys, whose build script asks pkg-config for the ALSA headers.
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang
+          sudo apt-get install -y clang libasound2-dev
 
       # PGO has to RUN the instrumented binary to collect profiles, and GitHub
       # cannot guarantee an AVX-512 runner (actions/runner-images#3389). The pool
@@ -122,6 +125,14 @@ jobs:
           ./tools/pgo/build-release.sh --linux-only
         env:
           # Fail the build rather than silently publish a non-PGO AVX-512 binary.
+          PGO_SDE: require
+
+      # One SIMD tier must count the same bench nodes from either binary, and
+      # the attack-path election must not change the tree — anything else is a
+      # dispatch or weight-permutation bug about to ship as a wrong evaluation.
+      - name: Verify runtime dispatch
+        run: ./tools/pgo/verify-dispatch.sh output/gaiachess-linux-universal output/gaiachess-linux-compat
+        env:
           PGO_SDE: require
 
       - name: Upload binaries to release
@@ -153,7 +164,7 @@ jobs:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -203,6 +214,11 @@ jobs:
           # Fail the build rather than silently publish a non-PGO AVX-512 binary.
           PGO_SDE: require
 
+      - name: Verify runtime dispatch
+        run: ./tools/pgo/verify-dispatch.sh output/gaiachess-windows-universal.exe output/gaiachess-windows-compat.exe
+        env:
+          PGO_SDE: require
+
       - name: Upload binaries to release
         run: |
           TAG="${GITHUB_REF#refs/tags/}"
@@ -221,17 +237,38 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-unknown-linux-gnu
 
+      # The board ships by default and its sound links against ALSA, so the arm64
+      # headers are needed here too. They are not on the default mirrors, which
+      # carry amd64 only -- arm64 lives on ports.ubuntu.com. So the existing
+      # entries are pinned to amd64, otherwise apt 404s on them for arm64, and the
+      # ports mirror is added beside them. libasound2-dev is Multi-Arch: same, so
+      # the two architectures coexist.
       - name: Install dependencies
         run: |
+          sudo dpkg --add-architecture arm64
+          CODENAME=$(. /etc/os-release && echo "$VERSION_CODENAME")
+          KEYRING=/usr/share/keyrings/ubuntu-archive-keyring.gpg
+          test -f "$KEYRING"
+          if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then
+            sudo sed -i '/^Types: deb/a Architectures: amd64' /etc/apt/sources.list.d/ubuntu.sources
+          else
+            sudo sed -i 's/^deb \(http\)/deb [arch=amd64] \1/' /etc/apt/sources.list
+          fi
+          sudo tee /etc/apt/sources.list.d/arm64-ports.list >/dev/null <<PORTS
+          deb [arch=arm64 signed-by=$KEYRING] http://ports.ubuntu.com/ubuntu-ports $CODENAME main universe
+          deb [arch=arm64 signed-by=$KEYRING] http://ports.ubuntu.com/ubuntu-ports $CODENAME-updates main universe
+          PORTS
           sudo apt-get update
-          sudo apt-get install -y clang gcc-aarch64-linux-gnu
+          sudo apt-get install -y clang gcc-aarch64-linux-gnu libasound2-dev:arm64
+          # Fail here, not three minutes later with an unreadable link error.
+          test -f /usr/lib/aarch64-linux-gnu/pkgconfig/alsa.pc
 
       - name: Download net
         run: |
@@ -246,6 +283,15 @@ jobs:
         run: |
           export OUTPUT_DIR="$GITHUB_WORKSPACE/output"
           ./tools/pgo/build-release-arm.sh
+        env:
+          # pkg-config will not answer for another architecture unless told to, and
+          # would otherwise hand the build the amd64 ALSA. LIBDIR replaces the
+          # default search path outright, so no host .pc can slip in. Set here and
+          # not in the build script: these paths are Debian multiarch, and the
+          # script also runs on other distributions.
+          PKG_CONFIG_ALLOW_CROSS: "1"
+          PKG_CONFIG_LIBDIR: /usr/lib/aarch64-linux-gnu/pkgconfig:/usr/share/pkgconfig
+          PKG_CONFIG_SYSROOT_DIR: /
 
       - name: Upload binary to release
         run: |
@@ -265,7 +311,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -298,4 +344,98 @@ jobs:
           ls -lh output/
           gh release upload "$TAG" output/gaiachess-macos-apple-silicon --clobber
         env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ================================================================
+  # Job 5: WebAssembly package, ready to upload to itch.io
+  # ================================================================
+  web:
+    needs: create-release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Download net
+        run: |
+          NET=$(grep '^DEFAULT_NET=' defaults.conf | head -1 | sed 's/DEFAULT_NET=//;s/"//g')
+          mkdir -p $(dirname "$NET")
+          curl --fail --retry 3 -L -o "$NET" "https://huggingface.co/jromanghf/gaiachess-networks/resolve/main/$(basename $NET)"
+
+      - name: Build the package
+        run: bash tools/web/build.sh --zip
+
+      # The browser build has no test suite of its own, and every fault in it is silent:
+      # a mis-declared import becomes a stub that quietly does nothing. So the engine
+      # module is made to actually play here, under Node, with the weights it ships
+      # beside — which needs no browser.
+      - name: Check the engine module plays a move
+        run: |
+          python3 -c "import zlib, sys; sys.stdout.buffer.write(zlib.decompress(open('web/dist/net.bin.deflate', 'rb').read(), -15))" > /tmp/net.bin
+          cat > /tmp/session.uci <<'SESSION'
+          uci
+          isready
+          position startpos
+          go depth 12
+          quit
+          SESSION
+          node web/engine/host.mjs web/dist/engine.wasm --net /tmp/net.bin < /tmp/session.uci > /tmp/out.txt
+          tail -3 /tmp/out.txt
+          grep -qE '^bestmove [a-h][1-8][a-h][1-8]' /tmp/out.txt || {
+            echo 'the engine module named no move'
+            exit 1
+          }
+
+      - name: Check the archive
+        run: python3 tools/web/check-zip.py var/web/gaiachess-web.zip
+
+      - name: Upload to release
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          ls -lh var/web/
+          gh release upload "$TAG" var/web/gaiachess-web.zip --clobber
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ================================================================
+  # Job 6: publish to itch.io — the page to play on, and three downloads
+  # ================================================================
+  # Last, and behind every build job: itch.io is where people arrive, and a page that
+  # offers three platforms of which one is missing is worse than a page that waits. The
+  # binaries are taken from the release rather than rebuilt, so what itch serves is the
+  # same file as the one under the tag, byte for byte.
+  itch:
+    needs: [create-release, linux-x86, windows-x86, macos-arm, web]
+    # Only the public repository publishes. A v* tag pushed anywhere else builds
+    # everything and touches nothing on itch.io.
+    if: github.repository == 'jromang/gaiachess'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+
+      # Pinned rather than LATEST, like the SDE action above: the version that publishes
+      # should change because someone chose it, not because a day passed.
+      - name: Install butler
+        run: |
+          curl --fail --retry 3 -L -o /tmp/butler.zip \
+            https://broth.itch.zone/butler/linux-amd64/15.30.0/archive/default
+          unzip -q -o /tmp/butler.zip -d "$HOME/butler"
+          chmod +x "$HOME/butler/butler"
+          echo "$HOME/butler" >> "$GITHUB_PATH"
+
+      - name: Verify butler
+        run: butler -V
+
+      - name: Push to itch.io
+        run: bash tools/itch/push.sh "${GITHUB_REF#refs/tags/}"
+        env:
+          BUTLER_API_KEY: ${{ secrets.BUTLER_API_KEY }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

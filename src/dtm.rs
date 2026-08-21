@@ -58,9 +58,9 @@ pub fn probe_position(pos: &Position, ply: i32) -> Option<i32> {
     let stm_dtm = dtm as i32;
 
     Some(if stm_dtm > 0 {
-        SCORE_MATE as i32 - ply - stm_dtm       // mate_in(ply + stm_dtm)
+        SCORE_MATE - ply - stm_dtm       // mate_in(ply + stm_dtm)
     } else if stm_dtm < 0 {
-        -(SCORE_MATE as i32) + ply + (-stm_dtm) // mated_in(ply + (-stm_dtm))
+        -SCORE_MATE + ply + (-stm_dtm) // mated_in(ply + (-stm_dtm))
     } else {
         0 // draw (stalemate or insufficient material)
     })
@@ -272,9 +272,9 @@ const MAP_PAWNS: [u8; 64] = {
         while fi < 4 {
             let (f1, f2) = files[fi];
             m[(rank * 8 + f1) as usize] = avail;
-            if avail > 0 { avail -= 1; }
+            avail = avail.saturating_sub(1);
             m[(rank * 8 + f2) as usize] = avail;
-            if avail > 0 { avail -= 1; }
+            avail = avail.saturating_sub(1);
             fi += 1;
         }
         rank += 1;
@@ -349,6 +349,9 @@ fn material_sig(white: &MatCounts, black: &MatCounts) -> [u8; SIG_LEN] {
 
 // ── Compact indexer ──────────────────────────────────────────────────
 
+/// The parameters describe one tablebase's shape; they travel together but are all
+/// plain scalars, and a struct here would only move the same list one line up.
+#[allow(clippy::too_many_arguments)]
 fn encode(
     wk: u8, bk: u8, piece_sqs: &[u8],
     has_pawns: bool,
@@ -381,12 +384,12 @@ fn encode(
         for (i, &sq) in piece_sqs.iter().enumerate() {
             cpieces[i] = apply_transform(sq, transform);
         }
-        if is_on_diagonal(cwk) {
-            if (cbk & 7) < (cbk >> 3) {
-                cbk = diagonal_reflect(cbk);
-                for p in cpieces[..num_pieces].iter_mut() {
-                    *p = diagonal_reflect(*p);
-                }
+        if is_on_diagonal(cwk)
+            && (cbk & 7) < (cbk >> 3)
+        {
+            cbk = diagonal_reflect(cbk);
+            for p in cpieces[..num_pieces].iter_mut() {
+                *p = diagonal_reflect(*p);
             }
         }
         let kk_local = MAP_KK[ti][cbk as usize];
@@ -415,7 +418,7 @@ fn encode(
             let sq = cpieces[num_white_pawns + i];
             let mut pi = (sq - 8) as usize;
             for &excl in &cpieces[..num_white_pawns] {
-                if excl >= 8 && excl < 56 && excl < sq { pi -= 1; }
+                if (8..56).contains(&excl) && excl < sq { pi -= 1; }
             }
             bp_mapped[i] = pi;
         }
@@ -436,7 +439,7 @@ fn encode(
     };
     occ[1] = canon_bk;
     let mut occ_len = 2 + num_pawns;
-    for i in 0..num_pawns { occ[2 + i] = cpieces[i]; }
+    occ[2..2 + num_pawns].copy_from_slice(&cpieces[..num_pawns]);
     occ[..occ_len].sort_unstable();
 
     let mut piece_offset = num_pawns;
@@ -596,12 +599,12 @@ impl Prober {
             let ownp: usize = white[1..].iter().map(|&c| c as usize).sum();
             let obnp: usize = black[1..].iter().map(|&c| c as usize).sum();
             let mut pos = 0;
-            for i in 0..obp { enc_pieces[pos] = piece_sqs[owp + i] ^ 56; pos += 1; }
-            for i in 0..owp { enc_pieces[pos] = piece_sqs[i] ^ 56; pos += 1; }
+            for &sq in &piece_sqs[owp..owp + obp] { enc_pieces[pos] = sq ^ 56; pos += 1; }
+            for &sq in &piece_sqs[..owp] { enc_pieces[pos] = sq ^ 56; pos += 1; }
             let np_start = owp + obp;
             pos = obp + owp;
-            for i in 0..obnp { enc_pieces[pos] = piece_sqs[np_start + ownp + i] ^ 56; pos += 1; }
-            for i in 0..ownp { enc_pieces[pos] = piece_sqs[np_start + i] ^ 56; pos += 1; }
+            for &sq in &piece_sqs[np_start + ownp..np_start + ownp + obnp] { enc_pieces[pos] = sq ^ 56; pos += 1; }
+            for &sq in &piece_sqs[np_start..np_start + ownp] { enc_pieces[pos] = sq ^ 56; pos += 1; }
         } else {
             enc_pieces[..num_pieces].copy_from_slice(piece_sqs);
         }

@@ -1,0 +1,15 @@
+[package]
+name = "gaia-web-engine"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# The interface is deliberately absent: this module is the search and nothing else, and
+# the two halves of the browser build are separate modules precisely so that neither
+# carries the other's dependencies.
+gaiachess = { path = "../..", default-features = false, features = ["nnue"] }

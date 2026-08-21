@@ -26,12 +26,39 @@ pub static STOP: AtomicBool = AtomicBool::new(false);
 /// from ponder mode to normal search with real time limits.
 pub static PONDER: AtomicBool = AtomicBool::new(false);
 
-/// Bench mode flag. When true, `check_limits()` updates `BENCH_NODES`.
-pub static BENCH_MODE: AtomicBool = AtomicBool::new(false);
+/// Whether anything outside the search is watching how fast it goes. Off — which is how
+/// every ordinary search runs — [`ThreadData::check_limits`] does not touch the counter
+/// below at all, so nobody pays for a figure nobody is reading.
+pub static COUNT_NODES: AtomicBool = AtomicBool::new(false);
 
-/// Accumulated node count during bench, updated every 2048 nodes.
-/// Read by the bench monitoring thread for real-time NPS display.
-pub static BENCH_NODES: AtomicU64 = AtomicU64::new(0);
+/// Nodes searched, to the nearest 512, by every thread while [`COUNT_NODES`] is set.
+/// Read by the bench monitor and by the interface's rate display; it only ever climbs,
+/// so a reader wanting a rate takes the difference over a window of its own.
+pub static NODES_SEARCHED: AtomicU64 = AtomicU64::new(0);
+
+/// Whether whoever is hosting the engine has asked for the search to end.
+///
+/// Deliberately not part of [`should_stop`], which every node calls: an imported function
+/// there would cost more than the search saves. [`ThreadData::check_limits`] asks instead,
+/// on its 512-node tick.
+#[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
+#[inline]
+fn host_wants_stop() -> bool {
+    #[link(wasm_import_module = "env")]
+    unsafe extern "C" {
+        /// Non-zero once the host wants the current search abandoned.
+        fn gaia_host_stop() -> i32;
+    }
+    unsafe { gaia_host_stop() != 0 }
+}
+
+/// Nothing asks on a target that has no host to ask. Constant-folded away, so the search
+/// is the same instruction for instruction and the bench node count cannot move.
+#[cfg(not(all(target_arch = "wasm32", not(target_os = "wasi"))))]
+#[inline(always)]
+fn host_wants_stop() -> bool {
+    false
+}
 
 /// Check if search should stop.
 #[inline]
@@ -185,6 +212,11 @@ impl SharedState {
 /// are shared (via `&SharedState`).
 pub struct ThreadData {
     pub id: usize,
+    /// Keeps this thread from writing to stdout. Thread 0 owns the clock, the root
+    /// reporting and the tablebase lookups; a caller that wants those but not the
+    /// output — a graphical interface driving the engine in-process — sets this rather
+    /// than taking a helper's id, which would silently cost it the time management too.
+    pub silent: bool,
     pub pos: Position,
     pub nodes: u64,
     /// Quiescence search node counter (diagnostic).
@@ -235,6 +267,12 @@ pub struct ThreadData {
     pub root_moves: Vec<RootMove>,
     /// Number of PV lines to search (UCI MultiPV option, default 1).
     pub multi_pv: usize,
+    /// How many principal variations the caller actually asked to be told about.
+    ///
+    /// A weakened level searches more of them than that, so it has something to choose
+    /// between (see `skill::variety_pick`); that is its own business and not something to
+    /// report to an interface that asked for one line.
+    pub reported_multi_pv: usize,
     /// Index of the PV line currently being searched (0-based).
     pub pv_index: usize,
     /// Tablebase hit counter (reported as `tbhits` in UCI info).
@@ -253,12 +291,25 @@ pub struct ThreadData {
     /// Set by evaluate_pos() when the lazy-eval gate fired (PeSTO used instead of NNUE).
     /// Read immediately afterward to skip correction history application/update.
     pub used_lazy_eval: bool,
+    /// The handicap in force, read once when the search starts. Inert at full strength,
+    /// where every test on it is a `false` bool and costs nothing. Taken as a copy so
+    /// the hot loops never touch an atomic, and so a level changed mid-search cannot
+    /// make the engine two different opponents in one move.
+    pub skill: crate::skill::Snapshot,
     /// Optimism bonus indexed by Color. Computed at root from running avg score.
     /// Positive = side is optimistic (root scores well), blended into eval.
     pub optimism: [i32; 2],
     /// Follow-PV guard: PV from the previous iteration
     pub last_iteration_pv: [Move; MAX_PLY + 1],
     pub last_iteration_pv_len: usize,
+    /// Search statistics (feature `stats`). Boxed to keep ThreadData small.
+    /// Written only by the owning thread; aggregated by the pool after join.
+    #[cfg(feature = "stats")]
+    pub stats: Box<crate::stats::SearchStats>,
+    /// Search tree recorder (feature `tree`). Installed by the dump runner;
+    /// `None` during normal play so recording costs nothing.
+    #[cfg(feature = "tree")]
+    pub tree: Option<Box<crate::tree::TreeRec>>,
 }
 
 impl ThreadData {
@@ -274,6 +325,7 @@ impl ThreadData {
 
         ThreadData {
             id,
+            silent: false,
             pos: Position::from_fen(STARTPOS).expect("startpos"),
             nodes: 0,
             qs_nodes: 0,
@@ -304,6 +356,7 @@ impl ThreadData {
             pondering: false,
             root_moves: Vec::new(),
             multi_pv: 1,
+            reported_multi_pv: 1,
             pv_index: 0,
             tb_hits: 0,
             #[cfg(feature = "syzygy")]
@@ -312,9 +365,14 @@ impl ThreadData {
             bm_stability: 0,
             prev_best_move: Move::NONE,
             used_lazy_eval: false,
+            skill: crate::skill::Snapshot::FULL_STRENGTH,
             optimism: [0; 2],
             last_iteration_pv: [Move::NONE; MAX_PLY + 1],
             last_iteration_pv_len: 0,
+            #[cfg(feature = "stats")]
+            stats: Box::new(crate::stats::SearchStats::zeroed()),
+            #[cfg(feature = "tree")]
+            tree: None,
         }
     }
 
@@ -355,9 +413,20 @@ impl ThreadData {
     #[inline]
     pub fn check_limits(&mut self) {
         if self.nodes & 511 == 0 {
-            // Update bench node counter (monitoring thread reads this for NPS)
-            if BENCH_MODE.load(Ordering::Relaxed) {
-                BENCH_NODES.fetch_add(512, Ordering::Relaxed);
+            // Feed whoever is watching the rate: the bench monitor, or the interface
+            // showing what the engine is doing on the player's time.
+            if COUNT_NODES.load(Ordering::Relaxed) {
+                NODES_SEARCHED.fetch_add(512, Ordering::Relaxed);
+            }
+
+            // A host outside the engine may want the search to end: a browser tab, where
+            // the interface runs in one thread and the search in another and a message
+            // cannot reach a worker busy in a search. Asked once every 512 nodes, so the
+            // call costs a few thousand a second and the answer is never more than a
+            // fraction of a millisecond stale. On every other target this folds away to
+            // nothing at compile time.
+            if host_wants_stop() {
+                STOP.store(true, Ordering::Relaxed);
             }
 
             // Detect ponderhit transition: PONDER was cleared by stdin reader
@@ -367,10 +436,10 @@ impl ThreadData {
             }
 
             // Skip time/node limits while pondering (search indefinitely)
-            if !self.pondering {
-                if self.tm.should_stop_hard() || self.nodes >= self.tm.max_nodes() {
-                    STOP.store(true, Ordering::Relaxed);
-                }
+            if !self.pondering
+                && (self.tm.should_stop_hard() || self.nodes >= self.tm.max_nodes())
+            {
+                STOP.store(true, Ordering::Relaxed);
             }
             // Per-thread deadline (datagen): stop this thread without touching global STOP
             if self.search_deadline > 0 && self.tm.elapsed_ms() >= self.search_deadline {
@@ -386,10 +455,28 @@ impl ThreadData {
         self.stopped || should_stop()
     }
 
+    /// Lowers the search ceiling to what the handicap allows in this position.
+    ///
+    /// How far a weakened level looks is a property of the level and the position
+    /// together, so it can only be settled once the root position is known. Anything that
+    /// installs a time manager of its own must call this afterwards or the level searches
+    /// as deep as it likes — which is why it is a method and not three copies of a
+    /// two-line `if`.
+    pub fn apply_skill_ceiling(&mut self) {
+        if self.skill.active {
+            self.tm.cap_depth(crate::skill::ceiling(&self.skill, self.pos.key));
+        }
+    }
+
     /// Prepare this thread for a new search.
     pub fn prepare_search(&mut self, pos: &Position, limits: &SearchLimits) {
         self.pos = pos.clone();
         self.nodes = 0;
+        // Read the handicap once, here: the level is set before a search is asked for,
+        // never during one.
+        self.skill = crate::skill::snapshot();
+        #[cfg(feature = "stats")]
+        self.stats.clear();
 
         // Refresh NNUE accumulator for root position
         if nnue::network::has_network() {
@@ -434,6 +521,14 @@ impl ThreadData {
             self.tm = TimeManager::new(limits);
         } else {
             self.tm = TimeManager::new(&SearchLimits::Infinite);
+        }
+        self.apply_skill_ceiling();
+        // The upper rungs need to see more than one root move to have anything to choose
+        // between. Raised, never lowered: someone who asked for a multi-PV analysis gets
+        // the lines they asked for.
+        self.reported_multi_pv = self.multi_pv;
+        if self.skill.active {
+            self.multi_pv = self.multi_pv.max(self.skill.rung.variety_moves.max(1) as usize);
         }
 
         // Reset search stack
@@ -533,7 +628,20 @@ impl ThreadPool {
             td.prepare_search(pos, &limits);
         }
 
-        if self.threads.len() == 1 {
+        // A weakened engine opens out of the book rather than searching, which is what
+        // keeps a given level from playing the same game every time. Full strength
+        // never gets here — `book::choice` answers `None` before it looks at anything.
+        let analysing = self.multi_pv > 1
+            || matches!(limits, SearchLimits::Infinite)
+            || PONDER.load(Ordering::Relaxed);
+        if let Some(mv) = crate::book::choice(pos, analysing) {
+            return (mv, None);
+        }
+
+        // A handicapped engine searches on one thread whatever the machine has, so a
+        // given skill level plays the same everywhere. Extra cores would otherwise
+        // quietly make a "weak" opponent stronger.
+        if self.threads.len() == 1 || crate::skill::level() < crate::skill::FULL_STRENGTH {
             // Single-thread fast path: no spawning overhead
             search::search(&mut self.threads[0], &self.shared);
             self.last_best_idx = 0;
@@ -653,6 +761,16 @@ impl ThreadPool {
         }
 
         best
+    }
+
+    /// Sum search statistics across all threads (call after the search joins).
+    #[cfg(feature = "stats")]
+    pub fn aggregated_stats(&self) -> crate::stats::SearchStats {
+        let mut agg = crate::stats::SearchStats::zeroed();
+        for td in &self.threads {
+            agg.add(&td.stats);
+        }
+        agg
     }
 
     /// Extract the ponder move (PV[1]) from the given thread's best root move.

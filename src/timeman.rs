@@ -4,7 +4,7 @@
 //! Soft limit: checked after each completed iteration (stop if exceeded).
 //! Hard limit: checked every 2048 nodes (abort if exceeded).
 
-use std::time::Instant;
+use crate::time::Instant;
 
 
 /// Search limits parsed from a UCI `go` command.
@@ -29,10 +29,8 @@ pub enum SearchLimits {
 pub struct TimeManager {
     start: Instant,
     base_soft_limit: u64, // ms, original value before stability adjustment
-    base_hard_limit: u64, // ms, original hard value before stability adjustment
     soft_limit: u64,      // ms, adjusted by stability multiplier
-    hard_limit: u64,      // ms, adjusted by stability multiplier
-    max_limit: u64,       // ms, absolute ceiling on time for one move
+    hard_limit: u64,      // ms, fixed ceiling for one move
     max_depth: i32,
     max_nodes: u64,
 }
@@ -40,11 +38,11 @@ pub struct TimeManager {
 impl TimeManager {
     /// Create a time manager from search limits.
     pub fn new(limits: &SearchLimits) -> TimeManager {
-        let (soft, hard, max, depth, nodes) = match *limits {
-            SearchLimits::Infinite => (u64::MAX, u64::MAX, u64::MAX, i32::MAX, u64::MAX),
-            SearchLimits::Depth(d) => (u64::MAX, u64::MAX, u64::MAX, d, u64::MAX),
-            SearchLimits::Nodes(n) => (u64::MAX, u64::MAX, u64::MAX, i32::MAX, n),
-            SearchLimits::MoveTime(ms) => (ms, ms, ms, i32::MAX, u64::MAX),
+        let (soft, hard, depth, nodes) = match *limits {
+            SearchLimits::Infinite => (u64::MAX, u64::MAX, i32::MAX, u64::MAX),
+            SearchLimits::Depth(d) => (u64::MAX, u64::MAX, d, u64::MAX),
+            SearchLimits::Nodes(n) => (u64::MAX, u64::MAX, i32::MAX, n),
+            SearchLimits::MoveTime(ms) => (ms, ms, i32::MAX, u64::MAX),
             SearchLimits::Clock { time, inc, movestogo } => {
                 let overhead = crate::tune::MOVE_OVERHEAD() as u64;
                 let moves = movestogo.unwrap_or(24);
@@ -61,18 +59,16 @@ impl TimeManager {
                     time / moves + inc * 94 / 100 - overhead
                 };
                 let soft = (computed.min(max) * 73 / 100).min(hard);
-                (soft, hard, max, i32::MAX, u64::MAX)
+                (soft, hard, i32::MAX, u64::MAX)
             }
         };
 
         TimeManager {
             start: Instant::now(),
+            max_depth: depth,
             base_soft_limit: soft,
-            base_hard_limit: hard,
             soft_limit: soft,
             hard_limit: hard,
-            max_limit: max,
-            max_depth: depth,
             max_nodes: nodes,
         }
     }
@@ -87,6 +83,16 @@ impl TimeManager {
     #[inline]
     pub fn max_depth(&self) -> i32 {
         self.max_depth
+    }
+
+    /// Lowers the ceiling, never raises it.
+    ///
+    /// A weakened opponent is capped here rather than inside the search, so the ceiling
+    /// applies whatever kind of limit was asked for. It is applied once the root position
+    /// is known, because how far a level looks depends on the position in front of it.
+    #[inline]
+    pub fn cap_depth(&mut self, ceiling: i32) {
+        self.max_depth = self.max_depth.min(ceiling);
     }
 
     /// Maximum nodes to search.
@@ -108,9 +114,9 @@ impl TimeManager {
     }
 
     /// Adjust soft limit by a multiplier (for best-move / score stability).
-    /// Always computed from the original base, clamped to [1, max_limit].
-    /// Both soft and hard limits are scaled by stability, but
-    /// never exceed the absolute ceiling (max_limit = 60% of clock).
+    /// Always computed from the original base, so repeated calls do not compound,
+    /// and clamped to [1, hard_limit]: only the soft bound moves with stability,
+    /// the hard one stays where the clock put it.
     ///
     /// Reference: CPW — Search Progression § Soft bound (best move stability, eval stability)
     #[inline]

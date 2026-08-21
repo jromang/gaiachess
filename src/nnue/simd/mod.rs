@@ -1,39 +1,29 @@
 //! SIMD abstraction layer for NNUE inference.
 //!
-//! Compile-time dispatch via `#[cfg(target_feature)]`:
-//! - AVX-512 (znver4, `target-cpu=znver4`)
-//! - AVX2 (most x86-64, `target-cpu=native`)
-//! - NEON (aarch64, always available — e.g. Raspberry Pi 5)
-//! - Scalar fallback (no SIMD features)
+//! Each backend module exports the same API: lane constants + primitive functions
+//! (`add_i16`, `dpbusd`, `packus`, ...). The kernels in `nnue::kernels` are
+//! monomorphized once per backend via `use <backend> as simd;`, so a kernel body
+//! written against `simd::*` compiles against every register width.
 //!
-//! All backends export the same API: lane constants + primitive functions.
-//! Code using `simd::add_i16()` etc. works regardless of backend.
+//! On x86-64 every backend is compiled unconditionally — which backend *runs* is
+//! decided per instantiation in `nnue::kernels` (compile-time today, so the set of
+//! instantiated kernels still follows `#[cfg(target_feature)]`). Other
+//! architectures keep a single compile-time backend:
+//! - NEON (aarch64, always available — e.g. Raspberry Pi 5)
+//! - simd128 (wasm32, `-C target-feature=+simd128`)
+//! - Scalar fallback (no SIMD features)
 
-// Priority: AVX-512 > AVX2 > NEON > scalar
-#[cfg(target_feature = "avx512f")]
-mod avx512;
-#[cfg(target_feature = "avx512f")]
-pub use avx512::*;
-
-#[cfg(all(target_feature = "avx2", not(target_feature = "avx512f")))]
-mod avx2;
-#[cfg(all(target_feature = "avx2", not(target_feature = "avx512f")))]
-pub use avx2::*;
+#[cfg(target_arch = "x86_64")]
+pub mod avx2;
+#[cfg(target_arch = "x86_64")]
+pub mod avx512;
+#[cfg(target_arch = "x86_64")]
+pub mod avx512vnni;
 
 #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
-mod neon;
-#[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
-pub use neon::*;
+pub mod neon;
 
-#[cfg(not(any(
-    target_feature = "avx512f",
-    target_feature = "avx2",
-    all(target_arch = "aarch64", target_feature = "neon"),
-)))]
-mod scalar;
-#[cfg(not(any(
-    target_feature = "avx512f",
-    target_feature = "avx2",
-    all(target_arch = "aarch64", target_feature = "neon"),
-)))]
-pub use scalar::*;
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+pub mod wasm128;
+
+pub mod scalar;

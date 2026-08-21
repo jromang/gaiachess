@@ -1,0 +1,96 @@
+
+# Builds the browser package and proves it works, without waiting for a release.
+#
+# The release workflow does the same and attaches the zip to the tag; this one runs on
+# every push that could break it, and leaves the zip as a build artefact you can download
+# and drop on itch.io. Nothing in this chain fails loudly: a mis-declared import becomes a
+# stub that quietly does nothing, and a stale file ships without anyone noticing. Finding
+# that out at tag time would be finding out too late.
+#
+# It can also be started by hand from the Actions tab, which is how you try a change to
+# the recipe itself.
+
+name: Web
+
+on:
+  push:
+    paths:
+      - 'src/**'
+      - 'web/**'
+      - 'tools/web/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'build.rs'
+      - '.github/workflows/web.yml'
+  pull_request:
+    paths:
+      - 'src/**'
+      - 'web/**'
+      - 'tools/web/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'build.rs'
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: web-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+
+      - name: Download net
+        run: |
+          NET=$(grep '^DEFAULT_NET=' defaults.conf | head -1 | sed 's/DEFAULT_NET=//;s/"//g')
+          mkdir -p $(dirname "$NET")
+          curl --fail --retry 3 -L -o "$NET" "https://huggingface.co/jromanghf/gaiachess-networks/resolve/main/$(basename $NET)"
+
+      - name: Build the package
+        run: bash tools/web/build.sh --zip
+
+      # The one check no browser is needed for, and the one that matters most: the module
+      # is made to actually search, with the weights it ships beside.
+      - name: Check the engine module plays a move
+        run: |
+          python3 -c "import zlib, sys; sys.stdout.buffer.write(zlib.decompress(open('web/dist/net.bin.deflate', 'rb').read(), -15))" > /tmp/net.bin
+          cat > /tmp/session.uci <<'SESSION'
+          uci
+          isready
+          position startpos
+          go depth 12
+          quit
+          SESSION
+          node web/engine/host.mjs web/dist/engine.wasm --net /tmp/net.bin < /tmp/session.uci > /tmp/out.txt
+          tail -3 /tmp/out.txt
+          grep -qE '^bestmove [a-h][1-8][a-h][1-8]' /tmp/out.txt || {
+            echo 'the engine module named no move'
+            exit 1
+          }
+
+      - name: Check the archive
+        run: python3 tools/web/check-zip.py var/web/gaiachess-web.zip
+
+      # Downloadable from the run's summary page: this is the file that goes on itch.io.
+      - name: Keep the package
+        uses: actions/upload-artifact@v7
+        with:
+          name: gaiachess-web
+          path: var/web/gaiachess-web.zip
+          if-no-files-found: error

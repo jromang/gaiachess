@@ -112,11 +112,15 @@ pub fn submit_priority(key: u64, fen: String) {
 /// Uses `try_lock` — returns false (conservative) if contended.
 pub fn is_known(key: u64) -> bool {
     let s = state();
-    if let Ok(cache) = s.cache.try_lock() {
-        if cache.contains_key(&key) { return true; }
+    if let Ok(cache) = s.cache.try_lock()
+        && cache.contains_key(&key)
+    {
+        return true;
     }
-    if let Ok(pending) = s.pending.try_lock() {
-        if pending.contains(&key) { return true; }
+    if let Ok(pending) = s.pending.try_lock()
+        && pending.contains(&key)
+    {
+        return true;
     }
     false
 }
@@ -143,8 +147,7 @@ fn submit_inner(key: u64, fen: String, priority: bool) {
 ///             ≤7 pieces → `submit` (back of queue, PV-adjacent fallback).
 pub fn submit_pv_positions(pos: &Position, pv: &[Move], pv_len: usize) {
     let mut scratch = pos.clone();
-    for i in 0..pv_len {
-        let mv = pv[i];
+    for &mv in pv.iter().take(pv_len) {
         if mv == Move::NONE { break; }
         scratch.make_move(mv);
         let pieces = scratch.occupied().count_ones();

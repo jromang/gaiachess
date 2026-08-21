@@ -1,0 +1,18 @@
+gl.js is miniquad's own loader, taken verbatim from the crate source
+(miniquad-0.4.11/js/gl.js) and vendored here on purpose.
+
+It is not published to npm and not shipped in this repository by cargo, so it has to
+travel with the page. Its version is checked at load time against the `crate_version`
+the module exports, and a mismatch is a console error rather than a crash — which is
+exactly the kind of failure nobody notices. macroquad 0.4.16 pins miniquad to =0.4.11,
+so the pairing is stable; if that pin ever moves, this file must be refreshed with it.
+
+Licence
+-------
+gl.js is part of miniquad, © 2019-2020 Fedor Logachev, dual-licensed MIT or
+Apache-2.0. The MIT text sits beside it in LICENSE-miniquad-MIT, because MIT asks that
+its notice travel with every copy — and this is a copy, both in this repository and in
+the zip that goes on itch.io.
+
+MIT is compatible with the GPL that covers the rest of GaiaChess: the whole may be
+distributed under the GPL, and this file keeps its own terms within it.

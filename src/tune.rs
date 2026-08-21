@@ -198,11 +198,13 @@ tunable! {
     /// Razoring alpha max: do not razor in decisive positions.
     RAZOR_ALPHA_MAX = 2048, 512, 4096, 128;
 
-    // === SEE pruning in search (2) ===
-    /// SEE quiet move margin per depth^2 (centipawns, negative).
-    SEE_QUIET_MARGIN = -13, -60, 0, 5;
+    // === SEE pruning in search (3) ===
+    /// SEE quiet move margin per lmr_depth^2 (centipawns, negative).
+    SEE_QUIET_MARGIN = -14, -60, 0, 5;
     /// SEE capture move margin per depth (centipawns, negative).
     SEE_CAPTURE_MARGIN = -110, -200, 0, 10;
+    /// History divisor in lmr_depth for quiet SEE pruning.
+    PRUNE_HIST_DIV = 7113, 3000, 16000, 650;
 
     // === Futility pruning (3) ===
     /// Maximum depth to apply futility pruning.
@@ -305,69 +307,73 @@ tunable! {
     PROBCUT_REDUCTION = 6, 1, 6, 1;
 
     // === LMR centipawn system (18) ===
-    /// Base LMR: `X * ilog2(move_count) * ilog2(depth)`.
-    LMR_LOG_MUL = 201, 100, 500, 20;
-    /// Move count adjustment: `X * move_count` subtracted.
-    LMR_MOVECOUNT_MUL = 21, 20, 150, 8;
+    // Defaults below come from an SPSA retune of the LMR family around the
+    // smooth log-log term (1115 iterations x 400 games, TC 2+0.02).
+    /// Base LMR: `X * LMR_LN[move_count] * LMR_LN[depth] / 1024`.
+    /// Initial value was a least-squares fit to the previous ilog2-product form
+    /// over a leaf-weighted (mc, depth) domain (bias ~0); SPSA settled slightly above it.
+    LMR_LOG_MUL = 710, 256, 1280, 40;
+    /// Constant offset added to the LMR log-log term (1/1024 ply).
+    LMR_LOG_BASE = -12, -512, 512, 32;
     /// Quiet move base penalty (centipawns).
-    LMR_QUIET_BASE = 1779, 1000, 3000, 100;
+    LMR_QUIET_BASE = 1670, 1000, 3000, 100;
     /// Quiet history: `X * combined_history / 1024` subtracted.
-    LMR_QUIET_HIST_MUL = 117, 50, 400, 20;
+    LMR_QUIET_HIST_MUL = 130, 50, 400, 20;
     /// Capture base penalty (centipawns).
-    LMR_CAPTURE_BASE = 953, 500, 2500, 100;
+    LMR_CAPTURE_BASE = 1040, 500, 2500, 100;
     /// Capture history: `X * cap_hist / 1024` subtracted.
-    LMR_CAPTURE_HIST_MUL = 136, 30, 300, 15;
+    LMR_CAPTURE_HIST_MUL = 172, 30, 300, 15;
     /// PV node base bonus subtracted from R.
-    LMR_PV_BASE = 417, 100, 800, 40;
+    LMR_PV_BASE = 395, 100, 800, 40;
     /// PV window scaling: `X * (beta-alpha) / root_delta`.
-    LMR_PV_WINDOW_MUL = 405, 100, 800, 40;
+    LMR_PV_WINDOW_MUL = 486, 100, 800, 40;
     /// TT PV base bonus subtracted from R.
-    LMR_TTPV_BASE = 496, 100, 700, 35;
+    LMR_TTPV_BASE = 535, 100, 700, 35;
     /// TT PV score bonus: `X * (tt_score > alpha)`.
-    LMR_TTPV_SCORE_MUL = 598, 200, 1200, 50;
+    LMR_TTPV_SCORE_MUL = 545, 200, 1200, 50;
     /// TT PV depth bonus: `X * (tt_depth >= depth)`.
-    LMR_TTPV_DEPTH_MUL = 1225, 300, 1500, 60;
+    LMR_TTPV_DEPTH_MUL = 1200, 300, 1500, 60;
+    /// TT PV depth-linear term: `X * depth`.
+    LMR_TTPV_DEPTH_LIN = 23, 0, 64, 8;
     /// Cut node penalty added to R.
-    LMR_CUTNODE_BASE = 1849, 800, 3000, 100;
+    LMR_CUTNODE_BASE = 1670, 800, 3000, 100;
     /// Cut node depth gradient: `LMR_CUTNODE_BASE + X * depth / 1024`.
     LMR_CUTNODE_DEPTH = -420, -2000, 2000, 200;
     /// No TT move penalty: `X * (tt_move == NONE)`.
-    LMR_CUTNODE_NOTM_MUL = 974, 400, 3000, 80;
+    LMR_CUTNODE_NOTM_MUL = 850, 400, 3000, 80;
     /// Not-improving base penalty.
-    LMR_NOT_IMPROVING_BASE = 298, 100, 1200, 40;
+    LMR_NOT_IMPROVING_BASE = 220, 100, 1200, 40;
     /// Not-improving depth gradient: `LMR_NOT_IMPROVING_BASE + X * depth / 1024`.
-    LMR_NOT_IMPROVING_DEPTH = -54, -800, 800, 80;
+    LMR_NOT_IMPROVING_DEPTH = -190, -800, 800, 80;
     /// Not-improving scale: `X * improvement / 128`.
-    LMR_NOT_IMPROVING_MUL = 80, 80, 900, 30;
+    LMR_NOT_IMPROVING_MUL = 125, 80, 900, 30;
     /// Max not-improving penalty.
-    LMR_NOT_IMPROVING_MAX = 1457, 500, 2500, 100;
+    LMR_NOT_IMPROVING_MAX = 1300, 500, 2500, 100;
     /// Gives-check bonus subtracted from R.
-    LMR_CHECK_SUB = 487, 200, 2500, 100;
+    LMR_CHECK_SUB = 475, 200, 2500, 100;
     /// Bad TT score penalty added to R.
-    LMR_BAD_TT_SCORE = 248, 200, 1200, 50;
+    LMR_BAD_TT_SCORE = 245, 200, 1200, 50;
     /// LMR penalty when TT depth is shallower than current depth (1/1024 ply).
     /// A shallow TT entry is weaker evidence for the move, so reduce it more.
-    LMR_TT_SHALLOW_DEPTH = 172, 50, 800, 40;
+    LMR_TT_SHALLOW_DEPTH = 219, 50, 800, 40;
     /// Correction history LMR: reduce less when |correction_value| is large.
     /// Positions with strong correction are hard to evaluate statically → search deeper.
     /// Scales the LMR adjustment derived from the correction magnitude.
-    LMR_CORR_HIST_MUL = 2500, 500, 5000, 200;
+    LMR_CORR_HIST_MUL = 2640, 500, 5000, 200;
 
     /// LMR overextension for strongly boosted early moves.
     /// Reduction threshold r (in 1/1024 plies) that triggers the overextension.
-    /// -3072 means the move accumulated 3+ plies of net bonuses (history/PV/check).
-    LMR_OVEREXT_THRESHOLD = -3072, -6144, -1024, 256;
+    /// The move must accumulate 3.5+ plies of net bonuses (history/PV/check).
+    LMR_OVEREXT_THRESHOLD = -3625, -6144, -1024, 256;
     /// Max move_count allowed for LMR overextension.
-    LMR_OVEREXT_MAX_MC = 3, 1, 8, 1;
+    LMR_OVEREXT_MAX_MC = 5, 1, 8, 1;
     /// LMR recapture bonus: reduce less for noisy recaptures (plies in units of 1/1024).
-    RECAPTURE_LMR_BONUS = 968, 256, 1536, 32;
+    RECAPTURE_LMR_BONUS = 920, 256, 1536, 32;
 
-    // === Adaptive re-search (4) ===
+    // === Adaptive re-search (3) ===
     // Two-tiered do-deeper re-search, plus reduced-depth shallower re-search.
     /// Deeper tier 1 base: `score > best_score + X`.
     DEEPER_BASE = 64, 10, 150, 5;
-    /// Deeper tier 1 depth scale (disabled when set to 0).
-    DEEPER_DEPTH_MUL = 89, 0, 800, 40;
     /// Deeper tier 2 base: `score > best_score + X` → +2 depth for major tactical moves.
     DEEPER2_BASE = 860, 400, 1200, 50;
     /// Shallower base: `score < best_score + X + reduced_depth`.
@@ -396,16 +402,16 @@ tunable! {
     /// History bonus max: `.min(X)`.
     STAT_BONUS_MAX = 1570, 500, 3000, 100;
     /// History malus: `X * depth - offset`.
-    STAT_MALUS_MUL = 230, 50, 400, 15;
+    STAT_MALUS_MUL = 220, 50, 400, 15;
     /// History malus offset: `mul * depth - X`.
-    STAT_MALUS_SUB = 43, -50, 100, 8;
+    STAT_MALUS_SUB = 47, -50, 100, 8;
     /// History malus max: `.min(X)`.
-    STAT_MALUS_MAX = 592, 200, 2500, 100;
+    STAT_MALUS_MAX = 481, 200, 2500, 100;
 
     // === Non-PV best-move history bonus scaled by move count ===
     /// Divisor scaling the bonus by the number of moves tried at non-PV nodes.
     /// Smaller = stronger effect, larger = weaker effect.
-    BESTMOVE_MC_DIV = 256, 64, 1024, 32;
+    BESTMOVE_MC_DIV = 241, 64, 1024, 32;
 
     // === Move ordering (4) ===
     /// MVV multiplier in capture scoring: `PIECE_VALUE[victim] * X`.
@@ -504,8 +510,8 @@ mod tests {
         // Spot-check that getter functions return the declared defaults.
         assert_eq!(ASP_INITIAL_DELTA(), 18);
         assert_eq!(RFP_MARGIN(), 105);
-        assert_eq!(SEE_QUIET_MARGIN(), -13);
-        assert_eq!(LMR_LOG_MUL(), 201);
+        assert_eq!(SEE_QUIET_MARGIN(), -14);
+        assert_eq!(LMR_LOG_MUL(), 710);
         assert_eq!(NMP_BASE_R(), 5);
         assert_eq!(STAT_BONUS_MUL(), 153);
         assert_eq!(MVV_MULTIPLIER(), 17);
@@ -551,8 +557,12 @@ mod tests {
         // Fixed params are NOT exported
         assert!(!csv.contains("MOVE_OVERHEAD"));
         assert!(!csv.contains("TM_BM_BASE"));
-        // Count lines = number of tunable params (87)
-        assert_eq!(csv.lines().count(), 90);
+        // One line per tunable, and the same set as the JSON export. Counting them
+        // against a number written here by hand is what this used to do, and the number
+        // was left behind at 90 while the list grew past a hundred: a test that has to
+        // be edited every time a technique lands is a test nobody edits.
+        assert_eq!(csv.lines().count(), emit_json().matches("\"min_value\"").count());
+        assert!(csv.lines().count() > 80, "the tunable list has collapsed");
     }
 
     #[cfg(feature = "spsa")]

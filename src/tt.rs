@@ -158,6 +158,8 @@ impl TT {
 
     /// Prefetch the TT cluster for the given key into L1 cache.
     #[inline]
+    // The argument is only read where there is an instruction to read it for.
+    #[cfg_attr(not(target_arch = "x86_64"), allow(unused_variables))]
     pub fn prefetch(&self, key: u64) {
         #[cfg(target_arch = "x86_64")]
         unsafe {
@@ -179,7 +181,7 @@ impl TT {
     /// `ply` is the current search ply (for mate score adjustment).
     /// `halfmove_clock` is used to downgrade unreachable mate scores (GHI fix).
     pub fn probe(&self, key: u64, ply: i32, halfmove_clock: u8) -> Option<TTHit> {
-        debug_assert!(ply >= 0 && ply < 256, "TT probe: ply {} OOB", ply);
+        debug_assert!((0..256).contains(&ply), "TT probe: ply {} OOB", ply);
         // SAFETY: Racy reads are acceptable; key16 verification catches corruption.
         let cluster = unsafe { &*self.clusters[self.index(key)].get() };
         let verify = verification_key(key);
@@ -201,6 +203,7 @@ impl TT {
 
     /// Store a search result in the TT.
     /// Thread-safe: uses interior mutability for lockless concurrent writes.
+    #[allow(clippy::too_many_arguments)]
     pub fn store(
         &self,
         key: u64,
@@ -212,10 +215,10 @@ impl TT {
         ply: i32,
         pv: bool,
     ) {
-        debug_assert!(ply >= 0 && ply < 256, "TT store: ply {} OOB", ply);
+        debug_assert!((0..256).contains(&ply), "TT store: ply {} OOB", ply);
         debug_assert!(score.abs() <= SCORE_MATE_IN_MAX + 512,
             "TT store: score {} too large", score);
-        debug_assert!(depth >= -5 && depth <= 256, "TT store: depth {} OOB", depth);
+        debug_assert!((-5..=256).contains(&depth), "TT store: depth {} OOB", depth);
         debug_assert!(mv == Move::NONE || (mv.from_sq().0 < 64 && mv.to_sq().0 < 64),
             "TT store: move squares OOB from={} to={}", mv.from_sq().0, mv.to_sq().0);
         let idx = self.index(key);

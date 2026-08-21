@@ -87,10 +87,10 @@ pub fn probe_position(pos: &Position, ply: i32) -> Option<i32> {
 
     match prober.probe(white, black, kings, queens, rooks, bishops, knights, pawns, wtm, ep) {
         Ok(NalimovResult::Win { plies }) => {
-            Some(SCORE_MATE as i32 - ply - plies as i32)
+            Some(SCORE_MATE - ply - plies as i32)
         }
         Ok(NalimovResult::Loss { plies }) => {
-            Some(-(SCORE_MATE as i32) + ply + plies as i32)
+            Some(-SCORE_MATE + ply + plies as i32)
         }
         Ok(NalimovResult::Draw) => Some(0),
         Err(_) => None,

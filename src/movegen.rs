@@ -347,6 +347,9 @@ fn generate_moves(pos: &Position, buf: &mut ArrayBuf<Move, MAX_MOVES>, count: &m
     }
 }
 
+/// Precomputed masks are passed in rather than recomputed per piece type; they are
+/// all bitboards in registers, and a struct would put them behind a pointer.
+#[allow(clippy::too_many_arguments)]
 fn generate_pawn_moves(
     pos: &Position, buf: &mut ArrayBuf<Move, MAX_MOVES>, count: &mut usize,
     us: Color, them: Color,
@@ -455,6 +458,7 @@ fn generate_pawn_moves(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn generate_piece_moves(
     pos: &Position, buf: &mut ArrayBuf<Move, MAX_MOVES>, count: &mut usize,
     us: Color, our_pieces: u64, occupied: u64,

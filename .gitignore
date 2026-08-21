@@ -2,3 +2,8 @@
 nets/
 *.pgn
 perf.data*
+# Browser port: the bundle produced by tools/web/build.sh, and the test driver's
+# dependencies.
+web/dist/
+tools/web/node_modules/
+tools/web/package*.json

@@ -82,7 +82,7 @@ pub fn init() {
 fn ray_mask(sq: u8, dir: i8) -> u64 {
     let mut mask = 0u64;
     let mut s = sq as i8 + dir;
-    while s >= 0 && s < 64 {
+    while (0..64).contains(&s) {
         let file_diff = ((s & 7) - ((s - dir) & 7)).abs();
         if file_diff > 2 {
             break; // wrapped around a/h file
@@ -300,15 +300,19 @@ mod avx2 {
 // AVX-512 setwise slider attacks (Kogge-Stone approach)
 // ============================================================
 
-#[cfg(target_feature = "avx512f")]
+#[cfg(target_arch = "x86_64")]
 mod avx512 {
     use super::*;
     use std::arch::x86_64::*;
 
     /// Compute aggregated attacks of ALL sliders of one color simultaneously.
     /// All 8 ray directions are processed in parallel in a single 512-bit register.
-    #[inline(always)]
-    pub fn slider_attacks_setwise(
+    #[cfg_attr(
+        not(target_feature = "avx512f"),
+        target_feature(enable = "avx512f")
+    )]
+    #[inline]
+    pub unsafe fn slider_attacks_setwise(
         bishops: u64,
         rooks: u64,
         queens: u64,
@@ -393,7 +397,7 @@ mod avx512 {
                     ),
                     0,
                 );
-                _mm512_test_epi8_mask(attacks, attacks) as u64
+                _mm512_test_epi8_mask(attacks, attacks)
             }
 
             #[cfg(not(all(
@@ -439,31 +443,50 @@ pub fn queen_attacks(sq: Square, occupied: u64) -> u64 {
     avx2::queen_attacks(sq, occupied)
 }
 
-/// Aggregated attacks of **all** sliders of one color simultaneously via AVX-512 Kogge-Stone.
-/// Processes 8 ray directions in parallel in a single `zmm` register.
-#[cfg(target_feature = "avx512f")]
-#[inline(always)]
-pub fn slider_attacks_setwise(bishops: u64, rooks: u64, queens: u64, occupied: u64) -> u64 {
-    avx512::slider_attacks_setwise(bishops, rooks, queens, occupied)
+/// Whether the AVX-512 Kogge-Stone setwise fill runs — decided once at startup
+/// by `cpu::init` (AVX-512F detected), read as a plain load. Defaults to false
+/// so binaries that skipped init (unit tests) take the loop, which returns
+/// identical bitboards. Distribution builds only: a build made for one machine
+/// pins the answer at compile time instead.
+#[cfg(all(target_arch = "x86_64", gaia_dist))]
+static USE_SETWISE512: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(all(target_arch = "x86_64", gaia_dist))]
+pub fn set_setwise512(enabled: bool) {
+    USE_SETWISE512.store(enabled, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// Scalar fallback for [`slider_attacks_setwise`]: loops over each slider individually.
-#[cfg(not(target_feature = "avx512f"))]
+/// Aggregated attacks of **all** sliders of one color simultaneously:
+/// AVX-512 Kogge-Stone (8 ray directions in parallel in a single `zmm`
+/// register) when available, otherwise a loop over each slider individually.
+/// Both forms return the same bitboard. Distribution builds elect the fill at
+/// runtime; others pin it at compile time.
+#[inline(always)]
 pub fn slider_attacks_setwise(bishops: u64, rooks: u64, queens: u64, occupied: u64) -> u64 {
-    let mut attacks = 0u64;
-    let bq = bishops | queens;
-    let rq = rooks | queens;
-    let mut bb = bq;
-    while bb != 0 {
-        let sq = pop_lsb(&mut bb);
-        attacks |= crate::bitboard::bishop_attacks(sq, occupied);
+    #[cfg(all(target_arch = "x86_64", gaia_dist))]
+    if USE_SETWISE512.load(std::sync::atomic::Ordering::Relaxed) {
+        return unsafe { avx512::slider_attacks_setwise(bishops, rooks, queens, occupied) };
     }
-    bb = rq;
-    while bb != 0 {
-        let sq = pop_lsb(&mut bb);
-        attacks |= crate::bitboard::rook_attacks(sq, occupied);
+    #[cfg(all(target_feature = "avx512f", not(gaia_dist)))]
+    return unsafe { avx512::slider_attacks_setwise(bishops, rooks, queens, occupied) };
+
+    #[cfg(not(all(target_feature = "avx512f", not(gaia_dist))))]
+    {
+        let mut attacks = 0u64;
+        let bq = bishops | queens;
+        let rq = rooks | queens;
+        let mut bb = bq;
+        while bb != 0 {
+            let sq = pop_lsb(&mut bb);
+            attacks |= crate::bitboard::bishop_attacks(sq, occupied);
+        }
+        bb = rq;
+        while bb != 0 {
+            let sq = pop_lsb(&mut bb);
+            attacks |= crate::bitboard::rook_attacks(sq, occupied);
+        }
+        attacks
     }
-    attacks
 }
 
 // ============================================================
@@ -500,7 +523,7 @@ mod tests {
         init();
         let t = tables();
         // E-file rook on empty rank: should attack all files except E
-        let att = t.rook_attacks_ew[0 * 4 + 4]; // occ=0, file=4 (E)
+        let att = t.rook_attacks_ew[4]; // occ=0, file=4 (E)
         assert_eq!(att.count_ones(), 7); // A through H minus E
     }
 
@@ -523,7 +546,7 @@ mod tests {
                 assert_eq!(
                     simd, magic,
                     "bishop_attacks mismatch at {}: simd={:#018x} magic={:#018x} occ={:#018x}",
-                    sq.to_string(), simd, magic, occ
+                    sq, simd, magic, occ
                 );
             }
         }
@@ -548,7 +571,7 @@ mod tests {
                 assert_eq!(
                     simd, magic,
                     "rook_attacks mismatch at {}: simd={:#018x} magic={:#018x} occ={:#018x}",
-                    sq.to_string(), simd, magic, occ
+                    sq, simd, magic, occ
                 );
             }
         }
@@ -573,7 +596,7 @@ mod tests {
                 assert_eq!(
                     simd, magic,
                     "queen_attacks mismatch at {}: simd={:#018x} magic={:#018x} occ={:#018x}",
-                    sq.to_string(), simd, magic, occ
+                    sq, simd, magic, occ
                 );
             }
         }

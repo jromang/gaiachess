@@ -4,11 +4,11 @@
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
-use indicatif::{ProgressBar, ProgressStyle};
+use crate::progress::{ProgressBar, ProgressStyle};
 
 use crate::position::Position;
 use crate::search;
-use crate::threads::{SharedState, ThreadData, BENCH_MODE, BENCH_NODES, STOP};
+use crate::threads::{SharedState, ThreadData, COUNT_NODES, NODES_SEARCHED, STOP};
 use crate::timeman::SearchLimits;
 /// 27 unique positions from gaia3.0's profile() function (gaia3.0/src/util.c:328).
 pub(crate) const POSITIONS: [&str; 27] = [
@@ -57,8 +57,10 @@ pub fn run(depth_override: Option<i32>) {
 
     let mut total_nodes: u64 = 0;
     let mut total_time_ms: u64 = 0;
+    #[cfg(feature = "stats")]
+    let mut agg_stats = crate::stats::SearchStats::zeroed();
 
-    BENCH_MODE.store(true, Ordering::Relaxed);
+    COUNT_NODES.store(true, Ordering::Relaxed);
 
     let pb = ProgressBar::new(total);
     pb.set_style(
@@ -75,7 +77,7 @@ pub fn run(depth_override: Option<i32>) {
         let limits = SearchLimits::Depth(depth);
 
         STOP.store(false, Ordering::Relaxed);
-        BENCH_NODES.store(0, Ordering::Relaxed);
+        NODES_SEARCHED.store(0, Ordering::Relaxed);
 
         // Prepare search — override tm since prepare_search gives infinite
         // limits to id!=0 (same pattern as datagen.rs:prepare_datagen_search)
@@ -91,10 +93,12 @@ pub fn run(depth_override: Option<i32>) {
         let nodes = td.nodes;
         total_nodes += nodes;
         total_time_ms += elapsed_ms;
+        #[cfg(feature = "stats")]
+        agg_stats.add(&td.stats);
         pb.set_position(i as u64 + 1);
     }
 
-    BENCH_MODE.store(false, Ordering::Relaxed);
+    COUNT_NODES.store(false, Ordering::Relaxed);
 
     // Final summary
     let avg_nps = if total_time_ms > 0 {
@@ -114,6 +118,12 @@ pub fn run(depth_override: Option<i32>) {
     );
     // Deterministic line for regression checks (OpenBench-compatible format)
     println!("{} nodes {} nps", total_nodes, avg_nps);
+
+    // Aggregated search statistics on stderr (never pollutes the UCI stream)
+    #[cfg(feature = "stats")]
+    eprint!("{}", agg_stats.emit_text());
+    // Throwaway debug slots (silent when unused)
+    crate::stats::dbg::print();
 }
 
 /// Run the statistical benchmark: N runs with robust statistics.
@@ -130,7 +140,7 @@ pub fn run_stats(depth_override: Option<i32>, num_runs: u32, verbose: bool) {
     let mut shared = SharedState::new(BENCH_HASH_MB);
     let mut td = ThreadData::new(1);
 
-    BENCH_MODE.store(true, Ordering::Relaxed);
+    COUNT_NODES.store(true, Ordering::Relaxed);
 
     // Storage: per-position NPS across measured runs, plus overall NPS per run
     let mut nps_per_position: Vec<Vec<f64>> = vec![Vec::with_capacity(num_runs); num_positions];
@@ -166,7 +176,7 @@ pub fn run_stats(depth_override: Option<i32>, num_runs: u32, verbose: bool) {
             let limits = SearchLimits::Depth(depth);
 
             STOP.store(false, Ordering::Relaxed);
-            BENCH_NODES.store(0, Ordering::Relaxed);
+            NODES_SEARCHED.store(0, Ordering::Relaxed);
 
             td.prepare_search(&pos, &limits);
             td.tm = crate::timeman::TimeManager::new(&limits);
@@ -202,7 +212,7 @@ pub fn run_stats(depth_override: Option<i32>, num_runs: u32, verbose: bool) {
         }
     }
 
-    BENCH_MODE.store(false, Ordering::Relaxed);
+    COUNT_NODES.store(false, Ordering::Relaxed);
     pb.finish_with_message("done");
 
     // Compute statistics

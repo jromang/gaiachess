@@ -1,0 +1,33 @@
+<!doctype html><html><head><meta charset="utf-8"><title>stop</title></head><body>
+<pre id="out">running…</pre>
+<script type="module">
+const out = document.getElementById("out");
+const say = (s) => { out.textContent += "\n" + s; };
+say("crossOriginIsolated = " + self.crossOriginIsolated);
+
+const shared = typeof SharedArrayBuffer !== "undefined" && self.crossOriginIsolated;
+const flag = new Int32Array(shared ? new SharedArrayBuffer(4) : new ArrayBuffer(4));
+const w = new Worker("worker.mjs", { type: "module" });
+
+let t0 = 0;
+w.onmessage = async (e) => {
+  const m = e.data;
+  if (m.k === "ready") {
+    const r = await fetch("net.bin.deflate");
+    const bytes = await new Response(r.body.pipeThrough(new DecompressionStream("deflate-raw"))).arrayBuffer();
+    w.postMessage({ k: "net", bytes }, [bytes]);
+  } else if (m.k === "net") {
+    say("network loaded = " + m.ok);
+    w.postMessage({ k: "cmd", line: "position startpos" });
+    t0 = performance.now();
+    w.postMessage({ k: "go", line: "go movetime 60000", gen: 1 });
+    setTimeout(() => { Atomics.store(flag, 0, 1); say("flag raised at " + Math.round(performance.now() - t0) + " ms"); }, 300);
+  } else if (m.k === "best") {
+    const dt = Math.round(performance.now() - t0);
+    say("bestmove " + m.uci + " after " + dt + " ms");
+    say(dt < 2000 ? "RESULT stopped early" : "RESULT ran to the end");
+    window.__done = true;
+  }
+};
+w.postMessage({ k: "boot", wasm: "engine.wasm", stop: flag });
+</script></body></html>
