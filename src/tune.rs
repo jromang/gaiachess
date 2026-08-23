@@ -164,7 +164,7 @@ macro_rules! fixed {
 }
 
 // ─── Parameter declarations ─────────────────────────────────────────────────
-// tunable! = exported to SPSA tuners (90 params)
+// tunable! = exported to SPSA tuners (92 params)
 // fixed!   = locked, not exported (10 params)
 
 tunable! {
@@ -205,6 +205,14 @@ tunable! {
     SEE_CAPTURE_MARGIN = -110, -200, 0, 10;
     /// History divisor in lmr_depth for quiet SEE pruning.
     PRUNE_HIST_DIV = 7113, 3000, 16000, 650;
+
+    // === Full-depth search gating (3) ===
+    /// Reduction-signal addend when no TT move backs the position.
+    EMR_NOTM = 993, 0, 2000, 100;
+    /// Reduction-signal threshold for the first ply cut in full-depth search.
+    EMR_R_ONE = 4302, 2000, 8000, 200;
+    /// Reduction-signal threshold for the second ply cut in full-depth search.
+    EMR_R_TWO = 5919, 3000, 10000, 200;
 
     // === Futility pruning (3) ===
     /// Maximum depth to apply futility pruning.
@@ -413,9 +421,13 @@ tunable! {
     /// Smaller = stronger effect, larger = weaker effect.
     BESTMOVE_MC_DIV = 241, 64, 1024, 32;
 
-    // === Move ordering (4) ===
+    // === Move ordering (6) ===
     /// MVV multiplier in capture scoring: `PIECE_VALUE[victim] * X`.
     MVV_MULTIPLIER = 17, 4, 64, 4;
+    /// Good/bad capture split: base SEE threshold (centipawns, negative).
+    GOOD_CAP_BASE = -106, -300, 0, 16;
+    /// Good/bad capture split: capture history divisor shifting the threshold.
+    GOOD_CAP_HIST_DIV = 24, 8, 96, 4;
     /// Movepicker bonus for quiet moves that give direct check.
     MOVEPICK_CHECK_BONUS = 10000, 4000, 20000, 1000;
     /// Learned look-ahead: TT child eval multiplier (numerator).

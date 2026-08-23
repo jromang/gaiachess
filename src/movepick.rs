@@ -261,7 +261,32 @@ impl MovePicker {
                         if m == self.tt_move {
                             continue; // already yielded
                         }
-                        if see::see(pos, m, 0) {
+                        // Good/bad split against a SEE threshold shifted by the
+                        // move's capture history: a capture with a good track
+                        // record keeps its spot near the front even when static
+                        // SEE loses a little material — history knows about
+                        // discovered threats and recurring sacrifices that SEE
+                        // cannot see. Promotions keep the plain threshold
+                        // (their score carries no capture history).
+                        let mt = m.move_type();
+                        let victim_pc = pos.board[m.to_sq().index()];
+                        let threshold = if mt == MT_PROMOTION
+                            || (mt != MT_EN_PASSANT && victim_pc == Piece::NONE)
+                        {
+                            0
+                        } else {
+                            let piece = pos.board[m.from_sq().index()];
+                            debug_assert!(piece != Piece::NONE,
+                                "movepick: no piece on from {} for split {}", m.from_sq().0, m.to_uci());
+                            let captured_pt = if mt == MT_EN_PASSANT {
+                                PieceType::Pawn
+                            } else {
+                                victim_pc.piece_type()
+                            };
+                            let caphist = cap_history.get(piece, m.to_sq(), captured_pt);
+                            tune::GOOD_CAP_BASE() - caphist / tune::GOOD_CAP_HIST_DIV()
+                        };
+                        if see::see(pos, m, threshold) {
                             return m;
                         }
                         // Bad capture: store at end of array (LIFO)

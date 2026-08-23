@@ -93,8 +93,9 @@ impl Queue {
 }
 
 // The desktop backend. Everything above this point is backend-free, which is what
-// lets the browser build reuse it whole.
-#[cfg(feature = "gui")]
+// lets the browser build reuse it whole. Haiku is desktop too but rodio has no
+// backend there; it plays through the host backend below, like the browser.
+#[cfg(all(feature = "gui", not(target_os = "haiku")))]
 mod desktop {
     use super::{Sfx, synth, volume};
     use rodio::static_buffer::StaticSamplesBuffer;
@@ -158,18 +159,23 @@ mod desktop {
 
 }
 
-#[cfg(feature = "gui")]
+#[cfg(all(feature = "gui", not(target_os = "haiku")))]
 pub use desktop::Audio;
 
-// The browser backend. No audio crate at all: the samples are already made here, and a
-// host that has Web Audio can schedule them to the sample, which is the very thing the
-// desktop backend went to rodio for. It also keeps `quad-snd` out of the workspace,
-// whose `links = "alsa"` cannot coexist with the one rodio brings.
-#[cfg(all(feature = "gui-core", not(feature = "gui")))]
-mod web {
+// The host backend, shared by the two builds whose mixer lives outside this crate. No
+// audio crate at all: the samples are already made here, and the host can schedule
+// them to the sample, which is the very thing the desktop backend went to rodio for.
+// In the browser the two functions come from the page (Web Audio; keeping `quad-snd`
+// out of the workspace, whose `links = "alsa"` cannot coexist with the one rodio
+// brings); on Haiku they come from the native shim's BSoundPlayer mixer.
+#[cfg(any(
+    all(feature = "gui-core", not(feature = "gui")),
+    all(feature = "gui", target_os = "haiku")
+))]
+mod host {
     use super::{Sfx, synth, volume};
 
-    #[link(wasm_import_module = "env")]
+    #[cfg_attr(target_arch = "wasm32", link(wasm_import_module = "env"))]
     unsafe extern "C" {
         /// Hands the host one rendered clip, to keep until the page goes.
         fn gaia_sfx_register(id: u32, samples: *const f32, len: usize, rate: u32);
@@ -200,8 +206,11 @@ mod web {
     }
 }
 
-#[cfg(all(feature = "gui-core", not(feature = "gui")))]
-pub use web::Audio;
+#[cfg(any(
+    all(feature = "gui-core", not(feature = "gui")),
+    all(feature = "gui", target_os = "haiku")
+))]
+pub use host::Audio;
 
 #[cfg(test)]
 mod tests {

@@ -23,6 +23,7 @@ EXPECTED = {
     "gui.wasm",
     "engine.wasm",
     "net.bin.deflate",
+    "tb34.gtpk",
     "favicon16.png",
     "favicon32.png",
     # gl.js is miniquad's, under MIT: its notice has to travel with it.
@@ -51,6 +52,13 @@ def main(path: str) -> int:
         if size < MIN_MODULE_BYTES:
             print(f"{name} is only {size} bytes — a stub, not a build", file=sys.stderr)
             return 1
+
+    # The endgame tables: 35 compressed tables come to ~30 MB, so anything much
+    # smaller is a truncated download, not the blob.
+    size = archive.getinfo("tb34.gtpk").file_size
+    if size < 20 * 1024 * 1024:
+        print(f"tb34.gtpk is only {size} bytes — not the tables", file=sys.stderr)
+        return 1
 
     total = sum(entry.compress_size for entry in archive.infolist())
     print(f"  {len(names)} files, {total / 1048576:.1f} MB compressed")

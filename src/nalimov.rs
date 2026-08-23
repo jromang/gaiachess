@@ -22,10 +22,16 @@ static PROBER: OnceLock<Option<NalimovProber>> = OnceLock::new();
 /// Max pieces detected automatically at load time by scanning TB files.
 static MAX_PIECES: AtomicU32 = AtomicU32::new(0);
 
-/// Initialize the prober from colon-separated (Unix) or semicolon-separated
-/// (Windows) directory paths. Detects the max piece count automatically by
-/// scanning for `.nbw.emd` / `.nbb.emd` files.
+/// Initialize the prober from colon- or semicolon-separated (Unix) or
+/// semicolon-separated (Windows) directory paths. Detects the max piece count
+/// automatically by scanning for `.nbw.emd` / `.nbb.emd` files.
+///
+/// On Windows, `:` must NOT be a separator: it would split the drive letter
+/// out of paths like `H:\nalimov` and make every absolute path unloadable.
 pub fn init(paths: &str) -> bool {
+    #[cfg(windows)]
+    let path_list: Vec<&str> = paths.split(';').collect();
+    #[cfg(not(windows))]
     let path_list: Vec<&str> = paths.split([':', ';']).collect();
     let detected = detect_max_pieces(&path_list);
     match NalimovProber::new(&path_list) {

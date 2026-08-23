@@ -96,6 +96,20 @@ open(target, "wb").write(raw[at:-8])
 DEFLATE
 rm -f "$OUT/net.tmp.gz"
 
+# The endgame tables travel beside the modules for the same reason the weights do — the
+# worker embeds nothing on wasm — but exactly as they ship: the blob is zstd inside,
+# which the module decompresses itself, and its magic is not gzip's, so no host will
+# take it for something to unwrap in transport. Fetched from HuggingFace when absent,
+# from the same address build.rs uses for the native embed.
+TB_BLOB="${GAIATB_BLOB:-tb/tb34.gtpk}"
+if [ ! -f "$TB_BLOB" ]; then
+    echo "== tables: downloading tb34.gtpk =="
+    mkdir -p "$(dirname "$TB_BLOB")"
+    curl -L --fail --progress-bar -o "$TB_BLOB" \
+        "https://huggingface.co/datasets/jromanghf/gaiatb-tb34/resolve/main/tb34.gtpk?download=true"
+fi
+cp "$TB_BLOB" "$OUT/tb34.gtpk"
+
 ls -l "$OUT" | tail -n +2 | awk '{printf "  %-16s %6.1f MB\n", $NF, $5/1048576}'
 
 # -- Zip for itch.io ---------------------------------------------------------

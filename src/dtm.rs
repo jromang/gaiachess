@@ -13,16 +13,50 @@ use std::sync::OnceLock;
 use crate::position::Position;
 use crate::types::{Color, PieceType, SCORE_MATE};
 
-// ── Embedded blob ────────────────────────────────────────────────────────────
+// ── Blob source ──────────────────────────────────────────────────────────────
+//
+// Native builds carry the blob inside the binary (`gaiatb_embedded`, set by build.rs)
+// and load it with [`init`]. The browser build ships it beside the module instead,
+// like the network weights: the host writes the compressed blob into the buffer
+// [`reserve`] hands back and calls [`publish_received`], which decompresses it and
+// frees the compressed copy.
 
+#[cfg(gaiatb_embedded)]
 static BLOB: &[u8] = include_bytes!(env!("GAIATB_ZST"));
 
 static PROBER: OnceLock<Option<Prober>> = OnceLock::new();
 
 /// Initialize the prober from the embedded blob. Called once at startup.
 /// Returns true if the tables loaded successfully.
+#[cfg(gaiatb_embedded)]
 pub fn init() -> bool {
     PROBER.get_or_init(|| Prober::from_blob(BLOB)).is_some()
+}
+
+/// Where a host-delivered blob accumulates before [`publish_received`] reads it.
+static INCOMING: std::sync::Mutex<Vec<u8>> = std::sync::Mutex::new(Vec::new());
+
+/// Sizes the incoming-blob buffer to `len` bytes and returns where to write them.
+///
+/// The pointer is valid until the next call into the module: nothing of ours runs
+/// while the host writes, so the buffer cannot move underneath it.
+pub fn reserve(len: usize) -> *mut u8 {
+    let mut buf = INCOMING.lock().unwrap();
+    buf.clear();
+    buf.resize(len, 0);
+    buf.as_mut_ptr()
+}
+
+/// Builds the prober from the bytes the host wrote after [`reserve`], then frees
+/// them — only the decompressed tables are kept. Returns true when the tables are
+/// ready. A second call changes nothing: the prober is published once and never
+/// replaced, since a search may be reading it.
+pub fn publish_received() -> bool {
+    let blob = std::mem::take(&mut *INCOMING.lock().unwrap());
+    if PROBER.get().is_none() {
+        PROBER.set(Prober::from_blob(&blob)).ok();
+    }
+    available()
 }
 
 /// Returns true if the DTM tables are loaded and ready.
@@ -113,9 +147,36 @@ fn extract_for_probe(pos: &Position) -> ([u8; 5], [u8; 5], u8, u8, [u8; 8]) {
 }
 
 // ╔══════════════════════════════════════════════════════════════════════════╗
-// ║  GaiaTB probe.rs — copied verbatim from gaiatb/src/probe.rs             ║
+// ║  GaiaTB probe.rs — copied from gaiatb/src/probe.rs                       ║
 // ║  Self-contained: no gaiatb crate dependency.                             ║
+// ║  Two local adaptations: decompression goes through `decode_zstd` (the C  ║
+// ║  zstd cannot be linked into a wasm module), and `packed_data` is sized   ║
+// ║  up front (letting ~155 MB double its way up would hold peak memory far  ║
+// ║  above that — a browser never hands linear memory back).                 ║
 // ╚══════════════════════════════════════════════════════════════════════════╝
+
+// ── Decompression ────────────────────────────────────────────────────────────
+
+/// One zstd frame, fully decoded. Native builds use the C zstd; the wasm build
+/// decodes with ruzstd, pure Rust, same as the embedded network does.
+#[cfg(not(target_arch = "wasm32"))]
+fn decode_zstd(data: &[u8]) -> Option<Vec<u8>> {
+    zstd::decode_all(data).ok()
+}
+
+#[cfg(target_arch = "wasm32")]
+fn decode_zstd(data: &[u8]) -> Option<Vec<u8>> {
+    use std::io::Read;
+    // The frames declare a 128 MB window, over ruzstd's 100 MB default ceiling —
+    // the same raise the embedded network needs (see nnue/network.rs). The window
+    // is a claim in the frame header, not an allocation: no section comes close.
+    const WINDOW: u64 = 128 * 1024 * 1024;
+    let mut decoder =
+        ruzstd::decoding::StreamingDecoder::new_with_max_window_size(data, WINDOW).ok()?;
+    let mut out = Vec::new();
+    decoder.read_to_end(&mut out).ok()?;
+    Some(out)
+}
 
 // ── Blob constants ───────────────────────────────────────────────────
 
@@ -515,8 +576,30 @@ impl Prober {
         let data_start = HEADER_SIZE + table_count * ENTRY_SIZE;
         if blob.len() < data_start { return None; }
 
+        // Size the decompressed store from the entries before filling it, so the
+        // ~155 MB is allocated once instead of grown. The entry table understates
+        // slightly — pawnful tables carry en-passant sub-ranges beyond `per_stm` —
+        // hence the margin below: what matters is that the store never reallocates,
+        // since at this size letting it double its way up would hold peak memory far
+        // above the result, and a browser never hands linear memory back.
+        let mut total_packed = 0usize;
+        for i in 0..table_count {
+            let off = HEADER_SIZE + i * ENTRY_SIZE;
+            let buf = &blob[off..off + ENTRY_SIZE];
+            let flags = buf[8];
+            let bits = buf[9] as usize;
+            let per_stm = u32::from_le_bytes(buf[12..16].try_into().ok()?) as usize;
+            if flags & FLAG_SINGLE_VALUE != 0 { continue; }
+            total_packed += if flags & FLAG_SPLIT_STM != 0 {
+                2 * (per_stm * bits).div_ceil(8)
+            } else {
+                (2 * per_stm * bits).div_ceil(8)
+            };
+        }
+
+        let capacity = total_packed + total_packed / 64 + (64 << 10);
         let mut tables = Vec::with_capacity(table_count);
-        let mut packed_data = Vec::new();
+        let mut packed_data: Vec<u8> = Vec::with_capacity(capacity);
 
         for i in 0..table_count {
             let off = HEADER_SIZE + i * ENTRY_SIZE;
@@ -543,13 +626,13 @@ impl Prober {
 
                 if flags & FLAG_SPLIT_STM != 0 {
                     let wtm_sz = u32::from_le_bytes(compressed[0..4].try_into().ok()?) as usize;
-                    let wtm = zstd::decode_all(&compressed[4..4 + wtm_sz]).ok()?;
-                    let btm = zstd::decode_all(&compressed[4 + wtm_sz..]).ok()?;
+                    let wtm = decode_zstd(&compressed[4..4 + wtm_sz])?;
+                    let btm = decode_zstd(&compressed[4 + wtm_sz..])?;
                     packed_data.extend_from_slice(&wtm);
                     btm_packed_offset = packed_data.len();
                     packed_data.extend_from_slice(&btm);
                 } else {
-                    let decompressed = zstd::decode_all(compressed).ok()?;
+                    let decompressed = decode_zstd(compressed)?;
                     packed_data.extend_from_slice(&decompressed);
                 }
             }
@@ -565,6 +648,10 @@ impl Prober {
             });
         }
 
+        debug_assert!(
+            packed_data.capacity() == capacity,
+            "the packed store outgrew its estimate and reallocated",
+        );
         Some(Prober { tables, packed_data })
     }
 

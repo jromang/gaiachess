@@ -3,10 +3,33 @@
 //! Keeping the sheets inside the executable is what lets the interface ship as a
 //! single file with nothing to install alongside it.
 
-use macroquad::prelude::{Image, ImageFormat};
-
 use super::fb::{Atlas, Sprite};
 use crate::types::PieceType;
+
+/// Decodes an embedded PNG to straight RGBA bytes.
+///
+/// Through macroquad where macroquad is the window layer anyway, and through the `png`
+/// crate on Haiku, where it is not. Same bytes out of both: the sheets are 8-bit RGBA
+/// already, nothing is converted.
+#[cfg(not(target_os = "haiku"))]
+fn decode_rgba(bytes: &[u8]) -> (usize, usize, Vec<u8>) {
+    use macroquad::prelude::{Image, ImageFormat};
+    let img = Image::from_file_with_format(bytes, Some(ImageFormat::Png))
+        .expect("embedded PNG must decode");
+    (img.width as usize, img.height as usize, img.bytes)
+}
+
+#[cfg(target_os = "haiku")]
+fn decode_rgba(bytes: &[u8]) -> (usize, usize, Vec<u8>) {
+    let decoder = png::Decoder::new(std::io::Cursor::new(bytes));
+    let mut reader = decoder.read_info().expect("embedded PNG must decode");
+    let mut buf = vec![0u8; reader.output_buffer_size().expect("PNG size must fit")];
+    let info = reader.next_frame(&mut buf).expect("embedded PNG must decode");
+    assert_eq!(info.color_type, png::ColorType::Rgba, "sheets are exported as 8-bit RGBA");
+    assert_eq!(info.bit_depth, png::BitDepth::Eight, "sheets are exported as 8-bit RGBA");
+    buf.truncate(info.buffer_size());
+    (info.width as usize, info.height as usize, buf)
+}
 
 /// Piece sheet: six piece types across, four colour variants down, then one more row
 /// holding the ground shadow that belongs under each piece.
@@ -38,20 +61,23 @@ static UI_PNG: &[u8] = include_bytes!("assets/ui.png");
 /// nearest — with the piece turning to a smudge and the frame to mud in all four. So 16
 /// is drawn by hand and 32 is the sheet's own pawn. Both from
 /// tools/gui_assets/make_icon.py.
+#[cfg(not(target_os = "haiku"))]
 static ICON_16_PNG: &[u8] = include_bytes!("assets/icon16.png");
+#[cfg(not(target_os = "haiku"))]
 static ICON_32_PNG: &[u8] = include_bytes!("assets/icon32.png");
 
 /// The icon at the three sizes the window system asks for.
 ///
 /// 64 is twice 32, which is exact: whole multiples are the only enlargement that leaves
-/// pixel art alone.
+/// pixel art alone. Not on Haiku, where an application's icon is a resource attached to
+/// the executable, read by the Deskbar long before anything of ours runs.
+#[cfg(not(target_os = "haiku"))]
 pub fn window_icon() -> macroquad::miniquad::conf::Icon {
-    fn decode(png: &[u8], side: u16) -> Image {
-        let img = Image::from_file_with_format(png, Some(ImageFormat::Png))
-            .expect("embedded icon must decode");
-        assert_eq!(img.width, side, "icon is not {side} wide");
-        assert_eq!(img.height, side, "icon is not {side} tall");
-        img
+    fn decode(png: &[u8], side: u16) -> Vec<u8> {
+        let (w, h, bytes) = decode_rgba(png);
+        assert_eq!(w, side as usize, "icon is not {side} wide");
+        assert_eq!(h, side as usize, "icon is not {side} tall");
+        bytes
     }
 
     /// Repeats each pixel `factor` times in both directions.
@@ -72,9 +98,9 @@ pub fn window_icon() -> macroquad::miniquad::conf::Icon {
     let medium = decode(ICON_32_PNG, 32);
 
     macroquad::miniquad::conf::Icon {
-        small: magnify::<{ 16 * 16 * 4 }>(&small.bytes, 16, 1),
-        medium: magnify::<{ 32 * 32 * 4 }>(&medium.bytes, 32, 1),
-        big: magnify::<{ 64 * 64 * 4 }>(&medium.bytes, 32, 2),
+        small: magnify::<{ 16 * 16 * 4 }>(&small, 16, 1),
+        medium: magnify::<{ 32 * 32 * 4 }>(&medium, 32, 1),
+        big: magnify::<{ 64 * 64 * 4 }>(&medium, 32, 2),
     }
 }
 
@@ -128,20 +154,17 @@ pub struct Assets {
 
 impl Assets {
     pub fn load() -> Assets {
-        let img = Image::from_file_with_format(PIECES_PNG, Some(ImageFormat::Png))
-            .expect("embedded piece sheet must decode");
-        let (w, h) = (img.width as usize, img.height as usize);
+        let (w, h, pieces) = decode_rgba(PIECES_PNG);
         assert_eq!(w, CELL_W as usize * 6, "piece sheet width does not match CELL_W");
         assert_eq!(
             h,
             CELL_H as usize * (VARIANTS as usize + 1),
             "piece sheet height does not match CELL_H"
         );
-        let ui = Image::from_file_with_format(UI_PNG, Some(ImageFormat::Png))
-            .expect("embedded interface sheet must decode");
+        let (uw, uh, ui) = decode_rgba(UI_PNG);
         Assets {
-            pieces: Atlas::from_rgba(&img.bytes, w, h),
-            ui: Atlas::from_rgba(&ui.bytes, ui.width as usize, ui.height as usize),
+            pieces: Atlas::from_rgba(&pieces, w, h),
+            ui: Atlas::from_rgba(&ui, uw, uh),
         }
     }
 

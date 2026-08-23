@@ -338,6 +338,14 @@ mod desktop {
     }
 
     fn run_worker(commands: &Receiver<Command>, answers: &Sender<Answer>) {
+        // The DTM tablebases, same as the UCI path loads: the rungs were calibrated
+        // over an engine that probes them, so a game here must probe them too. Done on
+        // this thread, where decompressing the blob costs a beat nobody sees, not a
+        // frame. Not under test: the prober is process-global, and the search tests
+        // sharing this process specify the bare search — loading the tables here would
+        // change their answers depending on which test ran first.
+        #[cfg(all(feature = "gaiatb", gaiatb_embedded, not(test)))]
+        crate::dtm::init();
         let mut shared = SharedState::new(TT_MB);
         // Thread 0, muted. The interface wants everything thread 0 does — the real time
         // budget, the root reporting, the tablebase lookups — and none of what it says.

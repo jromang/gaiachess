@@ -217,11 +217,18 @@ const PROBE_WINDOW: Duration = Duration::from_secs(2);
 /// failure, it panics, and a release build aborts on panic. The engine spends most of
 /// its life under match managers on machines reached over SSH, where the difference
 /// between "no window" and "no engine" is the whole match.
-#[cfg(all(feature = "gui", unix, not(target_os = "macos")))]
+#[cfg(all(feature = "gui", unix, not(any(target_os = "macos", target_os = "haiku"))))]
 fn display_available() -> bool {
     // An empty DISPLAY is how a script says "no display", so emptiness counts as absence.
     let set = |v| std::env::var_os(v).is_some_and(|d: std::ffi::OsString| !d.is_empty());
     set("DISPLAY") || set("WAYLAND_DISPLAY")
+}
+
+// Haiku sets no DISPLAY; the shim asks app_server itself, which is the only answer
+// that is true over SSH as well as at the desk.
+#[cfg(all(feature = "gui", target_os = "haiku"))]
+fn display_available() -> bool {
+    gui::haiku::display_available()
 }
 
 #[cfg(all(feature = "gui", any(windows, target_os = "macos")))]
@@ -314,25 +321,40 @@ fn main() {
             return;
         }
 
-        let rx = uci::spawn_stdin_reader();
-        match rx.recv_timeout(PROBE_WINDOW) {
-            // Someone is talking to us. The line is handed on, not dropped.
-            Ok(line) => {
-                stdin.rx = Some(rx);
-                stdin.first = Some(line);
+        // A pipe settles the question the probe exists to ask: only a program — a
+        // chess GUI, a match manager — ever connects one, and some (Fritz 17 among
+        // them) take longer than any reasonable window to say their first word.
+        // Commit to the protocol and wait indefinitely, as an engine always has;
+        // only a console stdin leaves real ambiguity for the probe to resolve.
+        #[cfg(windows)]
+        let probe = !win_console::stdin_is_pipe();
+        #[cfg(not(windows))]
+        let probe = true;
+
+        if probe {
+            let rx = uci::spawn_stdin_reader();
+            match rx.recv_timeout(PROBE_WINDOW) {
+                // Someone is talking to us. The line is handed on, not dropped.
+                Ok(line) => {
+                    stdin.rx = Some(rx);
+                    stdin.first = Some(line);
+                }
+                // Nobody said anything — and a stdin that ended before a word was said
+                // can never say one. Both are the same silence, so both get the board;
+                // EOF just answers without the wait. This is how a desktop launch looks
+                // on Haiku and Linux: Tracker and the freedesktop launchers hand the
+                // program a stdin already at EOF, where taking the engine path meant
+                // exiting at once and a double-click that seemed to do nothing.
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    // Nothing will drain this channel again; dropping it lets the reader
+                    // fall out of its loop instead of piling lines up behind it.
+                    drop(rx);
+                    init_cpu_dispatch();
+                    gui::run(None);
+                    return;
+                }
             }
-            // Nobody said anything: the board, then.
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                // Nothing will drain this channel again; dropping it lets the reader
-                // fall out of its loop instead of piling lines up behind it.
-                drop(rx);
-                init_cpu_dispatch();
-                gui::run(None);
-                return;
-            }
-            // Stdin ended before a word was said, so it can never carry a command. The
-            // engine path takes it from here and exits at once.
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => stdin.rx = Some(rx),
         }
     }
 

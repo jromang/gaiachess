@@ -12,4 +12,6 @@ crate-type = ["cdylib"]
 # The interface is deliberately absent: this module is the search and nothing else, and
 # the two halves of the browser build are separate modules precisely so that neither
 # carries the other's dependencies.
-gaiachess = { path = "../..", default-features = false, features = ["nnue"] }
+# `gaiatb` carries no blob here — build.rs embeds nothing on wasm — only the probing
+# code; the tables travel beside the module and arrive through gaia_tb_reserve/finish.
+gaiachess = { path = "../..", default-features = false, features = ["nnue", "gaiatb"] }

@@ -34,6 +34,19 @@
 #define __HOSTSWAP_DEFINED      1
 #endif /* BSD */
 
+/* Haiku - endian.h carries the BSD-style names and the host swap macros;
+ * byte swaps fall through to the __GNUC__ builtins below */
+#if defined(__HAIKU__)
+#include <endian.h>
+#ifndef _BYTE_ORDER
+#define _BYTE_ORDER             BYTE_ORDER
+#define _LITTLE_ENDIAN          LITTLE_ENDIAN
+#define _BIG_ENDIAN             BIG_ENDIAN
+#endif
+#define __ENDIAN_DEFINED        1
+#define __HOSTSWAP_DEFINED      1
+#endif /* __HAIKU__ */
+
 /* Solaris */
 #if defined (sun)
 #include <sys/isa_defs.h>

@@ -1096,7 +1096,11 @@ impl GameScene {
         if self.mode == UiMode::Drag {
             self.draw_carried(fb, assets, scheme);
         }
-        if self.mode != UiMode::Menu {
+        // The promotion panel floats over the board, and the hand picking from it has
+        // to stay on top of the panel — so in that mode the pointer waits its turn and
+        // is drawn after the panel, outside the shake, where the panel and its hit
+        // test already live.
+        if !matches!(self.mode, UiMode::Menu | UiMode::Promo) {
             self.draw_pointer(fb, assets);
         }
 
@@ -1155,6 +1159,7 @@ impl GameScene {
         fb.flash = self.flash;
         if self.mode == UiMode::Promo {
             self.draw_promo_panel(fb, assets, scheme);
+            self.draw_pointer(fb, assets);
         }
         if self.mode == UiMode::Menu {
             self.draw_game_menu(fb, assets, scheme);
@@ -2133,6 +2138,30 @@ mod tests {
                 "the cursor is in the way of the move it is there to watch (flying: {flying})"
             );
         }
+    }
+
+    #[test]
+    fn the_hand_points_at_the_promotion_panel_rather_than_hiding_behind_it() {
+        let assets = Assets::load();
+        let mut scene = hotseat();
+        scene.mode = UiMode::Promo;
+        let (px, py, w, h) = GameScene::promo_rect();
+        let at = (px + w / 2, py + h / 2);
+
+        scene.mouse = None;
+        let panel_alone = frame(&mut scene, &assets);
+        scene.mouse = Some(at);
+        let with_pointer = frame(&mut scene, &assets);
+
+        // The mouse stands in the middle of the panel, so if the hand shows at all it
+        // shows on top of it: pixels inside the panel's rectangle have to change.
+        let changed = changed_pixels(&panel_alone, &with_pointer);
+        assert!(
+            changed
+                .iter()
+                .any(|&(x, y)| (px..px + w).contains(&x) && (py..py + h).contains(&y)),
+            "the hand went behind the promotion panel"
+        );
     }
 
     /// One frame of the scene, as raw pixels. The shake would jitter one frame against

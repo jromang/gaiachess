@@ -113,6 +113,30 @@ for variant in "${VARIANTS_ALL[@]}"; do
     fi
 done
 
+# --- Windows only: console-subsystem engine for ChessBase GUIs ---
+# ChessBase loaders (Fritz "Install UCI module") refuse to launch a
+# GUI-subsystem executable: the process is never created, the dialog just
+# stays empty (measured 2026-08-22). So Windows ships one extra binary built
+# without the board (--no-default-features): same universal baseline, same
+# runtime dispatch and PGO, linked as a console application. Universal only —
+# anyone on a pre-2013 CPU running Fritz is on their own.
+if [ "$PLATFORM" = windows ]; then
+    console_features=$(augment_features "nnue,syzygy,nalimov,gaiatb,online-tb")
+    console_variant="console|x86-64-v3|--cfg gaia_dist|$console_features"
+
+    echo
+    echo "============================================================"
+    echo "=== [extra] console (ChessBase-compatible, universal) ==="
+    echo "============================================================"
+
+    if build_pgo_native "$console_variant" "$PGO_DIR" --no-default-features; then
+        cp "$NATIVE_BIN" "$OUTPUT_DIR/gaiachess-${PLATFORM}-console${EXE_SUFFIX}"
+    else
+        echo "FAILED: console ($PLATFORM)"
+        FAILED+=("console-$PLATFORM")
+    fi
+fi
+
 # --- Results ---
 echo
 echo "=== Produced binaries ==="

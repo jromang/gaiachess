@@ -3,10 +3,11 @@
 // It exists so the browser artefact can be checked against the native binary with the
 // same commands and a plain `diff`, without a browser in the loop.
 //
-//   node web/engine/host.mjs <path-to.wasm> [--net <net.bin>] [--mem]  < session.txt
+//   node web/engine/host.mjs <path-to.wasm> [--net <net.bin>] [--tb <tb34.gtpk>] [--mem]  < session.txt
 //
 // `--net` installs weights the module was not built with — which is how the browser
-// receives them, and therefore the path worth exercising here.
+// receives them, and therefore the path worth exercising here. `--tb` hands over the
+// endgame tables the same way.
 //
 // `--mem` reports the linear memory high-water mark on stderr when the session ends,
 // which is how the stack-size link argument gets chosen rather than guessed.
@@ -18,7 +19,7 @@ import { loadEngine } from "./engine.mjs";
 const wasmPath = process.argv[2];
 const reportMemory = process.argv.includes("--mem");
 if (!wasmPath) {
-  console.error("usage: node host.mjs <path-to.wasm> [--net <net.bin>] [--mem]");
+  console.error("usage: node host.mjs <path-to.wasm> [--net <net.bin>] [--tb <tb34.gtpk>] [--mem]");
   process.exit(2);
 }
 
@@ -34,6 +35,16 @@ if (netFlag !== -1) {
   const bytes = file.buffer.slice(file.byteOffset, file.byteOffset + file.byteLength);
   if (!engine.loadNetwork(bytes)) {
     process.stderr.write("the engine refused the network\n");
+    process.exit(1);
+  }
+}
+
+const tbFlag = process.argv.indexOf("--tb");
+if (tbFlag !== -1) {
+  const file = readFileSync(process.argv[tbFlag + 1]);
+  const bytes = file.buffer.slice(file.byteOffset, file.byteOffset + file.byteLength);
+  if (!engine.loadTables(bytes)) {
+    process.stderr.write("the engine refused the endgame tables\n");
     process.exit(1);
   }
 }

@@ -17,7 +17,8 @@ with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as z:
     for name in sorted(os.listdir(".")):
         if name in SKIP or not os.path.isfile(name):
             continue
-        # The weights are already compressed; deflating them again costs time and
-        # gains nothing.
-        how = zipfile.ZIP_STORED if name.endswith(".gz") else zipfile.ZIP_DEFLATED
+        # The weights and the tables are already compressed; deflating them again
+        # costs time and gains nothing.
+        stored = name.endswith((".gz", ".deflate", ".gtpk"))
+        how = zipfile.ZIP_STORED if stored else zipfile.ZIP_DEFLATED
         z.write(name, name, compress_type=how)

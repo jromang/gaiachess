@@ -37,8 +37,13 @@ fn main() {
     println!("cargo:rerun-if-env-changed=MODEL");
 
     // GaiaTB (DTM tablebases, 3+4 pieces)
+    //
+    // Like the network, whether the blob is baked into the binary is a property of the
+    // build, not of the feature set: a browser build carries the probing code and
+    // receives the blob from its host at run time, because 30 MB inside the module
+    // would ship on every code change and defeat the two-module split.
     #[cfg(feature = "gaiatb")]
-    {
+    if std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() != Ok("wasm32") {
         let blob_path = std::env::var("GAIATB_BLOB")
             .unwrap_or_else(|_| "tb/tb34.gtpk".to_string());
 
@@ -66,10 +71,12 @@ fn main() {
         std::fs::copy(&blob_path, &out_path)
             .unwrap_or_else(|e| panic!("Failed to copy GAIATB_BLOB={blob_path}: {e}"));
         println!("cargo:rustc-env=GAIATB_ZST={out_path}");
+        println!("cargo:rustc-cfg=gaiatb_embedded");
         println!("cargo:rerun-if-changed={blob_path}");
         let size = std::fs::metadata(&blob_path).map(|m| m.len()).unwrap_or(0);
         eprintln!("GaiaTB: {:.1} MB embedded", size as f64 / 1024.0 / 1024.0);
     }
+    println!("cargo:rustc-check-cfg=cfg(gaiatb_embedded)");
     println!("cargo:rerun-if-env-changed=GAIATB_BLOB");
 
     // Pyrrhic (Syzygy tablebase probing)
@@ -88,6 +95,28 @@ fn main() {
             .compile("pyrrhic");
         println!("cargo:rerun-if-changed=src/pyrrhic/tbprobe.c");
         println!("cargo:rerun-if-changed=src/pyrrhic/tbconfig.h");
+    }
+
+    // Haiku native shim
+    // miniquad has no Haiku backend, so the window, input and audio are a few hundred
+    // lines of Be API C++ instead, compiled here and spoken to over a C ABI. Only for a
+    // GUI build targeting Haiku; the engine alone stays pure Rust.
+    // GAIA_SKIP_SHIM=1 skips the C++ so a cross `cargo check -Zbuild-std` can
+    // type-check the Rust side from a machine with no Be headers; check never
+    // links, so the missing objects cost nothing.
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("haiku")
+        && std::env::var("CARGO_FEATURE_GUI").is_ok()
+        && std::env::var("GAIA_SKIP_SHIM").as_deref() != Ok("1")
+    {
+        cc::Build::new()
+            .cpp(true)
+            .file("src/gui/haiku_shim.cpp")
+            .flag("-std=c++17")
+            .compile("gaia_haiku_shim");
+        // libbe: BApplication, BWindow, BBitmap. libmedia: BSoundPlayer.
+        println!("cargo:rustc-link-lib=be");
+        println!("cargo:rustc-link-lib=media");
+        println!("cargo:rerun-if-changed=src/gui/haiku_shim.cpp");
     }
 
     // Windows icon

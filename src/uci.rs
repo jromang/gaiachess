@@ -86,8 +86,10 @@ pub struct UciSession {
 
 impl UciSession {
     pub fn new() -> UciSession {
-        // Initialize GaiaTB (embedded 3+4 piece DTM, decompresses ~147 MB at startup)
-        #[cfg(feature = "gaiatb")]
+        // Initialize GaiaTB (embedded 3+4 piece DTM, decompresses ~147 MB at startup).
+        // Builds without the embedded blob — the browser — receive it from the host
+        // later, through `dtm::reserve`/`dtm::publish_received`.
+        #[cfg(all(feature = "gaiatb", gaiatb_embedded))]
         {
             if crate::dtm::init() {
                 outerr!("info string GaiaTB loaded (3+4 piece DTM tablebases)");

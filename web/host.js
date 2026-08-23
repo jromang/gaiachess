@@ -19,11 +19,32 @@
 
   /** Answers waiting to be collected by the interface, oldest first. */
   const answers = [];
-  /** `go` lines held back until the weights are in. */
+  /** `go` lines held back until the weights and the endgame tables are in. */
   const heldSearches = [];
   let networkReady = false;
-  /** Percent of the weights downloaded, read by the interface once a frame. */
-  let netPercent = 0;
+  let tablesReady = false;
+  /** Bytes received and expected per download, folded into the one progress figure
+      the interface reads once a frame. */
+  const downloads = { net: [0, 0], tb: [0, 0] };
+
+  function assetPercent() {
+    let received = 0;
+    let total = 0;
+    for (const [got, expected] of Object.values(downloads)) {
+      received += got;
+      total += expected;
+    }
+    // Both totals are known within milliseconds of each other; until then the figure
+    // is short-lived and only ever too low.
+    return total ? Math.min(100, Math.round((received / total) * 100)) : 0;
+  }
+
+  /** Runs whatever the player set going while the engine's data was still arriving. */
+  function releaseWhenReady() {
+    if (!networkReady || !tablesReady) return;
+    setStatus(null);
+    for (const held of heldSearches.splice(0)) worker.postMessage(held);
+  }
 
   // Raised to ask a running search to stop. It has to be shared memory: a worker in the
   // middle of a search reads no messages until it comes back out, so nothing else
@@ -47,6 +68,7 @@
     switch (message.k) {
       case "ready":
         loadNetwork();
+        loadTables();
         break;
       case "net":
         networkReady = message.ok;
@@ -54,10 +76,18 @@
           fail("the engine could not read the network: " + (message.error ?? "unknown"));
           return;
         }
-        netPercent = 100;
-        setStatus(null);
-        // Anything the player set going while the weights were still arriving runs now.
-        for (const held of heldSearches.splice(0)) worker.postMessage(held);
+        releaseWhenReady();
+        break;
+      case "tb":
+        // As hard a requirement as the weights: an engine playing without the tables
+        // it was calibrated with is a subtly different opponent, which is worse than
+        // one that says it could not start.
+        tablesReady = message.ok;
+        if (!message.ok) {
+          fail("the engine could not read the endgame tables: " + (message.error ?? "unknown"));
+          return;
+        }
+        releaseWhenReady();
         break;
       case "best":
         answers.push(message.gen + " " + message.uci);
@@ -70,6 +100,22 @@
 
   worker.postMessage({ k: "boot", wasm: "engine.wasm", stop: stopFlag });
 
+  // Progress is counted on the compressed stream, which is what `content-length`
+  // describes and what the wait is actually made of. Reported rather than merely
+  // awaited: this is tens of megabytes, and a page that looks frozen is
+  // indistinguishable from one that is. The interface draws the bar itself, in its own
+  // pixels at its own scale, so the wait looks like part of the game instead of a
+  // caption stuck underneath it.
+  function counted(slot, response) {
+    downloads[slot][1] = Number(response.headers.get("content-length")) || 0;
+    return new TransformStream({
+      transform(chunk, controller) {
+        downloads[slot][0] += chunk.length;
+        controller.enqueue(chunk);
+      },
+    });
+  }
+
   async function loadNetwork() {
     if (typeof DecompressionStream === "undefined") {
       fail("this browser cannot decompress the engine weights (DecompressionStream)");
@@ -79,29 +125,12 @@
       const response = await fetch("net.bin.deflate");
       if (!response.ok) throw new Error("HTTP " + response.status);
 
-      // Progress is counted on the compressed stream, which is what `content-length`
-      // describes and what the wait is actually made of. Reported rather than merely
-      // awaited: this is tens of megabytes, and a page that looks frozen is
-      // indistinguishable from one that is.
-      const total = Number(response.headers.get("content-length")) || 0;
-      let received = 0;
-      const counted = new TransformStream({
-        transform(chunk, controller) {
-          received += chunk.length;
-          // Reported to the interface rather than written into the page: it draws the
-          // bar itself, in its own pixels at its own scale, so the wait looks like part
-          // of the game instead of a caption stuck underneath it.
-          if (total) netPercent = Math.round((received / total) * 100);
-          controller.enqueue(chunk);
-        },
-      });
-
       // Decompressed by the browser itself: native code, and none of it in the module's
       // linear memory, which is never handed back once taken. Raw deflate rather than
       // gzip, so that no host takes the file for one it should unwrap in transport and
       // leaves the page with something it cannot read — see tools/web/build.sh.
       const stream = response.body
-        .pipeThrough(counted)
+        .pipeThrough(counted("net", response))
         .pipeThrough(new DecompressionStream("deflate-raw"));
       const bytes = await new Response(stream).arrayBuffer();
 
@@ -109,6 +138,24 @@
       worker.postMessage({ k: "net", bytes }, [bytes]);
     } catch (err) {
       fail("the engine weights could not be loaded: " + err);
+    }
+  }
+
+  async function loadTables() {
+    try {
+      const response = await fetch("tb34.gtpk");
+      if (!response.ok) throw new Error("HTTP " + response.status);
+
+      // No decompression here: the blob is zstd inside, which no browser unwraps, and
+      // the module carries the decoder anyway to read what it embeds on the desktop.
+      // Its magic is not gzip's, so no host will take it for something to unwrap in
+      // transport either.
+      const stream = response.body.pipeThrough(counted("tb", response));
+      const bytes = await new Response(stream).arrayBuffer();
+
+      worker.postMessage({ k: "tb", bytes }, [bytes]);
+    } catch (err) {
+      fail("the endgame tables could not be loaded: " + err);
     }
   }
 
@@ -169,9 +216,9 @@
         // standing from the last one.
         Atomics.store(stopFlag, 0, 0);
         const message = { k: "go", line: UTF8ToString(ptr, len), gen: generation };
-        // Held rather than dropped: a game begun before the weights arrive should wait,
-        // not be answered by an engine with no evaluation to speak of.
-        if (networkReady) worker.postMessage(message);
+        // Held rather than dropped: a game begun before the weights and tables arrive
+        // should wait, not be answered by an engine with no evaluation to speak of.
+        if (networkReady && tablesReady) worker.postMessage(message);
         else heldSearches.push(message);
       };
 
@@ -195,7 +242,9 @@
       // imports this too. It has no search to stop.
       env.gaia_host_stop = () => 0;
 
-      env.gaia_net_progress = () => netPercent;
+      // One figure for everything still arriving — the weights and the tables share
+      // the bar, weighted by their sizes on the wire.
+      env.gaia_net_progress = () => assetPercent();
 
       // The languages the reader asks for, best first, as a comma-separated list of
       // BCP 47 tags. `?lang=` comes ahead of them: it is how the itch embed, and anyone

@@ -13,6 +13,8 @@ mod engine;
 mod fb;
 mod font;
 mod game;
+#[cfg(target_os = "haiku")]
+pub mod haiku;
 mod input;
 mod lang;
 mod loading;
@@ -23,15 +25,19 @@ mod synth;
 /// The rung a game starts on when nobody has picked one.
 pub use engine::DEFAULT_LEVEL;
 
+#[cfg(not(target_os = "haiku"))]
 use macroquad::prelude::*;
 // A tab neither closes its own window nor decides its shape, so the two calls that do
 // are desktop-only -- and with them everything they are called from, down to the
 // headless captures that only ever run from a command line.
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(any(target_arch = "wasm32", target_os = "haiku")))]
 use macroquad::{miniquad::window::order_quit, window::request_new_screen_size};
 
 use assets::Assets;
-use audio::{Audio, Queue};
+// On Haiku the loop in haiku.rs is the one that opens the audio device.
+#[cfg(not(target_os = "haiku"))]
+use audio::Audio;
+use audio::Queue;
 use fb::{FB_H, FB_W, Fb};
 use input::Input;
 use scenes::game::{GameExit, GameScene};
@@ -212,19 +218,25 @@ pub fn run(shot: Option<Shot<'_>>) {
     }
     #[cfg(target_arch = "wasm32")]
     let _ = shot;
-    let conf = Conf {
-        window_title: String::from("GaiaChess"),
-        window_width: FB_W as i32 * INITIAL_SCALE,
-        window_height: FB_H as i32 * INITIAL_SCALE,
-        window_resizable: true,
-        high_dpi: true,
-        sample_count: 1,
-        icon: Some(assets::window_icon()),
-        ..Default::default()
-    };
-    macroquad::Window::from_config(conf, amain());
+    #[cfg(target_os = "haiku")]
+    haiku::run_window();
+    #[cfg(not(target_os = "haiku"))]
+    {
+        let conf = Conf {
+            window_title: String::from("GaiaChess"),
+            window_width: FB_W as i32 * INITIAL_SCALE,
+            window_height: FB_H as i32 * INITIAL_SCALE,
+            window_resizable: true,
+            high_dpi: true,
+            sample_count: 1,
+            icon: Some(assets::window_icon()),
+            ..Default::default()
+        };
+        macroquad::Window::from_config(conf, amain());
+    }
 }
 
+#[cfg(not(target_os = "haiku"))]
 async fn amain() {
     let assets = Assets::load();
     let audio = Audio::load();
@@ -336,6 +348,13 @@ fn capture(shot: &Shot<'_>) {
         }
     }
 
+    write_png(shot.path, &fb);
+    println!("wrote {} ({FB_W}x{FB_H})", shot.path);
+}
+
+/// Writes the framebuffer out as a PNG, top row first.
+#[cfg(not(any(target_arch = "wasm32", target_os = "haiku")))]
+fn write_png(path: &str, fb: &Fb) {
     let mut img = Image::gen_image_color(FB_W as u16, FB_H as u16, BLACK);
     fb.copy_to(&mut img.bytes);
     // export_png flips rows for GL orientation, so pre-flipping cancels it out.
@@ -345,8 +364,22 @@ fn capture(shot: &Shot<'_>) {
         let opposite = (FB_H - 2 * row - 2) * stride;
         top[row * stride..].swap_with_slice(&mut bottom[opposite..opposite + stride]);
     }
-    img.export_png(shot.path);
-    println!("wrote {} ({FB_W}x{FB_H})", shot.path);
+    img.export_png(path);
+}
+
+/// The same picture through the `png` crate, which writes rows the way they come.
+#[cfg(target_os = "haiku")]
+fn write_png(path: &str, fb: &Fb) {
+    let mut bytes = vec![0u8; FB_W * FB_H * 4];
+    fb.copy_to(&mut bytes);
+    let file = std::fs::File::create(path)
+        .unwrap_or_else(|e| panic!("cannot create {path}: {e}"));
+    let mut enc = png::Encoder::new(std::io::BufWriter::new(file), FB_W as u32, FB_H as u32);
+    enc.set_color(png::ColorType::Rgba);
+    enc.set_depth(png::BitDepth::Eight);
+    enc.write_header()
+        .and_then(|mut w| w.write_image_data(&bytes))
+        .unwrap_or_else(|e| panic!("cannot write {path}: {e}"));
 }
 
 /// The mouse as a capture leaves it: where it points and whether its button is down.
@@ -488,6 +521,7 @@ fn settle(scene: &mut GameScene, mouse: Mouse) {
 }
 
 /// Draws the canvas scaled to fill the window.
+#[cfg(not(target_os = "haiku"))]
 fn present(texture: &Texture2D) {
     clear_background(BLACK);
     let (ox, oy, scale) = input::viewport();
@@ -512,7 +546,7 @@ fn present(texture: &Texture2D) {
 /// Only a size the desktop has actually reported as changed is corrected, so a window
 /// manager that refuses the request is asked once and then left alone rather than
 /// fought every frame.
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(any(target_arch = "wasm32", target_os = "haiku")))]
 fn keep_window_shape(last: &mut (f32, f32)) {
     const ASPECT: f32 = FB_W as f32 / FB_H as f32;
     let (sw, sh) = (screen_width(), screen_height());

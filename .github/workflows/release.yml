@@ -37,12 +37,19 @@ jobs:
           |--------|----------|---------|
           | `universal` | Windows / Linux x86-64 | Any CPU from ~2013 (Intel Haswell+, AMD Zen+) |
           | `compat` | Windows / Linux x86-64 | Any x86-64 CPU (2003+) |
+          | `console` | Windows x86-64 | ChessBase GUIs (Fritz, ChessBase...) — same engine as `universal`, without the built-in board |
           | `neon` | Linux ARM64 | RPi 4+, Graviton... |
+          | `android-neon` | Android ARM64 | Android chess GUIs (DroidFish...), Termux |
           | `apple-silicon` | macOS | M1 and later |
 
           Take **`universal`**. Take `compat` only if `universal` does not start (a CPU older
           than ~2013): it is the same engine on portable code paths — slower search, and a
           scalar network below AVX2 — but it plays the same chess.
+
+          **ChessBase GUIs (Fritz, ChessBase) cannot load `universal`**: their engine
+          installer only accepts console applications, and `universal` carries the built-in
+          board. Register **`console`** there instead — the same engine and strength, just
+          without the board.
 
           `gaiachess info` prints which paths were selected on your machine. The environment
           variables `GAIA_SIMD=scalar|avx2|avx512|vnni512` and `GAIA_PEXT=0|1` cap the
@@ -55,6 +62,10 @@ jobs:
           Because it carries the interface's sound, **Linux binaries need `libasound2`**
           (`alsa-lib` on Arch) — present on any desktop, sometimes missing from minimal
           server images and containers. Windows and macOS need nothing extra.
+
+          `android-neon` is the exception: engine only (no board, no sound), statically
+          linked against musl, so it needs nothing at all — point your Android chess
+          GUI at the file and it runs.
 
           All x86-64 binaries are compiled with **PGO** (Profile-Guided Optimization); every
           SIMD tier the binary can select is profiled, the AVX-512 ones under Intel SDE.
@@ -303,6 +314,81 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   # ================================================================
+  # Job 3b: Android ARM64 (static musl cross-compile, engine only, no PGO)
+  # ================================================================
+  # Android's libc is Bionic: the glibc-linked neon binary above does not start
+  # there. This one is statically linked against musl — it depends on the kernel
+  # alone, so any arm64 Android chess GUI (DroidFish, Chess for Android...) can
+  # run it. Built headless (--no-default-features): no board, no ALSA.
+  android-arm:
+    needs: create-release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-musl
+
+      # clang compiles Pyrrhic (build.rs), qemu runs the smoke test below.
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang qemu-user-static
+
+      # Bootlin toolchains have versioned, immutable URLs — pinned by SHA256,
+      # like the SDE action and butler: the compiler that ships a release should
+      # change because someone chose it, not because a day passed.
+      - name: Install musl cross-toolchain
+        run: |
+          TC=aarch64--musl--stable-2025.08-1
+          SHA=defba831ffa1175236f137069333e21ed46d4d19feb5080a90cf248b6fc2cb08
+          curl --fail --retry 3 -sL -o "/tmp/$TC.tar.xz" \
+            "https://toolchains.bootlin.com/downloads/releases/toolchains/aarch64/tarballs/$TC.tar.xz"
+          echo "$SHA  /tmp/$TC.tar.xz" | sha256sum -c -
+          tar xf "/tmp/$TC.tar.xz" -C "$HOME"
+          echo "$HOME/$TC/bin" >> "$GITHUB_PATH"
+
+      - name: Download net
+        run: |
+          NET=$(grep '^DEFAULT_NET=' defaults.conf | head -1 | sed 's/DEFAULT_NET=//;s/"//g')
+          echo "net=$NET" >> "$GITHUB_ENV"
+          mkdir -p $(dirname "$NET")
+          curl --fail --retry 3 -L -o "$NET" "https://huggingface.co/jromanghf/gaiachess-networks/resolve/main/$(basename $NET)"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build ARM64 musl static (no PGO)
+        run: |
+          export OUTPUT_DIR="$GITHUB_WORKSPACE/output"
+          ./tools/pgo/build-release-arm-musl.sh
+
+      # The x86 runner can execute the static arm64 binary under qemu: make it
+      # actually play before shipping — a cross-build fault would be silent
+      # otherwise, and nobody on the team runs Android.
+      - name: Check the binary plays a move
+        run: |
+          printf 'uci\nisready\nposition startpos\ngo depth 8\nquit\n' \
+            | qemu-aarch64-static output/gaiachess-android-neon > /tmp/out.txt
+          tail -3 /tmp/out.txt
+          grep -qE '^bestmove [a-h][1-8][a-h][1-8]' /tmp/out.txt || {
+            echo 'the engine named no move'
+            exit 1
+          }
+
+      - name: Upload binary to release
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          echo "=== Uploading Android ARM64 binary ==="
+          ls -lh output/
+          gh release upload "$TAG" output/gaiachess-android-neon --clobber
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ================================================================
   # Job 4: macOS Apple Silicon (native build, no PGO)
   # ================================================================
   macos-arm:
@@ -383,12 +469,20 @@ jobs:
           isready
           position startpos
           go depth 12
+          position fen 7k/8/8/8/8/8/8/KQ6 w - - 0 1
+          go depth 1
           quit
           SESSION
-          node web/engine/host.mjs web/dist/engine.wasm --net /tmp/net.bin < /tmp/session.uci > /tmp/out.txt
+          node web/engine/host.mjs web/dist/engine.wasm --net /tmp/net.bin --tb web/dist/tb34.gtpk < /tmp/session.uci > /tmp/out.txt
           tail -3 /tmp/out.txt
           grep -qE '^bestmove [a-h][1-8][a-h][1-8]' /tmp/out.txt || {
             echo 'the engine module named no move'
+            exit 1
+          }
+          # A mate-in-8 at depth 1 can only come out of the tablebases: the search
+          # cannot see that far, so this is the probe path exercised end to end.
+          grep -q 'score mate 8' /tmp/out.txt || {
+            echo 'the endgame tables answered no probe'
             exit 1
           }
 

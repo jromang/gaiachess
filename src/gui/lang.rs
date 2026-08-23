@@ -73,10 +73,23 @@ pub fn for_tag(tag: &str) -> Lang {
 
 /// The language the machine is set to, or English where it says nothing this table
 /// recognises.
-#[cfg(feature = "gui")]
+#[cfg(all(feature = "gui", not(target_os = "haiku")))]
 pub fn detect() -> Lang {
     sys_locale::get_locale()
         .and_then(|tag| Lang::from_tag(&tag))
+        .unwrap_or(Lang::En)
+}
+
+/// Haiku's Locale preferences reach a POSIX process as the usual variables, which is
+/// all sys-locale would read here anyway — asked directly instead of through a crate
+/// that has never been built for the platform.
+#[cfg(all(feature = "gui", target_os = "haiku"))]
+pub fn detect() -> Lang {
+    ["LC_ALL", "LC_MESSAGES", "LANG"]
+        .iter()
+        .filter_map(std::env::var_os)
+        .filter_map(|tag| Lang::from_tag(tag.to_str()?))
+        .next()
         .unwrap_or(Lang::En)
 }
 

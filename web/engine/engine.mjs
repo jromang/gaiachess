@@ -68,6 +68,17 @@ export async function loadEngine(wasmSource, onLine, stopFlag) {
       new Uint8Array(memory.buffer, ptr, size).set(new Uint8Array(bytes));
       return exports.gaia_net_finish() !== 0;
     },
+    /// Installs the endgame tables, from the blob exactly as it ships.
+    ///
+    /// Same rule as the network: the bytes go straight into the module's own buffer,
+    /// and the view is built after reserving, which may grow the memory. The module
+    /// decompresses the blob itself and frees the compressed copy.
+    loadTables(bytes) {
+      const size = bytes.byteLength;
+      const ptr = exports.gaia_tb_reserve(size);
+      new Uint8Array(memory.buffer, ptr, size).set(new Uint8Array(bytes));
+      return exports.gaia_tb_finish() !== 0;
+    },
     /// Bytes of linear memory currently reserved, for the record.
     memoryBytes() {
       return memory.buffer.byteLength;

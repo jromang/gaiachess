@@ -1640,8 +1640,11 @@ fn alpha_beta<NT: NodeType>(
         }
 
         // History pruning: skip quiets whose combined history score (butterfly +
-        // continuation) is below a depth-scaled threshold. Killers and
-        // countermove are exempt — they proved valuable in sibling nodes.
+        // continuation) is below a depth-scaled threshold. The depth multiplier
+        // drops by one when the position is not improving: a worsening position
+        // deserves less benefit of the doubt, so its quiets are pruned one
+        // depth step earlier. Killers and countermove are exempt — they proved
+        // valuable in sibling nodes.
         // Check guard: never prune moves that give check.
         //
         // Reference: CPW — History Leaf Pruning
@@ -1653,7 +1656,7 @@ fn alpha_beta<NT: NodeType>(
             && m != killers[0]
             && m != killers[1]
             && m != countermove
-            && combined_history < (tune::HIST_PRUNE_MARGIN() + tune::HIST_PRUNE_DEPTH() * depth / 1024) * depth
+            && combined_history < (tune::HIST_PRUNE_MARGIN() + tune::HIST_PRUNE_DEPTH() * depth / 1024) * (depth + improving as i32 - 1)
         {
             st!(td, s, s.hist_pruned[crate::stats::db(depth)] += 1;);
             tr!(td, t, {
@@ -1866,10 +1869,10 @@ fn alpha_beta<NT: NodeType>(
         } else {
             let mut s;
 
-            // LMR: centipawn reduction system (1024cp = 1 ply)
-            if depth >= 2 && move_count > 1 {
-                debug_assert!(move_count >= 2);
-                debug_assert!(depth >= 2);
+            // Centipawn reduction signal (1024cp = 1 ply), computed for every
+            // move: the LMR branch turns it into a reduced depth, the
+            // full-depth branch gates its depth on it when it runs high.
+            let r = {
                 let ln_mc = LMR_LN[(move_count as usize).min(63)];
                 let ln_d = LMR_LN[(depth as usize).min(63)];
                 let mut r = tune::LMR_LOG_MUL() * ln_mc * ln_d / 1024 + tune::LMR_LOG_BASE();
@@ -1895,7 +1898,7 @@ fn alpha_beta<NT: NodeType>(
                     // Depth-dependent linear term: reduce ex-PV nodes less as the
                     // remaining depth grows, since over-reducing a deep ex-PV line
                     // costs exponentially more. Scale is 1024 = 1 ply.
-                    debug_assert!(depth >= 2);
+                    debug_assert!(depth >= 1);
                     r -= tune::LMR_TTPV_DEPTH_LIN() * depth;
                 }
 
@@ -1938,6 +1941,13 @@ fn alpha_beta<NT: NodeType>(
                 // unreliable (large |correction_value| → hard-to-evaluate
                 // position → search deeper)
                 r -= tune::LMR_CORR_HIST_MUL() * correction_value.abs() / 1024;
+                r
+            };
+
+            // LMR: centipawn reduction system (1024cp = 1 ply)
+            if depth >= 2 && move_count > 1 {
+                debug_assert!(move_count >= 2);
+                debug_assert!(depth >= 2);
 
                 // LMR overextension for heavily boosted early moves:
                 // if r is very negative (many accumulated bonuses) and move_count is
@@ -1982,9 +1992,18 @@ fn alpha_beta<NT: NodeType>(
                     }
                 }
             } else {
-                // No LMR: full-depth null-window search
-                tr!(td, t, t.mv(ply as u8, m.0, move_count, tree_cat, crate::tree::A_SEARCH_FULL, -total_ext * 1024, new_depth););
-                s = -alpha_beta::<NonPv>(td, shared, -alpha - 1, -alpha, new_depth, ply + 1, false, !cut_node);
+                // No LMR (first move, or shallow depth): null-window search,
+                // gated on the reduction signal. When the accumulated
+                // reduction runs high, the move does not deserve the full
+                // depth even though the LMR branch is skipped. Moves without
+                // a TT move behind them are extra suspect.
+                let r_fds = r + tune::EMR_NOTM() * (tt_move == Move::NONE) as i32;
+                let d = new_depth
+                    - (r_fds > tune::EMR_R_ONE()) as i32
+                    - (r_fds > tune::EMR_R_TWO() && new_depth > 2) as i32;
+                debug_assert!(d >= new_depth - 2);
+                tr!(td, t, t.mv(ply as u8, m.0, move_count, tree_cat, crate::tree::A_SEARCH_FULL, -total_ext * 1024, d););
+                s = -alpha_beta::<NonPv>(td, shared, -alpha - 1, -alpha, d, ply + 1, false, !cut_node);
             }
 
             // PV re-search with full window
@@ -2729,6 +2748,10 @@ mod tests {
         let pos = Position::from_fen(fen).unwrap();
         let shared = SharedState::new(4);
         let mut td = ThreadData::new(0);
+        // STOP is a process global and other tests leave it raised — an interface
+        // engine dropped by its test aborts through it and nothing lowers it after.
+        // Searching without clearing it returns the -infinity sentinel instantly.
+        crate::threads::STOP.store(false, std::sync::atomic::Ordering::Relaxed);
         td.prepare_search(&pos, &SearchLimits::Depth(depth));
         shared.tt.new_search();
         search(&mut td, &shared);
@@ -2745,6 +2768,8 @@ mod tests {
         let pos = Position::from_fen(fen).unwrap();
         let shared = SharedState::new(4);
         let mut td = ThreadData::new(0);
+        // Same residue as in `search_depth`: cleared, or the search never starts.
+        crate::threads::STOP.store(false, std::sync::atomic::Ordering::Relaxed);
         skill::set(level, seed);
         td.prepare_search(&pos, &SearchLimits::Depth(depth));
         shared.tt.new_search();

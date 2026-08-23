@@ -23,6 +23,7 @@ const STD_ERROR_HANDLE: u32 = -12i32 as u32;
 /// `AttachConsole` asked for the launcher's console rather than a given process.
 const ATTACH_PARENT_PROCESS: u32 = -1i32 as u32;
 const FILE_TYPE_UNKNOWN: u32 = 0x0000;
+const FILE_TYPE_PIPE: u32 = 0x0003;
 const GENERIC_READ: u32 = 0x8000_0000;
 const GENERIC_WRITE: u32 = 0x4000_0000;
 const FILE_SHARE_READ: u32 = 0x0000_0001;
@@ -63,6 +64,16 @@ fn usable(handle: Handle) -> bool {
 /// here and there is nothing to wait for.
 pub fn stdin_is_readable() -> bool {
     usable(unsafe { GetStdHandle(STD_INPUT_HANDLE) })
+}
+
+/// Whether stdin is a pipe — the far end of which can only be a program.
+///
+/// A player types into a console or into nothing; only another program — a chess
+/// GUI, a match manager, an adapter — connects a pipe. `GetFileType` reports
+/// sockets as pipes too, which supports the same conclusion.
+pub fn stdin_is_pipe() -> bool {
+    let handle = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
+    usable(handle) && unsafe { GetFileType(handle) } == FILE_TYPE_PIPE
 }
 
 /// Joins the launcher's console, if it has one, and gives the standard streams

@@ -145,3 +145,31 @@ pub extern "C" fn gaia_net_finish() -> i32 {
         }
     }
 }
+
+// ============================================================
+// Receiving the endgame tables
+// ============================================================
+
+/// Sizes the tablebase inbox to `len` bytes and returns where to write them.
+///
+/// The blob arrives exactly as it ships — `tb34.gtpk`, zstd inside — and is
+/// decompressed table by table when [`gaia_tb_finish`] runs. Reserving may grow the
+/// memory, so any view onto it must be rebuilt after this call.
+#[unsafe(no_mangle)]
+pub extern "C" fn gaia_tb_reserve(len: usize) -> *mut u8 {
+    gaiachess::dtm::reserve(len)
+}
+
+/// Builds the prober from the blob just written and frees the compressed copy.
+/// Returns 1 on success, 0 otherwise.
+#[unsafe(no_mangle)]
+pub extern "C" fn gaia_tb_finish() -> i32 {
+    let ok = gaiachess::dtm::publish_received();
+    gaiachess::out::line(String::from(if ok {
+        "info string GaiaTB loaded (3+4 piece DTM tablebases)"
+    } else {
+        "info string GaiaTB: failed to load tablebases"
+    }));
+    flush();
+    i32::from(ok)
+}

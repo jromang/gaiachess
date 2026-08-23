@@ -48,6 +48,18 @@ function handle(message) {
       break;
     }
 
+    case "tb": {
+      let ok = false;
+      let error = null;
+      try {
+        ok = engine.loadTables(message.bytes);
+      } catch (err) {
+        error = String(err);
+      }
+      post({ k: "tb", ok, error, memory: engine.memoryBytes() });
+      break;
+    }
+
     case "cmd":
       engine.command(message.line);
       break;
