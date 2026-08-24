@@ -106,7 +106,7 @@ if [ ! -f "$TB_BLOB" ]; then
     echo "== tables: downloading tb34.gtpk =="
     mkdir -p "$(dirname "$TB_BLOB")"
     curl -L --fail --progress-bar -o "$TB_BLOB" \
-        "https://huggingface.co/datasets/jromanghf/gaiatb-tb34/resolve/main/tb34-v2.gtpk?download=true"
+        "https://huggingface.co/datasets/jromanghf/gaiatb-tb34/resolve/main/tb34-v3.gtpk?download=true"
 fi
 cp "$TB_BLOB" "$OUT/tb34.gtpk"
 

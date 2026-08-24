@@ -60,7 +60,7 @@ fn main() {
                     // Versioned name, append-only on the dataset side: the file this
                     // code parses can never be updated out from under it. tb34.gtpk
                     // (unsuffixed) is the GTPK v1 blob the pre-calibration engines read.
-                    "https://huggingface.co/datasets/jromanghf/gaiatb-tb34/resolve/main/tb34-v2.gtpk?download=true",
+                    "https://huggingface.co/datasets/jromanghf/gaiatb-tb34/resolve/main/tb34-v3.gtpk?download=true",
                 ])
                 .status()
                 .expect("Failed to run curl — is it installed?");

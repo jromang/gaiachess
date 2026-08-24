@@ -33,7 +33,12 @@ fi
 echo "=== Building GaiaChess for Haiku (net: $NET) ==="
 # The whole feature set builds and runs on Haiku (each proven one at a time,
 # 2026-08-23) — this is the default set plus nnue, minus nothing.
+# Fat LTO is disabled on Haiku: rustc 1.94.1 there miscompiles the GaiaTB
+# parser under fat LTO (embedded tables refuse to load; reproducible, 2026-08-23,
+# QEMU guest — to be re-checked on real hardware some day) and thin LTO ICEs.
+# A few percent of NPS is a fair price for tables that work.
 MODEL="$NET" RUSTFLAGS="-C target-cpu=x86-64-v2" ZSTD_SYS_USE_PKG_CONFIG=1 \
+    CARGO_PROFILE_RELEASE_LTO=false \
     cargo build --release --no-default-features \
     --features "nnue,gui,syzygy,gaiatb,online-tb,nalimov,progress"
 

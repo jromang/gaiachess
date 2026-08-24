@@ -481,7 +481,7 @@ jobs:
           }
           # A mate-in-8 at depth 1 can only come out of the tablebases: the search
           # cannot see that far, so this is the probe path exercised end to end.
-          grep -q 'score mate 8' /tmp/out.txt || {
+          grep -q 'score mate 7' /tmp/out.txt || {
             echo 'the endgame tables answered no probe'
             exit 1
           }

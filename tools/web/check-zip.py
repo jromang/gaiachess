@@ -53,10 +53,10 @@ def main(path: str) -> int:
             print(f"{name} is only {size} bytes — a stub, not a build", file=sys.stderr)
             return 1
 
-    # The endgame tables: 35 compressed tables come to ~30 MB, so anything much
-    # smaller is a truncated download, not the blob.
+    # The endgame tables: 35 compressed tables come to ~20 MB (v3 blob), so
+    # anything much smaller is a truncated download, not the blob.
     size = archive.getinfo("tb34.gtpk").file_size
-    if size < 20 * 1024 * 1024:
+    if size < 15 * 1024 * 1024:
         print(f"tb34.gtpk is only {size} bytes — not the tables", file=sys.stderr)
         return 1
 

@@ -80,10 +80,10 @@ pub fn probe_position(pos: &Position, ply: i32) -> Option<i32> {
     // Quick piece-count guard (should already be checked by caller, but be safe)
     if pos.occupied().count_ones() > 4 { return None; }
 
-    let (white, black, wk, bk, pieces) = extract_for_probe(pos);
+    let (white, black, wk, bk, pieces, np) = extract_for_probe(pos);
     let stm_white = pos.side_to_move == Color::White;
 
-    let dtm = prober.probe_dtm(&white, &black, wk, bk, &pieces, stm_white)?;
+    let dtm = prober.probe_dtm(&white, &black, wk, bk, &pieces[..np], stm_white)?;
 
     // probe_dtm returns STM-relative DTM:
     //   dtm > 0: the side to move wins in dtm half-moves
@@ -101,8 +101,10 @@ pub fn probe_position(pos: &Position, ply: i32) -> Option<i32> {
 }
 
 /// Extract piece data from a GaiaChess `Position` into the raw format expected
-/// by `Prober::probe_dtm`.
-fn extract_for_probe(pos: &Position) -> ([u8; 5], [u8; 5], u8, u8, [u8; 8]) {
+/// by `Prober::probe_dtm`. The last element is the number of non-king pieces
+/// actually written to the square array — the prober expects a slice of exactly
+/// that length, not the whole fixed-size buffer.
+fn extract_for_probe(pos: &Position) -> ([u8; 5], [u8; 5], u8, u8, [u8; 8], usize) {
     let wk = pos.king_sq(Color::White).0;
     let bk = pos.king_sq(Color::Black).0;
 
@@ -142,8 +144,9 @@ fn extract_for_probe(pos: &Position) -> ([u8; 5], [u8; 5], u8, u8, [u8; 8]) {
     for pt in [PieceType::Queen, PieceType::Rook, PieceType::Bishop, PieceType::Knight] {
         add(pos.piece_type_bb(pt, Color::Black));
     }
+    drop(add);
 
-    (white, black, wk, bk, pieces)
+    (white, black, wk, bk, pieces, p)
 }
 
 // ╔══════════════════════════════════════════════════════════════════════════╗
