@@ -34,6 +34,8 @@ pub const L2_SIZE: usize = 16;
 pub const L3_SIZE: usize = 32;
 pub const NUM_OUTPUT_BUCKETS: usize = 8;
 pub const TOTAL_THREATS: usize = threats::TOTAL_THREATS;
+/// Network output scale in centipawns — IDENTICAL to the engine's NETWORK_SCALE.
+pub const EVAL_SCALE: f32 = 287.0;
 
 /// King buckets (32 half-board entries, expanded with mirroring) — IDENTICAL to src/nnue/features.rs.
 #[rustfmt::skip]
@@ -162,7 +164,7 @@ fn run_phase1(
         let remaining_sb = superbatches - (start_sb - 1);
         let schedule = TrainingSchedule {
             net_id: net_id.to_string(),
-            eval_scale: 287.0,
+            eval_scale: EVAL_SCALE,
             steps: TrainingSteps {
                 batch_size: 16_384,
                 batches_per_superbatch: 6104,
@@ -184,7 +186,7 @@ fn run_phase1(
     } else {
         let schedule = TrainingSchedule {
             net_id: net_id.to_string(),
-            eval_scale: 287.0,
+            eval_scale: EVAL_SCALE,
             steps: TrainingSteps {
                 batch_size: 16_384,
                 batches_per_superbatch: 6104,
@@ -275,6 +277,22 @@ mod integration_tests {
         let path = "/tmp/test_raw.bin";
         if !std::path::Path::new(path).exists() { return; }
         let data = save_format::process_net(path).unwrap();
-        assert_eq!(data.len(), save_format::NNUE_FILE_SIZE);
+        assert_eq!(
+            data.len(),
+            save_format::NNUE_FILE_SIZE + save_format::FOOTER_SIZE
+        );
+    }
+
+    /// Pins the architecture digest. The engine pins the SAME literal in
+    /// src/nnue/integrity.rs from ITS constants: an architecture drift on
+    /// either side fails that side's `cargo test` before any network is
+    /// exported or loaded. A legitimate change updates both literals.
+    #[test]
+    fn the_architecture_digest_is_pinned_on_both_sides() {
+        assert_eq!(
+            save_format::ARCH_HASH,
+            0xee36_e388,
+            "update src/nnue/integrity.rs in lockstep"
+        );
     }
 }

@@ -240,7 +240,11 @@ fn play_game(
     // Phase 2: Verify opening with a quick search
     {
         let limits = if config.soft_nodes > 0 {
-            SearchLimits::Nodes(config.soft_nodes * 10) // 10x nodes for verification
+            let soft = config.soft_nodes * 10; // 10x budget for verification
+            SearchLimits::SoftNodes {
+                soft,
+                hard: soft.saturating_mul(crate::timeman::SOFT_NODES_HARD_FACTOR),
+            }
         } else {
             SearchLimits::Depth(config.depth + 2)
         };
@@ -321,7 +325,12 @@ fn play_game(
 
         // Search for best move
         let limits = if config.soft_nodes > 0 {
-            SearchLimits::Nodes(config.soft_nodes)
+            SearchLimits::SoftNodes {
+                soft: config.soft_nodes,
+                hard: config
+                    .soft_nodes
+                    .saturating_mul(crate::timeman::SOFT_NODES_HARD_FACTOR),
+            }
         } else {
             SearchLimits::Depth(config.depth)
         };
@@ -540,7 +549,14 @@ fn worker(
 // ============================================================
 
 /// Run datagen: `gaiachess datagen --threads 12 --positions 10000000 --depth 8`
-pub fn run(threads: usize, target_positions: u64, depth: i32, output: &str, book_path: Option<&str>) {
+pub fn run(
+    threads: usize,
+    target_positions: u64,
+    depth: i32,
+    soft_nodes: u64,
+    output: &str,
+    book_path: Option<&str>,
+) {
     let num_threads = match threads {
         0 => std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1),
         n => n,
@@ -560,9 +576,12 @@ pub fn run(threads: usize, target_positions: u64, depth: i32, output: &str, book
         Arc::new(lines)
     });
 
+    // A worker hitting its node limit stops itself (datagen_mode in
+    // check_limits), so a node budget no longer races the other workers
+    // through the global STOP.
     let config = DatagenConfig {
         depth,
-        soft_nodes: 0, // depth-only: avoids STOP race between datagen threads
+        soft_nodes,
         ..DatagenConfig::default()
     };
 
@@ -575,8 +594,15 @@ pub fn run(threads: usize, target_positions: u64, depth: i32, output: &str, book
     eprintln!("GaiaChess datagen");
     eprintln!("  Threads:    {num_threads}");
     eprintln!("  Target:     {target_positions} positions");
-    eprintln!("  Depth:      {depth}");
-    eprintln!("  Nodes:      {} soft", config.soft_nodes);
+    if config.soft_nodes > 0 {
+        eprintln!(
+            "  Nodes:      {} soft, {} hard",
+            config.soft_nodes,
+            config.soft_nodes * crate::timeman::SOFT_NODES_HARD_FACTOR
+        );
+    } else {
+        eprintln!("  Depth:      {depth}");
+    }
     eprintln!("  Output:     {output}.*");
     if book.is_none() {
         eprintln!("  Book:       none (random openings)");

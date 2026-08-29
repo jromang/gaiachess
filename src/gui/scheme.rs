@@ -34,7 +34,7 @@ pub struct Scheme {
     pub shadow_alpha: u32,
 }
 
-pub const SCHEMES: [Scheme; 2] = [
+pub const SCHEMES: [Scheme; 3] = [
     // Silver against navy on cool blue-greys, the closest match to how the piece
     // sheet was originally presented.
     Scheme {
@@ -69,7 +69,34 @@ pub const SCHEMES: [Scheme; 2] = [
         black_variant: 3,
         shadow_alpha: 80,
     },
+    // The Haiku desktop as a light theme: panel grey ground, off-white dialogs with
+    // a bevel rim, near-black ink, and the window-tab yellow living in the dark
+    // tiles. The accent is the desktop navy pulled down far enough to read on both
+    // light grounds — tab yellow only manages ~1.6:1 there, so the tiles carry it.
+    Scheme {
+        name: Key::SchemeHaiku,
+        bg: rgb(0xd8d8d8),
+        tile_light: rgb(0xf2f2f2),
+        tile_dark: rgb(0xffcb00),
+        board_edge: rgb(0x989898),
+        accent: rgb(0x28527a),
+        panel: rgb(0xefefef),
+        panel_edge: rgb(0xc4c4c4),
+        text: rgb(0x1a1a1a),
+        text_dim: rgb(0x4d4d4d),
+        white_variant: 0,
+        black_variant: 1,
+        shadow_alpha: 50,
+    },
 ];
+
+/// The scheme a fresh interface wakes up with. On Haiku the board dresses to match
+/// the desktop it sits on; everywhere else it keeps the slate the piece sheet was
+/// drawn for. Tab still cycles the full set either way.
+#[cfg(target_os = "haiku")]
+pub const DEFAULT: usize = 2;
+#[cfg(not(target_os = "haiku"))]
+pub const DEFAULT: usize = 0;
 
 impl Scheme {
     /// The sheet variant for a side.
@@ -128,6 +155,14 @@ mod tests {
                 s.name
             );
         }
+    }
+
+    #[test]
+    fn the_default_scheme_exists_and_index_two_is_still_haiku() {
+        // DEFAULT is 2 on Haiku builds; pin what 2 means so a reorder of the table
+        // cannot silently hand that desktop a different theme.
+        assert!(DEFAULT < SCHEMES.len());
+        assert!(matches!(SCHEMES[2].name, Key::SchemeHaiku));
     }
 
     #[test]

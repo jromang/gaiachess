@@ -630,6 +630,8 @@ bool tb_init(const char *path)
   if (pathString) {
     free(pathString);
     free(paths);
+    paths = NULL;
+    numPaths = 0;
 
     for (int i = 0; i < tbNumPiece; i++)
       free_tb_entry((struct BaseEntry *)&pieceEntry[i]);

@@ -694,9 +694,14 @@ pub fn search(td: &mut ThreadData, shared: &SharedState) {
             td.tm.restart();
         }
 
-        // Soft time check after each iteration (main thread only; helpers have infinite limits).
+        // Soft time and soft node checks after each iteration (main thread only;
+        // helpers have infinite limits — except in datagen, where every worker
+        // carries its own limits). The iteration that crossed the node budget
+        // was allowed to finish; the hard cap in check_limits catches explosions.
         // Skip while pondering — search indefinitely until ponderhit or stop.
-        if !td.pondering && td.tm.should_stop_soft() {
+        if !td.pondering
+            && (td.tm.should_stop_soft() || td.nodes >= td.tm.soft_nodes())
+        {
             break;
         }
     }
@@ -1399,8 +1404,12 @@ fn alpha_beta<NT: NodeType>(
         let probcut_beta = beta + tune::PROBCUT_MARGIN();
         let see_threshold = (probcut_beta - static_eval) * 10 / 16;
 
-        // TT move: include only if it's a capture passing SEE threshold
+        // TT move: include only if it's a capture passing SEE threshold.
+        // A stale or colliding TT entry can carry a move that does not fit this
+        // position (empty from-square, wrong side); everywhere else the TT move
+        // is validated by the MovePicker before use, but SEE is probed here first.
         let pc_tt_move = if tt_move != Move::NONE
+            && movegen::is_pseudo_legal(&td.pos, tt_move)
             && (tt_move.move_type() != MT_NORMAL
                 || td.pos.board[tt_move.to_sq().index()] != Piece::NONE)
             && crate::see::see(&td.pos, tt_move, see_threshold)
@@ -2927,6 +2936,39 @@ mod tests {
     fn test_startpos_returns_move() {
         let (m, _) = search_depth("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1", 4);
         assert!(m.is_ok(), "Search should return a valid move");
+    }
+
+    #[test]
+    fn soft_nodes_finish_the_iteration_hard_nodes_cut_it() {
+        let _guard = skill::lock_level();
+        let pos = Position::from_fen(
+            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+        ).unwrap();
+
+        // Soft budget: the iteration that crosses it is allowed to finish,
+        // so the search overshoots the budget but stays under the hard cap.
+        let shared = SharedState::new(4);
+        let mut td = ThreadData::new(0);
+        crate::threads::STOP.store(false, std::sync::atomic::Ordering::Relaxed);
+        td.prepare_search(&pos, &SearchLimits::SoftNodes { soft: 2000, hard: 200_000 });
+        shared.tt.new_search();
+        search(&mut td, &shared);
+        assert!(td.best_move.is_ok(), "soft-node search must return a move");
+        assert!(td.nodes >= 2000, "budget crossed then finished: {} nodes", td.nodes);
+        assert!(td.nodes < 200_000, "hard cap never reached: {} nodes", td.nodes);
+        assert!(td.completed_depth >= 1);
+
+        // Bare node limit stays hard: the search aborts within one 512-node
+        // tick of the limit instead of finishing the iteration.
+        let shared = SharedState::new(4);
+        let mut td = ThreadData::new(0);
+        crate::threads::STOP.store(false, std::sync::atomic::Ordering::Relaxed);
+        td.prepare_search(&pos, &SearchLimits::Nodes(2000));
+        shared.tt.new_search();
+        search(&mut td, &shared);
+        assert!(td.best_move.is_ok(), "hard-node search must return a move");
+        assert!(td.nodes <= 2000 + 1024, "hard limit overshot: {} nodes", td.nodes);
+        crate::threads::STOP.store(false, std::sync::atomic::Ordering::Relaxed);
     }
 
     #[test]

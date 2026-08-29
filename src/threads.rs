@@ -435,11 +435,18 @@ impl ThreadData {
                 self.tm.restart();
             }
 
-            // Skip time/node limits while pondering (search indefinitely)
+            // Skip time/node limits while pondering (search indefinitely).
+            // In datagen the limit is per-worker: stop this thread only, like
+            // the deadline below — a worker hitting its node budget must not
+            // kill its siblings through the global STOP.
             if !self.pondering
                 && (self.tm.should_stop_hard() || self.nodes >= self.tm.max_nodes())
             {
-                STOP.store(true, Ordering::Relaxed);
+                if self.datagen_mode {
+                    self.stopped = true;
+                } else {
+                    STOP.store(true, Ordering::Relaxed);
+                }
             }
             // Per-thread deadline (datagen): stop this thread without touching global STOP
             if self.search_deadline > 0 && self.tm.elapsed_ms() >= self.search_deadline {

@@ -152,6 +152,7 @@ pub enum Key {
     // Colour schemes.
     SchemeSlate,
     SchemeEmber,
+    SchemeHaiku,
     // The status band, which says what has just become true.
     Thinking,
     WhiteToMove,
@@ -204,6 +205,7 @@ pub fn t(k: Key, l: Lang) -> &'static str {
         Key::ClockNone    => ["none",                    "aucune",                      "ninguno",                  "keine",                   "nessuno",                      "nenhum"],
         Key::SchemeSlate  => ["slate",                   "ardoise",                     "pizarra",                  "schiefer",                "ardesia",                      "ardosia"],
         Key::SchemeEmber  => ["ember",                   "braise",                      "brasa",                    "glut",                    "brace",                        "brasa"],
+        Key::SchemeHaiku  => ["haiku",                   "haiku",                       "haiku",                    "haiku",                   "haiku",                        "haiku"],
         Key::Thinking     => ["thinking",                "reflexion",                   "pensando",                 "denkt nach",              "sto pensando",                 "pensando"],
         Key::WhiteToMove  => ["white to move",           "aux blancs de jouer",         "juegan blancas",           "weiss am zug",            "muove il bianco",              "brancas jogam"],
         Key::BlackToMove  => ["black to move",           "aux noirs de jouer",          "juegan negras",            "schwarz am zug",          "muove il nero",                "pretas jogam"],
@@ -292,11 +294,11 @@ mod tests {
     /// Listed rather than derived: there is no way to walk an enum, and a key left out
     /// of this list is a key no test ever measures.
     #[rustfmt::skip]
-    pub const KEYS: [Key; 41] = [
+    pub const KEYS: [Key; 42] = [
         Key::White, Key::Black, Key::Level, Key::Clock, Key::Colours, Key::Language,
         Key::Sound, Key::About, Key::Play, Key::Engine, Key::Human, Key::On, Key::Off,
         Key::Elo, Key::Tagline, Key::Since, Key::MenuHint, Key::ClockCustom,
-        Key::ClockNone, Key::SchemeSlate, Key::SchemeEmber, Key::Thinking,
+        Key::ClockNone, Key::SchemeSlate, Key::SchemeEmber, Key::SchemeHaiku, Key::Thinking,
         Key::WhiteToMove, Key::BlackToMove, Key::WhiteWins, Key::BlackWins,
         Key::Stalemate, Key::Draw, Key::WhiteFlagged, Key::BlackFlagged, Key::WhiteCheck,
         Key::BlackCheck, Key::TakeBack, Key::Restart, Key::SoundOn, Key::SoundOff,

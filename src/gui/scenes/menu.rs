@@ -12,7 +12,7 @@ use super::super::fb::{FB_H, FB_W, Fb, rgba};
 use super::super::font;
 use super::super::input::{Dir, Input};
 use super::super::lang::{self, Key, Lang, t};
-use super::super::scheme::{SCHEMES, Scheme};
+use super::super::scheme::{self, SCHEMES, Scheme};
 use super::about::About;
 use crate::skill;
 
@@ -40,7 +40,7 @@ impl Default for MatchConfig {
             black_cpu: true,
             level: DEFAULT_LEVEL,
             time: TimeControl::Unlimited,
-            scheme: 0,
+            scheme: scheme::DEFAULT,
             // Not detected here: this is what the tests and the headless captures start
             // from as well, and they have to say the same thing on every machine. The
             // running interface asks for the machine's language in `App::new`.

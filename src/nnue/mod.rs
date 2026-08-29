@@ -28,6 +28,7 @@
 
 pub mod accumulator;
 pub mod features;
+pub mod integrity;
 pub(crate) mod forward;
 pub(crate) mod kernels;
 pub mod network;

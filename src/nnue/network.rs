@@ -161,7 +161,7 @@ const PERM_BLOCK: usize = 8;
 /// Permutation written into the `.bin` by the trainer
 /// (`tools/trainer5/src/save_format.rs`, `packus_permute_*`): the AVX-512 pattern,
 /// which cancels the lane interleaving of `_mm512_packus_epi16`.
-const FILE_PERM: [usize; 8] = [0, 2, 4, 6, 1, 3, 5, 7];
+pub(crate) const FILE_PERM: [usize; 8] = [0, 2, 4, 6, 1, 3, 5, 7];
 
 /// Convert one row of `L1_SIZE` elements from the file's permutation to the target's.
 ///
@@ -276,26 +276,36 @@ fn decompress_embedded() -> Box<NNUEParams> {
     let mut decoder =
         ruzstd::decoding::StreamingDecoder::new_with_max_window_size(COMPRESSED_MODEL, WINDOW)
             .expect("Failed to init zstd decoder for embedded NNUE");
+    // Decompress the whole stream (a footered network carries 16 trailing
+    // bytes past the payload) and run the integrity gate on the file image.
+    // A legacy embedded network passes silently — embedding it was a build
+    // choice; a failed check is a corrupt or mismatched binary and panics
+    // like the decoder errors above.
+    let mut data = Vec::with_capacity(NNUE_FILE_SIZE + super::integrity::FOOTER_SIZE);
+    decoder
+        .read_to_end(&mut data)
+        .expect("Failed to decompress embedded NNUE network");
+    super::integrity::verify(&data)
+        .unwrap_or_else(|e| panic!("Embedded NNUE network failed integrity check: {e}"));
+
     let mut params = NNUEParams::zeroed_box();
-    // Read exactly NNUE_FILE_SIZE bytes into the struct (Aligned padding stays zero).
-    let dst = unsafe {
-        std::slice::from_raw_parts_mut(
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            data.as_ptr(),
             params.as_mut() as *mut NNUEParams as *mut u8,
             NNUE_FILE_SIZE,
-        )
-    };
-    decoder
-        .read_exact(dst)
-        .expect("Failed to decompress embedded NNUE network");
+        );
+    }
     repermute_ft(&mut params);
     params
 }
 
 /// Load a network from a `.bin` file at runtime.
 ///
-/// Accepts files of exactly `NNUE_FILE_SIZE` bytes, or up to 63 bytes larger
-/// (the Bullet trainer adds padding to align to 64 bytes).
-pub fn load_from_file(path: &str) -> Result<(), String> {
+/// Accepts a footered file (payload + 16-byte integrity footer, verified), or
+/// a legacy file of exactly `NNUE_FILE_SIZE` bytes plus up to 63 bytes of
+/// Bullet alignment padding (size-checked only).
+pub fn load_from_file(path: &str) -> Result<super::integrity::Provenance, String> {
     let data = std::fs::read(path).map_err(|e| format!("Failed to read {path}: {e}"))?;
     load_from_bytes(&data)
 }
@@ -311,15 +321,11 @@ pub fn load_from_file(path: &str) -> Result<(), String> {
 /// knowing otherwise would take a reclamation protocol this does not have. In practice
 /// nothing accumulates: the option is set between searches, and a browser loads once at
 /// start-up and never again.
-pub fn load_from_bytes(data: &[u8]) -> Result<(), String> {
-    let excess = data.len().wrapping_sub(NNUE_FILE_SIZE);
-    if excess > 63 {
-        return Err(format!(
-            "File size {} != expected {NNUE_FILE_SIZE} bytes (got {} extra, max 63 padding)",
-            data.len(),
-            if data.len() < NNUE_FILE_SIZE { -(excess as isize) } else { excess as isize },
-        ));
-    }
+pub fn load_from_bytes(data: &[u8]) -> Result<super::integrity::Provenance, String> {
+    // Integrity gate before anything is installed: a rejected network must
+    // neither leak a box nor bump the generation. The hashes are over the
+    // file bytes — repermute_ft below makes memory machine-dependent.
+    let provenance = super::integrity::verify(data)?;
 
     // Allocate zeroed box and copy the raw binary in, then fix the FT packus
     // permutation for the compiled target (no-op on AVX-512).
@@ -340,7 +346,7 @@ pub fn load_from_bytes(data: &[u8]) -> Result<(), String> {
     // Increment generation so Finny table caches are invalidated.
     NETWORK_GENERATION.fetch_add(1, Ordering::Release);
 
-    Ok(())
+    Ok(provenance)
 }
 
 // ============================================================

@@ -15,6 +15,103 @@ const L1_QUANT: f32 = 64.0;
 /// Expected binary size (must match engine's NNUE_FILE_SIZE).
 pub const NNUE_FILE_SIZE: usize = 38_330_144;
 
+/// Packus permutation baked into the exported file (AVX-512 lane order).
+/// Part of the file contract, hashed into ARCH_HASH.
+pub(crate) const FILE_PERM: [usize; 8] = [0, 2, 4, 6, 1, 3, 5, 7];
+
+// ============================================================
+// Integrity footer — mirror of the engine's src/nnue/integrity.rs
+// ============================================================
+//
+// 16 bytes appended after the payload: [arch_hash u32][content_hash u64]
+// [magic u32 = "GN1\0"], little-endian. ARCH_HASH is computed here from the
+// TRAINER's own constants and by the engine from its own: a drift between
+// the two sides makes the values diverge and the engine refuses the network
+// loudly. The golden tests on both sides pin the same literal.
+
+/// Size of the integrity footer.
+pub const FOOTER_SIZE: usize = 16;
+
+/// Footer magic, last 4 bytes of a footered file.
+pub const FOOTER_MAGIC: u32 = u32::from_le_bytes(*b"GN1\0");
+
+const FNV32_OFFSET: u32 = 0x811c_9dc5;
+const FNV32_PRIME: u32 = 0x0100_0193;
+const FNV64_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+const FNV64_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+/// Fold one little-endian u32 into an FNV-1a 32 state.
+const fn h32(mut h: u32, v: u32) -> u32 {
+    let bytes = v.to_le_bytes();
+    let mut i = 0;
+    while i < 4 {
+        h ^= bytes[i] as u32;
+        h = h.wrapping_mul(FNV32_PRIME);
+        i += 1;
+    }
+    h
+}
+
+/// FNV-1a 64 over the payload bytes.
+pub fn fnv1a64(data: &[u8]) -> u64 {
+    let mut h = FNV64_OFFSET;
+    for &b in data {
+        h ^= b as u64;
+        h = h.wrapping_mul(FNV64_PRIME);
+    }
+    h
+}
+
+/// Canonical architecture digest — same tuple, same order as the engine:
+/// FT_SIZE, THREAT_INPUT_SIZE, L1, L2, L3, INPUT_BUCKETS, OUTPUT_BUCKETS,
+/// FT_QUANT, L1_QUANT, NETWORK_SCALE, 64 king-bucket entries (half-board
+/// layout mirrored like the engine's features.rs), 33 output-bucket entries
+/// (MaterialCount formula `(count-2)/4`), 8 FILE_PERM entries.
+pub const ARCH_HASH: u32 = {
+    let mut h = FNV32_OFFSET;
+    h = h32(h, (768 * KING_BUCKETS) as u32); // FT_SIZE
+    h = h32(h, TOTAL_THREATS as u32);
+    h = h32(h, L1_SIZE as u32);
+    h = h32(h, L2_SIZE as u32);
+    h = h32(h, L3_SIZE as u32);
+    h = h32(h, KING_BUCKETS as u32);
+    h = h32(h, NUM_OUTPUT_BUCKETS as u32);
+    h = h32(h, INPUT_QUANT as u32);
+    h = h32(h, L1_QUANT as u32);
+    h = h32(h, crate::EVAL_SCALE as u32);
+    // King buckets, expanded to 64 squares: files e-h mirror a-d.
+    let mut sq = 0;
+    while sq < 64 {
+        let (rank, file) = (sq / 8, sq % 8);
+        let half = if file < 4 { file } else { 7 - file };
+        h = h32(h, crate::BUCKET_LAYOUT[rank * 4 + half] as u32);
+        sq += 1;
+    }
+    // Output buckets from Bullet's MaterialCount<8>.
+    let mut count = 0;
+    while count <= 32 {
+        let bucket = if count < 2 { 0 } else { (count - 2) / 4 };
+        h = h32(h, bucket as u32);
+        count += 1;
+    }
+    let mut i = 0;
+    while i < FILE_PERM.len() {
+        h = h32(h, FILE_PERM[i] as u32);
+        i += 1;
+    }
+    h
+};
+
+/// Build the 16-byte integrity footer for an exported payload.
+pub fn footer(payload: &[u8]) -> [u8; FOOTER_SIZE] {
+    assert_eq!(payload.len(), NNUE_FILE_SIZE);
+    let mut f = [0u8; FOOTER_SIZE];
+    f[0..4].copy_from_slice(&ARCH_HASH.to_le_bytes());
+    f[4..12].copy_from_slice(&fnv1a64(payload).to_le_bytes());
+    f[12..16].copy_from_slice(&FOOTER_MAGIC.to_le_bytes());
+    f
+}
+
 /// Raw save format (8 entries, no transforms).
 /// Bullet saves raw f32 weights that can be processed by process_net().
 pub fn build_save_format() -> Vec<SavedFormat> {
@@ -259,6 +356,12 @@ pub fn process_net(raw_path: &str) -> std::io::Result<Vec<u8>> {
     assert_eq!(output.len(), NNUE_FILE_SIZE,
         "process_net output size {} != expected {NNUE_FILE_SIZE}", output.len());
 
+    // Append the integrity footer: every exported network is verifiable, and
+    // engine binaries that predate the footer ignore the 16 trailing bytes
+    // (their loaders tolerate up to 63 bytes of padding).
+    let f = footer(&output);
+    output.extend_from_slice(&f);
+
     Ok(output)
 }
 
@@ -274,7 +377,7 @@ fn bytemuck_cast_slice(bytes: &[u8]) -> &[f32] {
 /// Packus permutation for i16 arrays (PST weights, biases).
 /// Reorders blocks of 8 i16 values within each row of `stride` elements.
 fn packus_permute_i16(data: &mut [i16], stride: usize) {
-    const PERM: [usize; 8] = [0, 2, 4, 6, 1, 3, 5, 7];
+    const PERM: [usize; 8] = FILE_PERM;
     const BLOCK: usize = 8; // i16 per __m128i
     let group = BLOCK * PERM.len(); // 64 i16 values
 
@@ -293,7 +396,7 @@ fn packus_permute_i16(data: &mut [i16], stride: usize) {
 /// Packus permutation for i8 arrays (threat weights).
 /// Reorders blocks of 8 bytes (u64 lanes) within each row.
 fn packus_permute_i8(data: &mut [i8], stride: usize) {
-    const PERM: [usize; 8] = [0, 2, 4, 6, 1, 3, 5, 7];
+    const PERM: [usize; 8] = FILE_PERM;
     const BLOCK: usize = 8; // bytes per uint64_t
     let group = BLOCK * PERM.len(); // 64 bytes
 

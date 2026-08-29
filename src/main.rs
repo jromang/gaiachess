@@ -60,6 +60,9 @@ enum Cmd {
         /// Search depth per move
         #[bpaf(short, long, fallback(8i32), display_fallback)]
         depth: i32,
+        /// Soft node budget per move (0 = fixed depth); hard cap = 100x
+        #[bpaf(short('N'), long, fallback(0u64), display_fallback)]
+        nodes: u64,
         /// Output base filename
         #[bpaf(short, long, fallback("data/gen0".to_string()), display_fallback)]
         output: String,
@@ -390,7 +393,7 @@ fn real_main(cmd: Cmd, stdin: ProbedStdin) {
             }
         }
         #[cfg(feature = "datagen")]
-        Cmd::Datagen { threads, positions, depth, output, book, syzygy } => {
+        Cmd::Datagen { threads, positions, depth, nodes, output, book, syzygy } => {
             #[cfg(feature = "syzygy")]
             if let Some(ref path) = syzygy
                 && !tb::init(path)
@@ -401,7 +404,7 @@ fn real_main(cmd: Cmd, stdin: ProbedStdin) {
             if syzygy.is_some() {
                 eprintln!("WARNING: --syzygy requires --features syzygy (ignored)");
             }
-            datagen::run(threads, positions, depth, &output, book.as_deref());
+            datagen::run(threads, positions, depth, nodes, &output, book.as_deref());
         }
         #[cfg(any(feature = "stats", feature = "tree"))]
         Cmd::Dump {
@@ -451,6 +454,10 @@ fn real_main(cmd: Cmd, stdin: ProbedStdin) {
                 println!(
                     "Network:     {}",
                     option_env!("MODEL").unwrap_or("unknown")
+                );
+                println!(
+                    "Arch hash:   {:#010x}",
+                    gaiachess::nnue::integrity::ARCH_HASH
                 );
             }
             // On x86-64 the SIMD paths are resolved from CPUID at startup; the

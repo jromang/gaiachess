@@ -28,6 +28,13 @@ const STARTPOS: &str = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1
 /// the opening book instead.
 static SKILL_SEED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// UCI `UseSoftNodes`: a bare `go nodes N` is reinterpreted as a soft budget
+/// (finish the iteration in flight) with a derived hard ceiling. Off by
+/// default — a plain `go nodes` stays a hard limit. Match runners only send
+/// `go nodes`, so this switch is what lets them exercise the soft behavior.
+static USE_SOFT_NODES: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 fn skill_seed() -> u64 {
     match SKILL_SEED.load(Ordering::Relaxed) {
         0 => 0x9E37_79B9_7F4A_7C15,
@@ -120,6 +127,7 @@ impl UciSession {
                 out!("option name OwnBook type check default true");
                 out!("option name MultiPV type spin default 1 min 1 max 256");
                 out!("option name Move Overhead type spin default 100 min 0 max 5000");
+                out!("option name UseSoftNodes type check default false");
                 out!(
                     "option name Skill Level type spin default {} min {} max {}",
                     crate::skill::FULL_STRENGTH,
@@ -285,6 +293,7 @@ fn parse_go(tokens: &[&str], pos: &Position) -> SearchLimits {
     let stm = pos.side_to_move as usize;
     let mut depth = None;
     let mut nodes = None;
+    let mut softnodes = None;
     let mut movetime = None;
     let mut clocks: [Option<u64>; 2] = [None, None];
     let mut incs = [0u64; 2];
@@ -297,6 +306,7 @@ fn parse_go(tokens: &[&str], pos: &Position) -> SearchLimits {
             "ponder" => {}
             "depth" => depth = next_val(&mut iter),
             "nodes" => nodes = next_val(&mut iter),
+            "softnodes" => softnodes = next_val(&mut iter),
             "movetime" => movetime = next_val(&mut iter),
             "wtime" => clocks[Color::White as usize] = next_val(&mut iter),
             "btime" => clocks[Color::Black as usize] = next_val(&mut iter),
@@ -310,7 +320,19 @@ fn parse_go(tokens: &[&str], pos: &Position) -> SearchLimits {
     if let Some(d) = depth {
         return SearchLimits::Depth(d);
     }
+    if let Some(n) = softnodes {
+        return SearchLimits::SoftNodes {
+            soft: n,
+            hard: n.saturating_mul(crate::timeman::SOFT_NODES_HARD_FACTOR),
+        };
+    }
     if let Some(n) = nodes {
+        if USE_SOFT_NODES.load(std::sync::atomic::Ordering::Relaxed) {
+            return SearchLimits::SoftNodes {
+                soft: n,
+                hard: n.saturating_mul(crate::timeman::SOFT_NODES_HARD_FACTOR),
+            };
+        }
         return SearchLimits::Nodes(n);
     }
     if let Some(ms) = movetime {
@@ -386,13 +408,26 @@ fn parse_setoption(tokens: &[&str], pool: &mut ThreadPool, ponder_enabled: &mut 
                 crate::tune::set_move_overhead(v);
             }
         }
+        "usesoftnodes" => {
+            USE_SOFT_NODES.store(
+                value.eq_ignore_ascii_case("true"),
+                Ordering::Relaxed,
+            );
+        }
         "evalfile" => {
             if value == "<internal>" {
                 outerr!("info string Using default evaluation");
             } else {
+                use crate::nnue::integrity::Provenance;
                 match crate::nnue::network::load_from_file(&value) {
-                    Ok(()) => {
-                        outerr!("info string Loaded NNUE network from {value}");
+                    Ok(Provenance::Verified) => {
+                        outerr!("info string Loaded NNUE network from {value} (integrity verified)");
+                        pool.clear();
+                    }
+                    Ok(Provenance::Legacy) => {
+                        outerr!(
+                            "info string Loaded NNUE network from {value} (legacy, no integrity footer)"
+                        );
                         pool.clear();
                     }
                     Err(e) => {

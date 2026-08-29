@@ -208,11 +208,11 @@ tunable! {
 
     // === Full-depth search gating (3) ===
     /// Reduction-signal addend when no TT move backs the position.
-    EMR_NOTM = 993, 0, 2000, 100;
+    EMR_NOTM = 811, 0, 2000, 100;
     /// Reduction-signal threshold for the first ply cut in full-depth search.
-    EMR_R_ONE = 4302, 2000, 8000, 200;
+    EMR_R_ONE = 4501, 2000, 8000, 200;
     /// Reduction-signal threshold for the second ply cut in full-depth search.
-    EMR_R_TWO = 5919, 3000, 10000, 200;
+    EMR_R_TWO = 6183, 3000, 10000, 200;
 
     // === Futility pruning (3) ===
     /// Maximum depth to apply futility pruning.
@@ -302,9 +302,9 @@ tunable! {
     /// Max eval-based R bonus.
     NMP_EVAL_MAX = 6, 1, 10, 1;
     /// Minimum depth for NMP verification search.
-    NMP_VERIF_DEPTH = 13, 10, 20, 2;
+    NMP_VERIF_DEPTH = 10, 4, 20, 2;
     /// Depth reduction for NMP verification search.
-    NMP_VERIF_REDUCTION = 4, 2, 8, 1;
+    NMP_VERIF_REDUCTION = 5, 2, 8, 1;
 
     // === ProbCut (3) ===
     /// Minimum depth for ProbCut pruning.

@@ -15,6 +15,10 @@ pub enum SearchLimits {
     Depth(i32),
     /// `go nodes N` — search a fixed number of nodes.
     Nodes(u64),
+    /// `go softnodes N` — node budget checked at iteration boundaries: the
+    /// iteration in flight is allowed to finish and overshoot. `hard` is the
+    /// in-tree ceiling that catches search explosions.
+    SoftNodes { soft: u64, hard: u64 },
     /// `go movetime N` — search for exactly N milliseconds.
     MoveTime(u64),
     /// `go wtime/btime/winc/binc` — Fischer clock.
@@ -25,6 +29,10 @@ pub enum SearchLimits {
     },
 }
 
+/// Hard node ceiling = soft budget x this factor, for the limits that derive
+/// one from the other (`go softnodes`, `UseSoftNodes`, datagen).
+pub const SOFT_NODES_HARD_FACTOR: u64 = 100;
+
 /// Manages time for a single search.
 pub struct TimeManager {
     start: Instant,
@@ -33,15 +41,22 @@ pub struct TimeManager {
     hard_limit: u64,      // ms, fixed ceiling for one move
     max_depth: i32,
     max_nodes: u64,
+    soft_nodes: u64,
 }
 
 impl TimeManager {
     /// Create a time manager from search limits.
     pub fn new(limits: &SearchLimits) -> TimeManager {
+        let mut soft_nodes = u64::MAX;
         let (soft, hard, depth, nodes) = match *limits {
             SearchLimits::Infinite => (u64::MAX, u64::MAX, i32::MAX, u64::MAX),
             SearchLimits::Depth(d) => (u64::MAX, u64::MAX, d, u64::MAX),
             SearchLimits::Nodes(n) => (u64::MAX, u64::MAX, i32::MAX, n),
+            SearchLimits::SoftNodes { soft, hard } => {
+                debug_assert!(soft <= hard);
+                soft_nodes = soft;
+                (u64::MAX, u64::MAX, i32::MAX, hard)
+            }
             SearchLimits::MoveTime(ms) => (ms, ms, i32::MAX, u64::MAX),
             SearchLimits::Clock { time, inc, movestogo } => {
                 let overhead = crate::tune::MOVE_OVERHEAD() as u64;
@@ -70,6 +85,7 @@ impl TimeManager {
             soft_limit: soft,
             hard_limit: hard,
             max_nodes: nodes,
+            soft_nodes,
         }
     }
 
@@ -99,6 +115,12 @@ impl TimeManager {
     #[inline]
     pub fn max_nodes(&self) -> u64 {
         self.max_nodes
+    }
+
+    /// Soft node budget, checked at iteration boundaries.
+    #[inline]
+    pub fn soft_nodes(&self) -> u64 {
+        self.soft_nodes
     }
 
     /// Check after each completed iteration: should we stop?

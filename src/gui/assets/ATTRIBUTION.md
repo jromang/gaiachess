@@ -12,6 +12,14 @@ upscale is undone, the flat background is made transparent, the cells are aligne
 uniform grid and the baked ground shadows are moved to a row of their own. **No pixel
 of the artwork itself is altered.**
 
+**Used with the artist's permission**, granted by direct message on Reddit on
+2026-08-22. Asked whether the set could be included in this GPLv3 open-source
+project — artwork untouched, author fully credited by name with links to the Reddit
+post, itch.io, Instagram and Twitter in the app's about screen and in this
+repository — `u/Rangersimi` answered: *"Yea you can use it no problem, as long as
+its credited like you said. :D"* The credit lives in the about screen (name and
+itch.io link, guarded by a unit test) and in this file (all four links above).
+
 ## Inspiration — and nothing more
 
 The look owes a debt to the ROM of a retro chess cartridge by **Krystman** (Lazy Devs),

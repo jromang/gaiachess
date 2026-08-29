@@ -603,6 +603,7 @@ mod web {
         match limits {
             SearchLimits::Depth(d) => format!("go depth {d}"),
             SearchLimits::Nodes(n) => format!("go nodes {n}"),
+            SearchLimits::SoftNodes { soft, .. } => format!("go softnodes {soft}"),
             SearchLimits::MoveTime(ms) => format!("go movetime {ms}"),
             // Both sides are given the same numbers. The engine only ever reads the clock
             // of the side to move, so one pair would do; naming both keeps the line valid
@@ -670,8 +671,10 @@ mod ponder_tests {
     }
 
     /// Waits for an answer rather than hanging the suite on one that never comes.
+    /// The budget (30s) is sized for the whole suite running in parallel on an
+    /// emulated machine, where wall-clock deadlines stretch by an order of magnitude.
     fn collect(engine: &mut Engine) -> Thought {
-        for _ in 0..2_000 {
+        for _ in 0..6_000 {
             if let Some(thought) = engine.poll() {
                 return thought;
             }
@@ -726,8 +729,9 @@ mod ponder_tests {
     }
 
     /// Loops until `ready` or gives up, ticking the meter as a drawn frame would.
+    /// Budgeted (20s) like `collect`, for suites running on starved virtual CPUs.
     fn watch(engine: &mut Engine, what: &str, ready: impl Fn(&Engine) -> bool) {
-        for _ in 0..600 {
+        for _ in 0..4_000 {
             engine.tick();
             if ready(engine) {
                 return;
@@ -743,7 +747,9 @@ mod ponder_tests {
         let mut engine = Engine::spawn();
         assert!(engine.nps().is_none(), "an engine that has not started cannot have a rate");
 
-        engine.think(&startpos(), &[], SearchLimits::MoveTime(3_000), MAX_LEVEL, 0);
+        // Long enough that the search is still running when a loaded machine finally
+        // gets around to reading the meter; aborted the moment the rate shows.
+        engine.think(&startpos(), &[], SearchLimits::MoveTime(30_000), MAX_LEVEL, 0);
         watch(&mut engine, "a running search never read as any rate", |e| e.nps().is_some());
         assert!(engine.nps().is_some_and(|nps| nps > 0));
 

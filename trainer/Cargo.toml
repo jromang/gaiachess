@@ -8,7 +8,11 @@ name = "train5"
 path = "src/main.rs"
 
 [dependencies]
-bullet_lib = { git = "https://github.com/jw1912/bullet", rev = "cebc78a093d92cbc87e56cfef049184c225270b0" }
+bullet_lib = { git = "https://github.com/jw1912/bullet", rev = "feab6443fc523c9d349427bca2d5bb3c04369420" }
 bulletformat = "1.8.0"
 sfbinpack = "0.6.0"
 rand = "0.9"
+
+# Own workspace root: this crate is built on its own (CUDA, bullet), never as part
+# of the engine workspace at the repository root.
+[workspace]

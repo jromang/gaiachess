@@ -61,11 +61,16 @@ export async function loadEngine(wasmSource, onLine, stopFlag) {
     /// built after the call and never before.
     loadNetwork(bytes) {
       const size = exports.gaia_net_size();
-      if (bytes.byteLength !== size) {
-        throw new Error(`network is ${bytes.byteLength} bytes, expected ${size}`);
+      // The payload may carry a trailing integrity footer (16 bytes) or legacy
+      // trainer padding (up to 63). The reserved buffer holds exactly the
+      // payload, so only the first `size` bytes are copied; the footer is not
+      // verified on this path — the web bundle is produced by our own build
+      // pipeline from an already-verified network.
+      if (bytes.byteLength < size || bytes.byteLength > size + 63) {
+        throw new Error(`network is ${bytes.byteLength} bytes, expected ${size} (+0..63 trailer)`);
       }
       const ptr = exports.gaia_net_reserve();
-      new Uint8Array(memory.buffer, ptr, size).set(new Uint8Array(bytes));
+      new Uint8Array(memory.buffer, ptr, size).set(new Uint8Array(bytes).subarray(0, size));
       return exports.gaia_net_finish() !== 0;
     },
     /// Installs the endgame tables, from the blob exactly as it ships.
