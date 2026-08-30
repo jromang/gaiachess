@@ -5,8 +5,6 @@ executable — and twenty levels of play, from a child's first game to a grandma
 
 ![The board mid-game: an Italian, the hand carrying the bishop to e6](docs/screenshot.png)
 
-> See also: [gaiachess.free.fr](http://gaiachess.free.fr/) — the original Gaia website
-
 **Gaia 4** is a complete rewrite from C to Rust — not a single line of the original code survived. Back after 20 years.
 
 ## Play in your browser
