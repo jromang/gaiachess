@@ -534,7 +534,7 @@ impl GameScene {
             sfx.push(Sfx::Select);
             return true;
         }
-        let Some(m) = self.targets.iter().copied().find(|m| m.to_sq() == sq) else {
+        let Some(m) = self.targets.iter().copied().find(|m| game::drop_square(*m) == sq || m.to_sq() == sq) else {
             return false;
         };
         self.begin_move_from(m, start);
@@ -842,7 +842,7 @@ impl GameScene {
                     self.promo_index = 0;
                     self.mode = UiMode::Promo;
                     sfx.push(Sfx::Select);
-                } else if let Some(m) = self.targets.iter().copied().find(|m| m.to_sq() == sq) {
+                } else if let Some(m) = self.targets.iter().copied().find(|m| game::drop_square(*m) == sq || m.to_sq() == sq) {
                     self.begin_move(m);
                 }
             }
@@ -897,7 +897,7 @@ impl GameScene {
         debug_assert_ne!(mover, Piece::NONE, "moving from an empty square");
 
         let start = start.unwrap_or_else(|| as_f32(board::piece_xy(m.from_sq(), self.flipped)));
-        let end = as_f32(board::piece_xy(m.to_sq(), self.flipped));
+        let end = as_f32(board::piece_xy(m.lands_on(), self.flipped));
         let squares = squares_between(start, end);
         let travel = PieceAnim::steps_for(squares);
         let mut anims = vec![PieceAnim::new(mover, start, end, squares)];
@@ -1362,11 +1362,13 @@ impl GameScene {
             return;
         }
         for m in &self.targets {
-            let occupied = self.game.pos.piece_on(m.to_sq()) != Piece::NONE
-                || m.move_type() == MT_EN_PASSANT;
+            let dest = game::drop_square(*m);
+            let occupied = m.move_type() != MT_CASTLING
+                && (self.game.pos.piece_on(dest) != Piece::NONE
+                    || m.move_type() == MT_EN_PASSANT);
             let mark = if occupied { Ui::MoveRing } else { Ui::MoveDot };
             let sprite = assets.ui(mark);
-            let (x, y) = board::tile_xy(m.to_sq(), self.flipped);
+            let (x, y) = board::tile_xy(dest, self.flipped);
             fb.blit(
                 assets.ui_sheet(),
                 sprite,
@@ -1383,6 +1385,9 @@ impl GameScene {
         }
         if self.holding() {
             for m in &self.targets {
+                if m.move_type() == MT_CASTLING {
+                    continue;
+                }
                 let target = self.game.pos.piece_on(m.to_sq());
                 if target != Piece::NONE {
                     board::draw_outline(

@@ -6,11 +6,11 @@
 //! and the atomic stop flag. All history tables, killers, search stack, and PV
 //! are per-thread.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use crate::history::{
     ButterflyHistory, CaptureHistory, ContCorrectionHistory, ContinuationHistory, Countermoves,
-    Killers, MinorCorrectionHistory, NonPawnCorrectionHistory, PawnCorrectionHistory, PawnHistory, PieceToCorrTable,
+    Killers, PawnHistory, PieceToCorrTable, SharedCorrectionHistory,
     PieceToTable,
 };
 use crate::nnue;
@@ -26,12 +26,37 @@ pub static STOP: AtomicBool = AtomicBool::new(false);
 /// from ponder mode to normal search with real time limits.
 pub static PONDER: AtomicBool = AtomicBool::new(false);
 
-/// Whether anything outside the search is watching how fast it goes. Off — which is how
-/// every ordinary search runs — [`ThreadData::check_limits`] does not touch the counter
-/// below at all, so nobody pays for a figure nobody is reading.
-pub static COUNT_NODES: AtomicBool = AtomicBool::new(false);
+/// How many watchers are reading how fast the search goes. At zero — which is how every
+/// ordinary search runs — [`ThreadData::check_limits`] does not touch the counter below
+/// at all, so nobody pays for a figure nobody is reading.
+///
+/// A count and not a flag, because more than one watcher can be alive at once: the
+/// interface builds the next screen before dropping the one it replaces, so two engines
+/// briefly overlap, and a test suite runs several side by side. With a flag, whichever
+/// watcher closed first turned the counter off under everyone else, and the rate they
+/// were reading silently went to nothing.
+static NODE_WATCHERS: AtomicUsize = AtomicUsize::new(0);
 
-/// Nodes searched, to the nearest 512, by every thread while [`COUNT_NODES`] is set.
+/// Starts reading the node counter. Balance with [`close_node_meter`].
+pub fn open_node_meter() {
+    NODE_WATCHERS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Stops reading it. Saturating: an unbalanced close must not wrap the count into
+/// "watched by four billion", which no later close could undo.
+pub fn close_node_meter() {
+    let _ = NODE_WATCHERS.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+        Some(n.saturating_sub(1))
+    });
+}
+
+/// Whether anyone is reading the node counter.
+#[inline]
+pub fn counting_nodes() -> bool {
+    NODE_WATCHERS.load(Ordering::Relaxed) > 0
+}
+
+/// Nodes searched, to the nearest 512, by every thread while anyone is watching.
 /// Read by the bench monitor and by the interface's rate display; it only ever climbs,
 /// so a reader wanting a rate takes the difference over a window of its own.
 pub static NODES_SEARCHED: AtomicU64 = AtomicU64::new(0);
@@ -187,17 +212,31 @@ unsafe impl Send for StackEntry {}
 
 /// State shared between all search threads.
 ///
-/// The TT is lockless (races accepted, verified by key16).
+/// The TT is lockless (races accepted, verified by key16), and so are the
+/// correction histories: an estimator of eval error indexed by pawn structure has
+/// no reason to differ from one thread to the next, so the threads pool their
+/// observations instead of each learning the same ones over again.
 /// The stop flag is the global [`STOP`] atomic (not in this struct).
 pub struct SharedState {
     pub tt: TT,
+    pub corr: SharedCorrectionHistory,
 }
 
 impl SharedState {
-    pub fn new(hash_mb: usize) -> Self {
+    /// `threads` sizes the correction tables so the entries per thread, and with
+    /// them the collision rate, stay what they are at one thread. Every caller that
+    /// searches alone passes 1.
+    pub fn new(hash_mb: usize, threads: usize) -> Self {
         SharedState {
             tt: TT::new(hash_mb),
+            corr: SharedCorrectionHistory::new(threads),
         }
+    }
+
+    /// Clear everything shared (`ucinewgame`, and between bench runs).
+    pub fn clear(&mut self) {
+        self.tt.clear();
+        self.corr.clear();
     }
 }
 
@@ -226,9 +265,10 @@ pub struct ThreadData {
     pub cap_history: CaptureHistory,
     pub cont_history: ContinuationHistory,
     pub countermoves: Countermoves,
-    pub pawn_correction: PawnCorrectionHistory,
-    pub non_pawn_correction: NonPawnCorrectionHistory,
-    pub minor_correction: MinorCorrectionHistory,
+    /// Continuation correction stays per-thread: its entries are the `[piece][to]`
+    /// subtable the current line points at, so every thread searching the same
+    /// subtree would hammer the same few cache lines. The reference that shared it
+    /// reverted the change for exactly that.
     pub cont_correction: ContCorrectionHistory,
     pub killers: Killers,
     /// Triangular PV table: `pv[ply][i]` stores the PV from ply onwards.
@@ -256,6 +296,13 @@ pub struct ThreadData {
     /// Per-thread search deadline in milliseconds (0 = no limit).
     /// Used by datagen to cap explosion-prone searches without global STOP.
     pub search_deadline: u64,
+    /// How many threads the pool this thread belongs to holds, so a fixed node
+    /// budget can be divided evenly. Left at 1 by every caller that searches
+    /// alone: datagen, bench, the interface worker, the tests.
+    pub thread_count: usize,
+    /// Set when a fixed node budget was split across the pool. This thread then
+    /// owns its share and ends on it alone, never through the global stop flag.
+    pub per_thread_nodes: bool,
     /// Per-thread stopped flag, set when search_deadline is exceeded.
     pub stopped: bool,
     /// Maximum ply reached during current depth iteration (for UCI seldepth).
@@ -312,6 +359,29 @@ pub struct ThreadData {
     pub tree: Option<Box<crate::tree::TreeRec>>,
 }
 
+/// Divides a fixed node budget into one share per thread; `None` for every other
+/// kind of limit.
+///
+/// `go nodes N` keeps meaning about N nodes for this move whatever the thread count,
+/// and each thread gets a share it can finish on its own. That second half is the
+/// point: with the budget on the main thread only, the helpers ran until it stopped
+/// them, so the work actually done per move depended on how busy the machine was —
+/// and two binaries measured at different moments were not comparable. A clock is
+/// left alone: there the main thread owns the budget and the helpers search beside it.
+fn split_node_limit(limits: &SearchLimits, threads: usize) -> Option<SearchLimits> {
+    debug_assert!(threads > 0, "split_node_limit: zero threads");
+    let t = threads as u64;
+    match *limits {
+        SearchLimits::Nodes(n) => Some(SearchLimits::Nodes(n.div_ceil(t).max(1))),
+        // div_ceil is monotonic, so soft <= hard survives the division.
+        SearchLimits::SoftNodes { soft, hard } => Some(SearchLimits::SoftNodes {
+            soft: soft.div_ceil(t).max(1),
+            hard: hard.div_ceil(t).max(1),
+        }),
+        _ => None,
+    }
+}
+
 impl ThreadData {
     /// Create a new thread with the given id. History tables are zeroed,
     /// position is startpos (will be overwritten in `prepare_search`).
@@ -334,9 +404,6 @@ impl ThreadData {
             cap_history: CaptureHistory::new(),
             cont_history: ContinuationHistory::new(),
             countermoves: Countermoves::new(),
-            pawn_correction: PawnCorrectionHistory::new(),
-            non_pawn_correction: NonPawnCorrectionHistory::new(),
-            minor_correction: MinorCorrectionHistory::new(),
             cont_correction: ContCorrectionHistory::new(),
             nnue: nnue::Network::new(),
             killers: Killers::new(),
@@ -351,6 +418,8 @@ impl ThreadData {
             best_move: Move::NONE,
             best_score: -SCORE_INFINITE,
             search_deadline: 0,
+            thread_count: 1,
+            per_thread_nodes: false,
             stopped: false,
             seldepth: 0,
             pondering: false,
@@ -415,7 +484,7 @@ impl ThreadData {
         if self.nodes & 511 == 0 {
             // Feed whoever is watching the rate: the bench monitor, or the interface
             // showing what the engine is doing on the player's time.
-            if COUNT_NODES.load(Ordering::Relaxed) {
+            if counting_nodes() {
                 NODES_SEARCHED.fetch_add(512, Ordering::Relaxed);
             }
 
@@ -436,13 +505,13 @@ impl ThreadData {
             }
 
             // Skip time/node limits while pondering (search indefinitely).
-            // In datagen the limit is per-worker: stop this thread only, like
-            // the deadline below — a worker hitting its node budget must not
-            // kill its siblings through the global STOP.
+            // In datagen, and whenever a node budget was split across the pool, the
+            // limit is this thread's alone: stop it like the deadline below — a thread
+            // spending its own share must not kill its siblings through the global STOP.
             if !self.pondering
                 && (self.tm.should_stop_hard() || self.nodes >= self.tm.max_nodes())
             {
-                if self.datagen_mode {
+                if self.datagen_mode || self.per_thread_nodes {
                     self.stopped = true;
                 } else {
                     STOP.store(true, Ordering::Relaxed);
@@ -523,11 +592,17 @@ impl ThreadData {
         // response even if stopped before completing depth 1.
         self.best_move = if count > 0 { buf[0] } else { Move::NONE };
 
-        // Set time manager: real limits for main thread, infinite for helpers
-        if self.id == 0 {
-            self.tm = TimeManager::new(limits);
-        } else {
-            self.tm = TimeManager::new(&SearchLimits::Infinite);
+        // Time manager: real limits for the main thread, infinite for the helpers —
+        // except for a node budget, which is divided evenly instead (see
+        // `split_node_limit`). At one thread nothing is divided and nothing changes.
+        self.per_thread_nodes = false;
+        match split_node_limit(limits, self.thread_count).filter(|_| self.thread_count > 1) {
+            Some(share) => {
+                self.per_thread_nodes = true;
+                self.tm = TimeManager::new(&share);
+            }
+            None if self.id == 0 => self.tm = TimeManager::new(limits),
+            None => self.tm = TimeManager::new(&SearchLimits::Infinite),
         }
         self.apply_skill_ceiling();
         // The upper rungs need to see more than one root move to have anything to choose
@@ -563,9 +638,6 @@ impl ThreadData {
         self.cap_history.clear();
         self.cont_history.clear();
         self.countermoves.clear();
-        self.pawn_correction.clear();
-        self.non_pawn_correction.clear();
-        self.minor_correction.clear();
         self.cont_correction.clear();
     }
 }
@@ -588,9 +660,12 @@ impl ThreadPool {
     /// Create a new thread pool.
     pub fn new(num_threads: usize, hash_mb: usize) -> Self {
         let n = num_threads.max(1);
-        let threads = (0..n).map(ThreadData::new).collect();
+        let mut threads: Vec<ThreadData> = (0..n).map(ThreadData::new).collect();
+        for td in &mut threads {
+            td.thread_count = n;
+        }
         ThreadPool {
-            shared: SharedState::new(hash_mb),
+            shared: SharedState::new(hash_mb, n),
             threads,
             multi_pv: 1,
             last_best_idx: 0,
@@ -601,10 +676,13 @@ impl ThreadPool {
     pub fn resize_threads(&mut self, n: usize) {
         let n = n.max(1);
         self.threads.resize_with(n, || ThreadData::new(n));
-        // Fix ids
+        // Fix ids, and tell every thread how many of them there are
         for (i, td) in self.threads.iter_mut().enumerate() {
             td.id = i;
+            td.thread_count = n;
         }
+        // The shared correction tables are sized by the thread count.
+        self.shared.corr.resize(n);
     }
 
     /// Resize the TT (must not be called during search).
@@ -612,9 +690,9 @@ impl ThreadPool {
         self.shared.tt.resize(mb);
     }
 
-    /// Clear TT and all per-thread histories (`ucinewgame`).
+    /// Clear the shared state and all per-thread histories (`ucinewgame`).
     pub fn clear(&mut self) {
-        self.shared.tt.clear();
+        self.shared.clear();
         for td in &mut self.threads {
             td.clear_histories();
         }
@@ -628,6 +706,10 @@ impl ThreadPool {
     pub fn start_search(&mut self, pos: &Position, limits: SearchLimits) -> (Move, Option<Move>) {
         STOP.store(false, Ordering::Relaxed);
         self.shared.tt.new_search();
+        // The info lines report the whole search, not the main thread's share: with
+        // helpers running, every thread feeds the shared counter, zeroed here so a
+        // single-thread search that follows never reads a stale total.
+        NODES_SEARCHED.store(0, Ordering::Relaxed);
 
         // Prepare all threads
         for td in &mut self.threads {
@@ -658,6 +740,10 @@ impl ThreadPool {
         }
 
         // Multi-thread: scope ensures all threads join before we return
+        // The info lines report the whole search, so the shared counter has to be live
+        // while helpers run. A watcher, not a flag: another watcher may already be
+        // reading, and closing is balanced so the count never leaks.
+        open_node_meter();
         std::thread::scope(|s| {
             let (main_td, helpers) = self.threads.split_first_mut().unwrap();
             let shared = &self.shared;
@@ -675,9 +761,15 @@ impl ThreadPool {
             // Main thread runs search (blocks until time/depth limit)
             search::search(main_td, shared);
 
-            // Main thread finished → stop all helpers
-            STOP.store(true, Ordering::Relaxed);
+            // Main thread finished → stop all helpers. Unless the node budget was
+            // split: each helper then owns a share, and cutting it short here would
+            // hand an idle machine more work per move than a busy one — exactly what
+            // a fixed-node lane at several threads exists to avoid.
+            if !main_td.per_thread_nodes {
+                STOP.store(true, Ordering::Relaxed);
+            }
         });
+        close_node_meter();
 
         // Select best thread via weighted vote aggregation
         let best_idx = self.select_best_thread();
@@ -789,5 +881,104 @@ impl ThreadPool {
         } else {
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::Move;
+
+    /// A quiet middlegame position: deep enough that a few thousand nodes settle
+    /// nothing, so no thread can finish its work before spending its budget.
+    const MIDGAME: &str = "r1bq1rk1/pp2ppbp/2np2p1/2n5/P3PP2/N1P2N2/1PB3PP/R1B1QRK1 b - - 0 1";
+
+    #[test]
+    fn a_node_budget_divides_evenly_and_nothing_else_does() {
+        // A clock belongs to the main thread; only a node count is shared out.
+        assert!(matches!(
+            split_node_limit(&SearchLimits::Nodes(40_000), 4),
+            Some(SearchLimits::Nodes(10_000))
+        ));
+        assert!(matches!(
+            split_node_limit(&SearchLimits::SoftNodes { soft: 1_000, hard: 100_000 }, 8),
+            Some(SearchLimits::SoftNodes { soft: 125, hard: 12_500 })
+        ));
+        assert!(split_node_limit(&SearchLimits::Depth(12), 4).is_none());
+        assert!(split_node_limit(&SearchLimits::MoveTime(500), 4).is_none());
+        assert!(split_node_limit(&SearchLimits::Infinite, 4).is_none());
+        assert!(split_node_limit(&SearchLimits::Clock { time: 1000, inc: 10, movestogo: None }, 4)
+            .is_none());
+
+        // Rounded up, and never down to nothing: a thread with a budget of zero would
+        // return before it had a move to offer.
+        assert!(matches!(
+            split_node_limit(&SearchLimits::Nodes(10), 4),
+            Some(SearchLimits::Nodes(3))
+        ));
+        assert!(matches!(
+            split_node_limit(&SearchLimits::Nodes(1), 24),
+            Some(SearchLimits::Nodes(1))
+        ));
+
+        // The order the time manager asserts on survives the division.
+        let split = split_node_limit(&SearchLimits::SoftNodes { soft: 7, hard: 7 }, 3);
+        let Some(SearchLimits::SoftNodes { soft, hard }) = split else { panic!("not split") };
+        assert!(soft <= hard, "soft {soft} > hard {hard}");
+    }
+
+    #[test]
+    fn each_thread_of_a_pool_spends_its_own_share_of_the_budget() {
+        let _guard = crate::skill::lock_level();
+        STOP.store(false, Ordering::Relaxed);
+
+        const THREADS: usize = 4;
+        const BUDGET: u64 = 40_000;
+        let pos = Position::from_fen(MIDGAME).unwrap();
+        let mut pool = ThreadPool::new(THREADS, 4);
+        for td in pool.threads.iter_mut() {
+            td.silent = true;
+        }
+        let (best, _) = pool.start_search(&pos, SearchLimits::Nodes(BUDGET));
+        assert!(best != Move::NONE, "search returned no move");
+
+        let share = BUDGET / THREADS as u64;
+        for td in &pool.threads {
+            // The limit is checked every 512 nodes, so a thread can overshoot by that
+            // much plus the tail of the node it was in.
+            assert!(
+                td.nodes >= share && td.nodes < share + 2048,
+                "thread {} searched {} nodes, expected about {}",
+                td.id, td.nodes, share
+            );
+            assert!(td.per_thread_nodes, "thread {} did not own a share", td.id);
+            assert!(td.stopped, "thread {} was not stopped by its own budget", td.id);
+        }
+        // Ending on its own share must not raise the flag that ends everyone else's.
+        assert!(!should_stop(), "a spent budget raised the global stop flag");
+
+        let total: u64 = pool.threads.iter().map(|td| td.nodes).sum();
+        assert!(
+            total >= BUDGET && total < BUDGET + 2048 * THREADS as u64,
+            "pool searched {total} nodes for a budget of {BUDGET}"
+        );
+    }
+
+    #[test]
+    fn one_thread_keeps_the_budget_and_the_behaviour_it_always_had() {
+        let _guard = crate::skill::lock_level();
+        STOP.store(false, Ordering::Relaxed);
+
+        let pos = Position::from_fen(MIDGAME).unwrap();
+        let mut pool = ThreadPool::new(1, 4);
+        pool.threads[0].silent = true;
+        pool.start_search(&pos, SearchLimits::Nodes(40_000));
+        let td = &pool.threads[0];
+        assert!(!td.per_thread_nodes, "a lone thread must not think it owns a share");
+        assert!(
+            td.nodes >= 40_000 && td.nodes < 42_048,
+            "lone thread searched {} nodes for a budget of 40000",
+            td.nodes
+        );
     }
 }

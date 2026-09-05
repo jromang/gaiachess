@@ -8,8 +8,8 @@
 //! Incremental push/pop via `AccDelta`. Finny table cache (13 king buckets)
 //! avoids full refresh when king stays in the same bucket.
 //!
-//! Filtered threat features (41,272) are recomputed per-eval in `forward.rs`
-//! rather than maintained incrementally.
+//! Aux features (pawn pairs + pairwise threats) are maintained incrementally
+//! in `ThreatAccumulator` (`threats.rs`).
 //!
 //! Lazily updated: `Network::ensure_updated()` walks back to the nearest
 //! accurate ancestor and applies deltas forward. Null moves mark inaccurate
@@ -22,7 +22,7 @@ use crate::types::*;
 use super::features;
 use super::kernels::dispatch;
 use super::network::{self, Aligned};
-use super::{INPUT_BUCKETS, L1_SIZE};
+use super::{INPUT_BUCKETS, L1_SIZE, OUTPUT_BUCKETS};
 
 // ============================================================
 // Delta info — stored per ply for lazy incremental updates
@@ -75,6 +75,8 @@ impl Default for AccDelta {
 pub struct FinnyEntry {
     /// Cached FT output values for one perspective.
     pub values: Aligned<[i16; L1_SIZE]>,
+    /// Cached PSQT head sums for one perspective (no bias: empty board = 0).
+    pub psqt: [i32; OUTPUT_BUCKETS],
     /// Piece bitboards at time of caching. Indexed by raw piece (0..12).
     pub pieces: [u64; 12],
 }
@@ -84,6 +86,7 @@ impl FinnyEntry {
         FinnyEntry {
             // Initialize with FT biases so first use = delta from empty board
             values: network::params().ft_biases.clone(),
+            psqt: [0i32; OUTPUT_BUCKETS],
             pieces: [0u64; 12],
         }
     }
@@ -149,6 +152,8 @@ impl Clone for FinnyTable {
 pub struct Accumulator {
     /// Feature transformer output: `[white_pov][L1_SIZE]`, `[black_pov][L1_SIZE]`.
     pub values: Aligned<[[i16; L1_SIZE]; 2]>,
+    /// PSQT head sums over PST features: `[pov][bucket]`, i32 ×PSQT_QUANT.
+    pub psqt: [[i32; OUTPUT_BUCKETS]; 2],
     /// Whether each perspective is up-to-date.
     pub accurate: [bool; 2],
     /// Delta from the previous ply (how we got here).
@@ -159,6 +164,7 @@ impl Accumulator {
     pub fn new() -> Self {
         Accumulator {
             values: Aligned([[0i16; L1_SIZE]; 2]),
+            psqt: [[0i32; OUTPUT_BUCKETS]; 2],
             accurate: [false; 2],
             delta: AccDelta::default(),
         }
@@ -212,6 +218,15 @@ impl Accumulator {
             }
         }
 
+        let mut psqt = [0i32; OUTPUT_BUCKETS];
+        for f in 0..n_features {
+            let w = &params.psqt_pst_weights.0[feat_indices[f]];
+            for b in 0..OUTPUT_BUCKETS {
+                psqt[b] += w[b];
+            }
+        }
+        self.psqt[pov] = psqt;
+
         self.accurate[pov] = true;
     }
 
@@ -241,6 +256,7 @@ impl Accumulator {
         // the parent's eval was TT-reused and `ensure_updated()` never ran.
         if mv == Move::NONE {
             self.values.0[pov] = prev.values.0[pov];
+            self.psqt[pov] = prev.psqt[pov];
             self.accurate[pov] = true;
             return;
         }
@@ -258,11 +274,13 @@ impl Accumulator {
 
         match mt {
             MT_CASTLING => {
-                // King + rook both move: add2_sub2
-                let (rook_from, rook_to) = castling_rook_squares(to);
+                // Encoded as king-captures-rook: `to` is the rook origin.
+                let rook_from = to;
+                let king_to = mv.castle_king_to();
+                let rook_to = mv.castle_rook_to();
                 let sub1 = features::feature_index(piece_color, PieceType::King, from, king_sq, perspective);
                 let sub2 = features::feature_index(piece_color, PieceType::Rook, rook_from, king_sq, perspective);
-                let add1 = features::feature_index(piece_color, PieceType::King, to, king_sq, perspective);
+                let add1 = features::feature_index(piece_color, PieceType::King, king_to, king_sq, perspective);
                 let add2 = features::feature_index(piece_color, PieceType::Rook, rook_to, king_sq, perspective);
                 self.apply_add2_sub2(prev, pov, add1, add2, sub1, sub2);
             }
@@ -307,7 +325,28 @@ impl Accumulator {
 
     // ============================================================
     // Kernel entry points — the loops live in `nnue::kernels`
+    // (the 8-wide PSQT head sums stay scalar, not worth a kernel)
     // ============================================================
+
+    /// Update the PSQT head sums from `prev` for a set of added/removed features.
+    #[inline]
+    fn psqt_apply(&mut self, prev: &Accumulator, pov: usize, adds: &[usize], subs: &[usize]) {
+        let params = network::params();
+        let mut psqt = prev.psqt[pov];
+        for &a in adds {
+            let w = &params.psqt_pst_weights.0[a];
+            for b in 0..OUTPUT_BUCKETS {
+                psqt[b] += w[b];
+            }
+        }
+        for &s in subs {
+            let w = &params.psqt_pst_weights.0[s];
+            for b in 0..OUTPUT_BUCKETS {
+                psqt[b] -= w[b];
+            }
+        }
+        self.psqt[pov] = psqt;
+    }
 
     /// Normal move: one feature added, one removed.
     #[inline]
@@ -315,6 +354,7 @@ impl Accumulator {
         let vacc = self.values.0[pov].as_mut_ptr();
         let vprev = prev.values.0[pov].as_ptr();
         unsafe { dispatch::acc_add1_sub1(vprev, vacc, add1, sub1) };
+        self.psqt_apply(prev, pov, &[add1], &[sub1]);
     }
 
     /// Capture / EP: one feature added, two removed.
@@ -326,6 +366,7 @@ impl Accumulator {
         let vacc = self.values.0[pov].as_mut_ptr();
         let vprev = prev.values.0[pov].as_ptr();
         unsafe { dispatch::acc_add1_sub2(vprev, vacc, add1, sub1, sub2) };
+        self.psqt_apply(prev, pov, &[add1], &[sub1, sub2]);
     }
 
     /// Castling: two features added, two removed.
@@ -337,6 +378,7 @@ impl Accumulator {
         let vacc = self.values.0[pov].as_mut_ptr();
         let vprev = prev.values.0[pov].as_ptr();
         unsafe { dispatch::acc_add2_sub2(vprev, vacc, add1, add2, sub1, sub2) };
+        self.psqt_apply(prev, pov, &[add1, add2], &[sub1, sub2]);
     }
 
     // ============================================================
@@ -407,11 +449,27 @@ impl Accumulator {
         // Apply delta with SIMD register blocking
         unsafe { dispatch::finny_apply(entry.values.0.as_mut_ptr(), &adds[..n_adds], &subs[..n_subs]) };
 
+        // PSQT head: same diff, scalar (8 i32 per feature)
+        let params = network::params();
+        for &a in &adds[..n_adds] {
+            let w = &params.psqt_pst_weights.0[a];
+            for b in 0..OUTPUT_BUCKETS {
+                entry.psqt[b] += w[b];
+            }
+        }
+        for &s in &subs[..n_subs] {
+            let w = &params.psqt_pst_weights.0[s];
+            for b in 0..OUTPUT_BUCKETS {
+                entry.psqt[b] -= w[b];
+            }
+        }
+
         // Update cache bitboards
         entry.pieces = pos.pieces;
 
         // Copy cached values to current accumulator
         self.values.0[pov] = entry.values.0;
+        self.psqt[pov] = entry.psqt;
         self.accurate[pov] = true;
     }
 }
@@ -420,17 +478,7 @@ impl Accumulator {
 // Helpers
 // ============================================================
 
-/// Given the king's castling destination, return (rook_from, rook_to).
-fn castling_rook_squares(king_to: Square) -> (Square, Square) {
-    let rank = king_to.rank();
-    if king_to.file() == 6 {
-        // King-side: rook h -> f
-        (Square::new(7, rank), Square::new(5, rank))
-    } else {
-        // Queen-side: rook a -> d
-        (Square::new(0, rank), Square::new(3, rank))
-    }
-}
+
 
 /// Check whether we can incrementally update from an ancestor ply,
 /// or if a full refresh is needed.
@@ -458,7 +506,8 @@ pub fn find_update_source(
                     && delta.moved_piece.color() == perspective
                 {
                     let from = delta.mv.from_sq();
-                    let to = delta.mv.to_sq();
+                    // Castling encodes `to` as the rook origin: ask where the king lands.
+                    let to = delta.mv.lands_on();
                     if features::needs_refresh(from, to, perspective) {
                         can_update = false;
                         break;
@@ -496,22 +545,37 @@ mod tests {
     }
 
     #[test]
-    fn test_castling_rook_squares() {
-        let (rf, rt) = castling_rook_squares(Square::G1);
-        assert_eq!(rf, Square::H1);
-        assert_eq!(rt, Square::F1);
+    fn test_castling_destinations() {
+        let oo = Move::new_with_type(Square::E1, Square::H1, MT_CASTLING);
+        assert_eq!(oo.castle_king_to(), Square::G1);
+        assert_eq!(oo.castle_rook_to(), Square::F1);
 
-        let (rf, rt) = castling_rook_squares(Square::C1);
-        assert_eq!(rf, Square::A1);
-        assert_eq!(rt, Square::D1);
+        let ooo = Move::new_with_type(Square::E1, Square::A1, MT_CASTLING);
+        assert_eq!(ooo.castle_king_to(), Square::C1);
+        assert_eq!(ooo.castle_rook_to(), Square::D1);
+    }
 
-        let (rf, rt) = castling_rook_squares(Square::G8);
-        assert_eq!(rf, Square::H8);
-        assert_eq!(rt, Square::F8);
+    /// Whether an ancestor accumulator survives a king move is decided by where the
+    /// king lands. Castling records the rook's origin as its `to`, so reading that
+    /// square asks about a square the king never occupies: here it would compare
+    /// g1 against h1 and refresh, though the king does not move at all.
+    #[test]
+    fn a_king_that_stays_put_castling_keeps_its_ancestor() {
+        let mut accs = [Accumulator::new(), Accumulator::new()];
+        accs[0].accurate = [true, true];
+        accs[1].accurate = [false, false];
+        accs[1].delta = AccDelta {
+            // FRC O-O with the king already on g1: only the rook travels, h1 → f1.
+            mv: Move::new_with_type(Square::G1, Square::H1, MT_CASTLING),
+            moved_piece: Piece::WHITE_KING,
+            captured_piece: Piece::NONE,
+            old_occ: 0,
+        };
+        assert_eq!(find_update_source(&accs, 1, Color::White), Some(0));
 
-        let (rf, rt) = castling_rook_squares(Square::C8);
-        assert_eq!(rf, Square::A8);
-        assert_eq!(rt, Square::D8);
+        // And a king that does cross the mirror still forces the refresh.
+        accs[1].delta.mv = Move::new(Square::E1, Square::D1);
+        assert_eq!(find_update_source(&accs, 1, Color::White), None);
     }
 
     // ============================================================
@@ -541,6 +605,10 @@ mod tests {
                     acc_ref.values.0[pov][i], acc_finny.values.0[pov][i],
                 );
             }
+            assert_eq!(
+                acc_ref.psqt[pov], acc_finny.psqt[pov],
+                "{label}: {perspective:?} psqt mismatch",
+            );
         }
     }
 
@@ -607,6 +675,7 @@ mod tests {
                 acc2.values.0[0][i], acc_ref.values.0[0][i],
             );
         }
+        assert_eq!(acc2.psqt[0], acc_ref.psqt[0], "Warm cache: White psqt mismatch");
     }
 
     #[test]

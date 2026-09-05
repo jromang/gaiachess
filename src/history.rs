@@ -5,6 +5,8 @@
 //! [killer moves](https://www.chessprogramming.org/Killer_Heuristic),
 //! and [correction history](https://www.chessprogramming.org/Static_Evaluation_Correction_History).
 
+use std::sync::atomic::{AtomicI16, Ordering};
+
 use crate::types::{Color, Move, Piece, PieceType, Square, MAX_PLY};
 
 /// Maximum history value for gravity formula.
@@ -13,8 +15,13 @@ const MAX_HISTORY: i32 = 16384;
 /// Maximum correction history value for gravity formula.
 pub const CORRHIST_LIMIT: i32 = 1024;
 
-/// Number of entries in correction history tables.
-const CORRHIST_SIZE: usize = 16384;
+/// Entries per thread in the key-indexed correction history tables.
+///
+/// The scale of the reference engines, which is four times what this was. Sharing the
+/// tables between threads (R03) quadrupled the distinct slots as a side effect and won
+/// far more than sharing alone was expected to; this raises the base so the two effects
+/// can be told apart, and so a single thread gets whatever the size is worth.
+const CORRHIST_SIZE: usize = 65536;
 
 /// Threat-indexed butterfly history: `[color][from_threatened][to_threatened][from_sq * 64 + to_sq]`.
 ///
@@ -335,142 +342,117 @@ impl Countermoves {
     }
 }
 
-/// Pawn correction history: `[pawn_key % SIZE][stm]`.
+/// Which of the key-indexed correction tables an entry belongs to.
 ///
-/// Tracks the difference between static evaluation and search score
-/// for positions with similar pawn structures, then adjusts future
-/// static evaluations accordingly.
-/// Size: 16384 * 2 * 2 bytes = 64 KB.
-pub struct PawnCorrectionHistory {
-    table: [[i16; 2]; CORRHIST_SIZE],
+/// The four live interleaved in one allocation, so a slot is
+/// `[stm][kind]`: one base pointer, one mask, one length. Each kind is looked up
+/// with its own key and only ever touches its own field, so they stay four
+/// independent tables that happen to share a shape.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(usize)]
+pub enum CorrKind {
+    Pawn = 0,
+    Minor = 1,
+    NonPawnWhite = 2,
+    NonPawnBlack = 3,
 }
 
-impl PawnCorrectionHistory {
-    pub fn new() -> Self {
-        PawnCorrectionHistory {
-            table: [[0i16; 2]; CORRHIST_SIZE],
+impl CorrKind {
+    /// The non-pawn table for a given piece colour.
+    #[inline]
+    pub fn non_pawn(color: Color) -> CorrKind {
+        match color {
+            Color::White => CorrKind::NonPawnWhite,
+            _ => CorrKind::NonPawnBlack,
         }
     }
 
+    #[inline]
+    const fn index(self) -> usize {
+        self as usize
+    }
+}
+
+/// Number of correction kinds packed into one slot.
+const CORR_KINDS: usize = 4;
+
+/// Correction histories keyed by position structure, shared by every search thread.
+///
+/// A correction history is an estimator of value indexed by structure — pawn key,
+/// non-pawn key per colour, minor-piece key — not a move-ordering signal. Nothing
+/// about it wants to differ from one thread to the next, and with a copy per thread
+/// N threads spend their search learning the same N corrections N times over.
+///
+/// Entries are relaxed atomics read-modify-written without a lock, the way the
+/// transposition table is: two threads updating the same slot can lose an update,
+/// which costs one observation out of millions. What they cannot do is write a value
+/// out of range, because the old value is loaded into a register once and the result
+/// is clamped before it goes back.
+///
+/// The table holds [`CORRHIST_SIZE`] `* next_power_of_two(threads)` slots so that the number of
+/// entries per thread, and with it the collision rate, stays what it was at one
+/// thread. Being a power of two, the key is masked rather than divided.
+pub struct SharedCorrectionHistory {
+    /// `[(key & mask) * 2 + stm] * CORR_KINDS + kind`
+    table: Box<[AtomicI16]>,
+    mask: usize,
+}
+
+impl SharedCorrectionHistory {
+    /// Slot count for a pool of `threads` threads.
+    fn slots_for(threads: usize) -> usize {
+        debug_assert!(threads > 0, "SharedCorrectionHistory: zero threads");
+        CORRHIST_SIZE * threads.max(1).next_power_of_two()
+    }
+
+    pub fn new(threads: usize) -> Self {
+        let slots = Self::slots_for(threads);
+        let table = (0..slots * 2 * CORR_KINDS).map(|_| AtomicI16::new(0)).collect();
+        SharedCorrectionHistory { table, mask: slots - 1 }
+    }
+
+    /// Reallocate for a new thread count. Zeroes the table, like resizing the
+    /// transposition table does; must not run during a search.
+    pub fn resize(&mut self, threads: usize) {
+        if Self::slots_for(threads) != self.mask + 1 {
+            *self = Self::new(threads);
+        } else {
+            self.clear();
+        }
+    }
+
+    /// Zero every entry (`ucinewgame`). Serial: 1 MB at one thread, 32 MB at 24.
     pub fn clear(&mut self) {
-        for entry in &mut self.table {
-            entry.fill(0);
+        for entry in self.table.iter_mut() {
+            *entry.get_mut() = 0;
         }
     }
 
     #[inline]
-    fn index(pawn_key: u64) -> usize {
-        pawn_key as usize % CORRHIST_SIZE
+    fn slot(&self, kind: CorrKind, key: u64, stm: Color) -> &AtomicI16 {
+        let idx = ((key as usize & self.mask) * 2 + stm.index()) * CORR_KINDS + kind.index();
+        debug_assert!(idx < self.table.len(), "SharedCorrectionHistory: index {} OOB", idx);
+        &self.table[idx]
     }
 
-    /// Get the correction value for the given pawn key and side to move.
+    /// Correction value for a key and side to move.
     #[inline]
-    pub fn get(&self, pawn_key: u64, stm: Color) -> i32 {
-        self.table[Self::index(pawn_key)][stm.index()] as i32
+    pub fn get(&self, kind: CorrKind, key: u64, stm: Color) -> i32 {
+        self.slot(kind, key, stm).load(Ordering::Relaxed) as i32
     }
 
     /// Gravity update: `val += bonus - val * |bonus| / CORRHIST_LIMIT`.
+    ///
+    /// Load, compute, store — never a fetch-and-add or a compare-exchange loop, both
+    /// of which cost far more than the observation is worth on a line this hot.
     #[inline]
-    pub fn update(&mut self, pawn_key: u64, stm: Color, bonus: i32) {
+    pub fn update(&self, kind: CorrKind, key: u64, stm: Color, bonus: i32) {
         debug_assert!(bonus.abs() <= CORRHIST_LIMIT,
-            "PawnCorrectionHistory::update: bonus {} exceeds limit {}", bonus, CORRHIST_LIMIT);
-        let entry = &mut self.table[Self::index(pawn_key)][stm.index()];
-        let val = *entry as i32;
+            "SharedCorrectionHistory::update: bonus {} exceeds limit {}", bonus, CORRHIST_LIMIT);
+        let slot = self.slot(kind, key, stm);
+        let val = slot.load(Ordering::Relaxed) as i32;
         let new_val = val + bonus - val * bonus.abs() / CORRHIST_LIMIT;
-        *entry = new_val.clamp(-CORRHIST_LIMIT, CORRHIST_LIMIT) as i16;
-    }
-}
-
-/// Non-pawn correction history: `[piece_color][non_pawn_key % SIZE][stm]`.
-///
-/// Tracks eval error correlation with the arrangement of non-pawn pieces
-/// (N, B, R, Q, K) for each color independently. Both white and black
-/// tables are looked up and summed, then both updated with the same bonus.
-/// Size: 2 * 16384 * 2 * 2 bytes = 128 KB.
-pub struct NonPawnCorrectionHistory {
-    table: [[[i16; 2]; CORRHIST_SIZE]; 2],
-}
-
-impl NonPawnCorrectionHistory {
-    pub fn new() -> Self {
-        NonPawnCorrectionHistory {
-            table: [[[0i16; 2]; CORRHIST_SIZE]; 2],
-        }
-    }
-
-    pub fn clear(&mut self) {
-        for color_table in &mut self.table {
-            for entry in color_table.iter_mut() {
-                entry.fill(0);
-            }
-        }
-    }
-
-    #[inline]
-    fn index(key: u64) -> usize {
-        key as usize % CORRHIST_SIZE
-    }
-
-    #[inline]
-    pub fn get(&self, key: u64, piece_color: Color, stm: Color) -> i32 {
-        self.table[piece_color.index()][Self::index(key)][stm.index()] as i32
-    }
-
-    #[inline]
-    pub fn update(&mut self, key: u64, piece_color: Color, stm: Color, bonus: i32) {
-        debug_assert!(bonus.abs() <= CORRHIST_LIMIT,
-            "NonPawnCorrectionHistory::update: bonus {} exceeds limit {}", bonus, CORRHIST_LIMIT);
-        let entry = &mut self.table[piece_color.index()][Self::index(key)][stm.index()];
-        let val = *entry as i32;
-        let new_val = val + bonus - val * bonus.abs() / CORRHIST_LIMIT;
-        *entry = new_val.clamp(-CORRHIST_LIMIT, CORRHIST_LIMIT) as i16;
-    }
-}
-
-/// Minor piece correction history: `[minor_key % SIZE][stm]`.
-///
-/// Tracks eval error correlation with the arrangement of minor pieces
-/// (N, B, K) for both colors combined in a single Zobrist key.
-/// Size: 16384 * 2 * 2 bytes = 64 KB.
-///
-/// Uses a combined key for N+B+K pieces.
-pub struct MinorCorrectionHistory {
-    table: [[i16; 2]; CORRHIST_SIZE],
-}
-
-impl MinorCorrectionHistory {
-    pub fn new() -> Self {
-        MinorCorrectionHistory {
-            table: [[0i16; 2]; CORRHIST_SIZE],
-        }
-    }
-
-    pub fn clear(&mut self) {
-        for entry in &mut self.table {
-            entry.fill(0);
-        }
-    }
-
-    #[inline]
-    fn index(minor_key: u64) -> usize {
-        minor_key as usize % CORRHIST_SIZE
-    }
-
-    /// Get the correction value for the given minor key and side to move.
-    #[inline]
-    pub fn get(&self, minor_key: u64, stm: Color) -> i32 {
-        self.table[Self::index(minor_key)][stm.index()] as i32
-    }
-
-    /// Gravity update: `val += bonus - val * |bonus| / CORRHIST_LIMIT`.
-    #[inline]
-    pub fn update(&mut self, minor_key: u64, stm: Color, bonus: i32) {
-        debug_assert!(bonus.abs() <= CORRHIST_LIMIT,
-            "MinorCorrectionHistory::update: bonus {} exceeds limit {}", bonus, CORRHIST_LIMIT);
-        let entry = &mut self.table[Self::index(minor_key)][stm.index()];
-        let val = *entry as i32;
-        let new_val = val + bonus - val * bonus.abs() / CORRHIST_LIMIT;
-        *entry = new_val.clamp(-CORRHIST_LIMIT, CORRHIST_LIMIT) as i16;
+        slot.store(new_val.clamp(-CORRHIST_LIMIT, CORRHIST_LIMIT) as i16, Ordering::Relaxed);
     }
 }
 
@@ -541,5 +523,133 @@ impl ContCorrectionHistory {
         let val = *entry as i32;
         let new_val = val + bonus - val * bonus.abs() / CORRHIST_LIMIT;
         *entry = new_val.clamp(-CORRHIST_LIMIT, CORRHIST_LIMIT) as i16;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const KINDS: [CorrKind; 4] = [
+        CorrKind::Pawn,
+        CorrKind::Minor,
+        CorrKind::NonPawnWhite,
+        CorrKind::NonPawnBlack,
+    ];
+
+    #[test]
+    fn one_thread_lands_on_the_entry_the_private_tables_used() {
+        // The whole no-Elo-at-one-thread claim rests on this: a lone thread must
+        // address exactly the slot the per-thread table addressed, so the search
+        // reads the same numbers and the bench counts the same nodes.
+        let h = SharedCorrectionHistory::new(1);
+        assert_eq!(h.mask, CORRHIST_SIZE - 1);
+        let mut key = 0x9E3779B97F4A7C15u64;
+        for _ in 0..2000 {
+            key = key.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            assert_eq!(key as usize & h.mask, key as usize % CORRHIST_SIZE);
+        }
+    }
+
+    #[test]
+    fn the_table_grows_with_the_pool_and_stays_a_power_of_two() {
+        for (threads, expected) in [(1, 1), (2, 2), (3, 4), (4, 4), (5, 8), (12, 16), (24, 32)] {
+            let h = SharedCorrectionHistory::new(threads);
+            let slots = h.mask + 1;
+            assert_eq!(slots, CORRHIST_SIZE * expected, "{threads} threads");
+            assert!(slots.is_power_of_two(), "{threads} threads: {slots} slots");
+            assert_eq!(h.table.len(), slots * 2 * CORR_KINDS);
+        }
+    }
+
+    #[test]
+    fn the_four_kinds_share_a_slot_without_sharing_a_value() {
+        // They are one allocation but four tables: a bonus fed to one key must not
+        // show up under another kind, or the corrections would cross-contaminate.
+        let h = SharedCorrectionHistory::new(4);
+        let key = 0xDEADBEEFCAFEu64;
+        h.update(CorrKind::Pawn, key, Color::White, 300);
+        assert_eq!(h.get(CorrKind::Pawn, key, Color::White), 300);
+        for kind in KINDS.iter().copied().filter(|k| *k != CorrKind::Pawn) {
+            assert_eq!(h.get(kind, key, Color::White), 0, "{kind:?} moved");
+        }
+        // Nor across sides to move.
+        assert_eq!(h.get(CorrKind::Pawn, key, Color::Black), 0);
+    }
+
+    #[test]
+    fn gravity_saturates_instead_of_running_away() {
+        let h = SharedCorrectionHistory::new(1);
+        let key = 12345u64;
+        for _ in 0..500 {
+            h.update(CorrKind::Minor, key, Color::Black, CORRHIST_LIMIT);
+        }
+        let v = h.get(CorrKind::Minor, key, Color::Black);
+        assert!(v > 0 && v <= CORRHIST_LIMIT, "value {v} outside [0, {CORRHIST_LIMIT}]");
+        for _ in 0..500 {
+            h.update(CorrKind::Minor, key, Color::Black, -CORRHIST_LIMIT);
+        }
+        let v = h.get(CorrKind::Minor, key, Color::Black);
+        assert!(v < 0 && v >= -CORRHIST_LIMIT, "value {v} outside [-{CORRHIST_LIMIT}, 0]");
+    }
+
+    #[test]
+    fn gravity_matches_the_formula_the_private_tables_used() {
+        let h = SharedCorrectionHistory::new(1);
+        let key = 777u64;
+        let mut expected = 0i32;
+        for bonus in [200, -50, 900, -1024, 17, 640] {
+            expected = expected + bonus - expected * bonus.abs() / CORRHIST_LIMIT;
+            expected = expected.clamp(-CORRHIST_LIMIT, CORRHIST_LIMIT);
+            h.update(CorrKind::NonPawnWhite, key, Color::White, bonus);
+            assert_eq!(h.get(CorrKind::NonPawnWhite, key, Color::White), expected);
+        }
+    }
+
+    #[test]
+    fn clearing_and_resizing_leave_nothing_behind() {
+        let mut h = SharedCorrectionHistory::new(2);
+        h.update(CorrKind::Pawn, 42, Color::White, 500);
+        h.clear();
+        assert_eq!(h.get(CorrKind::Pawn, 42, Color::White), 0);
+
+        h.update(CorrKind::Pawn, 42, Color::White, 500);
+        h.resize(8); // different size: reallocates
+        assert_eq!(h.mask + 1, CORRHIST_SIZE * 8);
+        assert_eq!(h.get(CorrKind::Pawn, 42, Color::White), 0);
+
+        h.update(CorrKind::Pawn, 42, Color::White, 500);
+        h.resize(7); // same size once rounded up: must still come back empty
+        assert_eq!(h.mask + 1, CORRHIST_SIZE * 8);
+        assert_eq!(h.get(CorrKind::Pawn, 42, Color::White), 0);
+    }
+
+    #[test]
+    fn the_shared_tables_can_cross_a_thread_boundary() {
+        fn assert_sync<T: Sync>() {}
+        assert_sync::<SharedCorrectionHistory>();
+        assert_sync::<crate::threads::SharedState>();
+    }
+
+    #[test]
+    fn concurrent_updates_never_write_out_of_range() {
+        // Losing an update is the accepted cost; writing a value outside the gravity
+        // range is not, and would poison every eval that reads the slot afterwards.
+        let h = std::sync::Arc::new(SharedCorrectionHistory::new(4));
+        std::thread::scope(|s| {
+            for t in 0..4 {
+                let h = h.clone();
+                s.spawn(move || {
+                    let bonus = if t % 2 == 0 { CORRHIST_LIMIT / 4 } else { -CORRHIST_LIMIT / 4 };
+                    for i in 0..20_000u64 {
+                        h.update(CorrKind::Pawn, i % 8, Color::White, bonus);
+                    }
+                });
+            }
+        });
+        for key in 0..8u64 {
+            let v = h.get(CorrKind::Pawn, key, Color::White);
+            assert!(v.abs() <= CORRHIST_LIMIT, "key {key} holds {v}");
+        }
     }
 }

@@ -5,7 +5,7 @@
 //! → quiets (butterfly + continuation history) → bad captures.
 //! QSearch mode yields only the TT move and good captures.
 
-use crate::bitboard::{pawn_attacks, knight_attacks, bishop_attacks, rook_attacks, queen_attacks};
+use crate::bitboard::{bishop_attacks, knight_attacks, pawn_attacks, queen_attacks, rook_attacks};
 use crate::eval;
 use crate::history::{ButterflyHistory, CaptureHistory, ContinuationHistory, PawnHistory};
 use crate::movegen;
@@ -14,7 +14,10 @@ use crate::see;
 use crate::threads::{StackEntry, SS_OFFSET};
 use crate::tt::TT;
 use crate::tune;
-use crate::types::{ArrayBuf, Color, Move, ScoredMove, MAX_MOVES, Piece, PieceType, MT_EN_PASSANT, MT_PROMOTION, PIECE_VALUE, CASTLING_RIGHTS_MASK, Square};
+use crate::types::{
+    ArrayBuf, Color, Move, Piece, PieceType, ScoredMove, Square, MAX_MOVES,
+    MT_CASTLING, MT_EN_PASSANT, MT_PROMOTION, PIECE_VALUE,
+};
 use crate::zobrist::ZOBRIST;
 
 /// Check if a move is quiet (no capture, no promotion, no EP).
@@ -22,38 +25,76 @@ use crate::zobrist::ZOBRIST;
 #[inline]
 fn is_quiet(pos: &Position, m: Move) -> bool {
     let mt = m.move_type();
+    if mt == MT_CASTLING {
+        return true;
+    }
     mt != MT_PROMOTION && mt != MT_EN_PASSANT && pos.board[m.to_sq().index()] == Piece::NONE
 }
 
-/// Compute the Zobrist key of the child position after a quiet move,
-/// without performing make_move. Used for TT look-ahead probing.
-/// Handles EP clearing/setting and castling rights updates.
+/// Compute the Zobrist key of the child position after a move, without performing
+/// make_move: the look-ahead probes the TT with it for the quiets, and the move loops
+/// prefetch the child's cluster with it for every move. Exact for every move —
+/// captures, en passant, promotions, castling, en passant clearing/setting and
+/// castling rights included.
 #[inline]
-fn child_key(pos: &Position, m: Move, piece: Piece) -> u64 {
+pub(crate) fn child_key(pos: &Position, m: Move, piece: Piece) -> u64 {
     let from = m.from_sq();
     let to = m.to_sq();
+    let mt = m.move_type();
 
+    let dest = if mt == MT_CASTLING { m.castle_king_to() } else { to };
+    // What lands on the arrival square: the piece itself, or what a pawn became.
+    let landed = if mt == MT_PROMOTION { Piece::new(m.promo_type(), piece.color()) } else { piece };
     let mut key = pos.key
         ^ ZOBRIST.pieces[piece.index()][from.index()]
-        ^ ZOBRIST.pieces[piece.index()][to.index()]
+        ^ ZOBRIST.pieces[landed.index()][dest.index()]
         ^ ZOBRIST.side;
+
+    // The victim leaves: on the arrival square, or one rank behind it en passant.
+    // Castling is encoded as king-takes-rook, and that rook is no victim.
+    if mt == MT_EN_PASSANT {
+        let victim_sq = Square(to.0 ^ 8);
+        let victim = pos.board[victim_sq.index()];
+        debug_assert!(victim.piece_type() == PieceType::Pawn);
+        key ^= ZOBRIST.pieces[victim.index()][victim_sq.index()];
+    } else if mt != MT_CASTLING {
+        let victim = pos.board[to.index()];
+        if victim != Piece::NONE {
+            key ^= ZOBRIST.pieces[victim.index()][to.index()];
+        }
+    }
+
+    // Castling moves the rook too, from `to` (its origin) to the d/f file. The four
+    // XORs stay correct when king and rook squares overlap: equal terms cancel.
+    if m.move_type() == MT_CASTLING {
+        let rook = Piece::new(PieceType::Rook, piece.color());
+        key ^= ZOBRIST.pieces[rook.index()][to.index()]
+            ^ ZOBRIST.pieces[rook.index()][m.castle_rook_to().index()];
+    }
 
     // Clear current EP (always cleared after any move)
     if pos.ep_square != Square::NONE {
         key ^= ZOBRIST.ep[pos.ep_square.file() as usize];
     }
 
-    // Set new EP for double pawn push
-    if piece.piece_type() == PieceType::Pawn {
-        let rank_diff = (to.rank() as i32 - from.rank() as i32).unsigned_abs();
-        if rank_diff == 2 {
-            key ^= ZOBRIST.ep[to.file() as usize];
+    // Set new EP for a double pawn push, but only where an enemy pawn stands ready to
+    // answer it: that is the condition make_move hashes on, and a key that hashes the
+    // file unconditionally names a position that never occurs, so the probe finds
+    // nothing.
+    if piece.piece_type() == PieceType::Pawn
+        && (to.rank() as i32 - from.rank() as i32).unsigned_abs() == 2
+    {
+        let ep = Square((from.0 + to.0) / 2);
+        let us = piece.color();
+        if pawn_attacks(ep, us) & pos.piece_type_bb(PieceType::Pawn, !us) != 0 {
+            key ^= ZOBRIST.ep[ep.file() as usize];
         }
     }
 
     // Update castling rights if king or rook moves from/to relevant squares
     let old_rights = pos.castling_rights;
-    let new_rights = old_rights & CASTLING_RIGHTS_MASK[from.index()] & CASTLING_RIGHTS_MASK[to.index()];
+    let new_rights =
+        old_rights & pos.castling_rights_mask[from.index()] & pos.castling_rights_mask[to.index()];
     if old_rights != new_rights {
         key ^= ZOBRIST.castling[old_rights as usize] ^ ZOBRIST.castling[new_rights as usize];
     }
@@ -64,14 +105,22 @@ fn child_key(pos: &Position, m: Move, piece: Piece) -> u64 {
 /// Get the captured piece type for a move (handles EP).
 #[inline]
 pub fn get_captured_pt(pos: &Position, m: Move) -> PieceType {
-    debug_assert!(m.to_sq().0 < 64, "get_captured_pt: to sq OOB {}", m.to_sq().0);
+    debug_assert!(
+        m.to_sq().0 < 64,
+        "get_captured_pt: to sq OOB {}",
+        m.to_sq().0
+    );
     if m.move_type() == MT_EN_PASSANT {
         PieceType::Pawn
     } else {
         let pc = pos.board[m.to_sq().index()];
         // Note: promotions without captures have pc == NONE here, which is expected
-        debug_assert!(pc != Piece::NONE || m.move_type() == MT_PROMOTION,
-            "get_captured_pt: no piece on {} for {}", m.to_sq().0, m.to_uci());
+        debug_assert!(
+            pc != Piece::NONE || m.move_type() == MT_PROMOTION,
+            "get_captured_pt: no piece on {} for {}",
+            m.to_sq().0,
+            m.to_uci()
+        );
         pc.piece_type()
     }
 }
@@ -138,7 +187,11 @@ impl MovePicker {
     /// Create a move picker for a full search node.
     pub fn new(tt_move: Move, killers: [Move; 2], countermove: Move, depth: i32) -> MovePicker {
         MovePicker {
-            stage: if tt_move != Move::NONE { Stage::TTMove } else { Stage::GenerateCaptures },
+            stage: if tt_move != Move::NONE {
+                Stage::TTMove
+            } else {
+                Stage::GenerateCaptures
+            },
             tt_move,
             killers,
             countermove,
@@ -158,10 +211,20 @@ impl MovePicker {
         self.skip_quiets = true;
     }
 
+    /// True while the last yielded move came from the losing-capture stage
+    /// (SEE below the history-shifted split).
+    pub fn in_bad_captures(&self) -> bool {
+        self.stage == Stage::BadCaptures
+    }
+
     /// Create a move picker for quiescence search (captures only).
     pub fn new_qsearch(tt_move: Move) -> MovePicker {
         MovePicker {
-            stage: if tt_move != Move::NONE { Stage::TTMove } else { Stage::GenerateCaptures },
+            stage: if tt_move != Move::NONE {
+                Stage::TTMove
+            } else {
+                Stage::GenerateCaptures
+            },
             tt_move,
             killers: [Move::NONE; 2],
             countermove: Move::NONE,
@@ -212,9 +275,7 @@ impl MovePicker {
             match self.stage {
                 Stage::TTMove => {
                     self.stage = Stage::GenerateCaptures;
-                    if self.tt_move.is_ok()
-                        && movegen::is_pseudo_legal(pos, self.tt_move)
-                    {
+                    if self.tt_move.is_ok() && movegen::is_pseudo_legal(pos, self.tt_move) {
                         return self.tt_move;
                     }
                 }
@@ -227,7 +288,11 @@ impl MovePicker {
                         let mt = m.move_type();
                         self.entries[i].score = if mt == MT_EN_PASSANT {
                             let piece = pos.board[m.from_sq().index()];
-                            debug_assert!(piece != Piece::NONE, "movepick: EP no piece on from {}", m.from_sq().0);
+                            debug_assert!(
+                                piece != Piece::NONE,
+                                "movepick: EP no piece on from {}",
+                                m.from_sq().0
+                            );
                             cap_history.get(piece, m.to_sq(), PieceType::Pawn)
                         } else if mt == MT_PROMOTION {
                             let victim_pc = pos.board[m.to_sq().index()];
@@ -236,15 +301,20 @@ impl MovePicker {
                             } else {
                                 0
                             };
-                            PIECE_VALUE[m.promo_type() as usize] * tune::MVV_MULTIPLIER() + victim_val
+                            PIECE_VALUE[m.promo_type() as usize] * tune::MVV_MULTIPLIER()
+                                + victim_val
                         } else {
                             let victim_pc = pos.board[m.to_sq().index()];
                             if victim_pc == Piece::NONE {
                                 0
                             } else {
                                 let piece = pos.board[m.from_sq().index()];
-                                debug_assert!(piece != Piece::NONE,
-                                    "movepick: no piece on from {} for capture {}", m.from_sq().0, m.to_uci());
+                                debug_assert!(
+                                    piece != Piece::NONE,
+                                    "movepick: no piece on from {} for capture {}",
+                                    m.from_sq().0,
+                                    m.to_uci()
+                                );
                                 let captured_pt = victim_pc.piece_type();
                                 PIECE_VALUE[captured_pt as usize] * tune::MVV_MULTIPLIER()
                                     + cap_history.get(piece, m.to_sq(), captured_pt)
@@ -276,8 +346,12 @@ impl MovePicker {
                             0
                         } else {
                             let piece = pos.board[m.from_sq().index()];
-                            debug_assert!(piece != Piece::NONE,
-                                "movepick: no piece on from {} for split {}", m.from_sq().0, m.to_uci());
+                            debug_assert!(
+                                piece != Piece::NONE,
+                                "movepick: no piece on from {} for split {}",
+                                m.from_sq().0,
+                                m.to_uci()
+                            );
                             let captured_pt = if mt == MT_EN_PASSANT {
                                 PieceType::Pawn
                             } else {
@@ -290,8 +364,10 @@ impl MovePicker {
                             return m;
                         }
                         // Bad capture: store at end of array (LIFO)
-                        debug_assert!(self.bad_start > self.count,
-                            "movepick: bad captures overflow into active region");
+                        debug_assert!(
+                            self.bad_start > self.count,
+                            "movepick: bad captures overflow into active region"
+                        );
                         self.bad_start -= 1;
                         self.entries[self.bad_start] = ScoredMove { score: 0, mv: m };
                         continue;
@@ -362,12 +438,12 @@ impl MovePicker {
                     let their_king = pos.king_sq(stm.flip());
                     let occ = pos.occupied();
                     let check_sqs: [u64; 6] = [
-                        pawn_attacks(their_king, stm.flip()),   // PieceType::Pawn = 0
-                        knight_attacks(their_king),              // PieceType::Knight = 1
-                        bishop_attacks(their_king, occ),         // PieceType::Bishop = 2
-                        rook_attacks(their_king, occ),           // PieceType::Rook = 3
-                        queen_attacks(their_king, occ),          // PieceType::Queen = 4
-                        0u64,                                    // PieceType::King = 5 (no direct check)
+                        pawn_attacks(their_king, stm.flip()), // PieceType::Pawn = 0
+                        knight_attacks(their_king),           // PieceType::Knight = 1
+                        bishop_attacks(their_king, occ),      // PieceType::Bishop = 2
+                        rook_attacks(their_king, occ),        // PieceType::Rook = 3
+                        queen_attacks(their_king, occ),       // PieceType::Queen = 4
+                        0u64, // PieceType::King = 5 (no direct check)
                     ];
 
                     // Learned look-ahead: prefetch TT entries for child positions
@@ -396,8 +472,12 @@ impl MovePicker {
                             continue; // already yielded in earlier stage
                         }
                         let piece = pos.board[m.from_sq().index()];
-                        debug_assert!(piece != Piece::NONE,
-                            "movepick: no piece on from {} for quiet {}", m.from_sq().0, m.to_uci());
+                        debug_assert!(
+                            piece != Piece::NONE,
+                            "movepick: no piece on from {} for quiet {}",
+                            m.from_sq().0,
+                            m.to_uci()
+                        );
                         let to = m.to_sq();
                         let mut score = history.get(stm, m, pos.threats);
                         score += pawn_history.get(pos.pawn_key, piece, to);
@@ -423,15 +503,20 @@ impl MovePicker {
                             if let Some(hit) = tt.probe(ckey, ply as i32 + 1, 0) {
                                 // Use static eval (more stable than search score for ordering).
                                 // Eval is from child's STM (= opponent) → negate for our perspective.
-                                let raw = if hit.eval != crate::types::SCORE_NONE { hit.eval } else { hit.score };
-                                score += -raw * tune::LOOKAHEAD_BONUS_MUL() / tune::LOOKAHEAD_BONUS_DIV();
+                                let raw = if hit.eval != crate::types::SCORE_NONE {
+                                    hit.eval
+                                } else {
+                                    hit.score
+                                };
+                                score += -raw * tune::LOOKAHEAD_BONUS_MUL()
+                                    / tune::LOOKAHEAD_BONUS_DIV();
                             }
                         }
                         // PST tiebreaker when all history is zero
                         if score == 0 {
                             let from = m.from_sq();
                             score = eval::MG_TABLE[piece.index()][to.index()]
-                                  - eval::MG_TABLE[piece.index()][from.index()];
+                                - eval::MG_TABLE[piece.index()][from.index()];
                         }
                         self.entries[j] = ScoredMove { score, mv: m };
                         j += 1;
@@ -502,7 +587,12 @@ impl MovePicker {
 
     /// Partial insertion sort: sort moves with score >= limit
     /// into descending order at the front. Moves below limit remain unsorted after.
-    fn partial_insertion_sort(entries: &mut ArrayBuf<ScoredMove, MAX_MOVES>, start: usize, end: usize, limit: i32) {
+    fn partial_insertion_sort(
+        entries: &mut ArrayBuf<ScoredMove, MAX_MOVES>,
+        start: usize,
+        end: usize,
+        limit: i32,
+    ) {
         let mut sorted_end = start;
         for p in (start + 1)..end {
             if entries[p].score >= limit {
@@ -517,5 +607,66 @@ impl MovePicker {
                 entries[q] = tmp;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The look-ahead probes the TT with a key `child_key` predicts without playing the
+    /// move, and the move loops prefetch with it. A key that does not name the child
+    /// position probes nothing, so it must agree with `make_move` on every legal move —
+    /// captures, en passant, promotions plain and capturing, and castling, where king
+    /// and rook both move and their squares may overlap.
+    #[test]
+    fn the_predicted_child_key_is_the_one_make_move_produces() {
+        let fens = [
+            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R b KQkq - 0 1",
+            // An en passant square to clear, whatever the move played.
+            "rnbqkbnr/pp1ppppp/8/2p5/4P3/8/PPPP1PPP/RNBQKBNR w KQkq c6 0 2",
+            // An en passant capture to play, for either side.
+            "rnbqkbnr/ppp1p1pp/8/3pPp2/8/8/PPPP1PPP/RNBQKBNR w KQkq f6 0 3",
+            "rnbqkbnr/pppp1ppp/8/8/3Pp3/8/PPP1PPPP/RNBQKBNR b KQkq d3 0 3",
+            // A rook taken on its home square loses the right with it.
+            "4k2r/8/8/8/8/8/8/4K2R w Kk - 0 1",
+            "r3k3/8/8/8/8/8/8/R3K3 b Qq - 0 1",
+            // Promotions, plain and capturing, for either side; one takes a rook on
+            // its home square.
+            "1n2k2r/P6P/8/8/8/8/6K1/8 w k - 0 1",
+            "8/6k1/8/8/8/8/p6p/1N2K2R b K - 0 1",
+            // A black pawn on d4 answers both c2c4 and e2e4, so those two double pushes
+            // leave an en passant file behind and the others do not.
+            "rnbqkbnr/ppp1pppp/8/8/3p4/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+            // FRC: castling short swaps king and rook.
+            "4k3/8/8/8/8/8/8/5KR1 w K - 0 1",
+            // FRC: the king already stands on g1 and stays there.
+            "4k3/8/8/8/8/8/8/6KR w K - 0 1",
+            // FRC: castling long leaves the king where it is, on both sides.
+            "1rk5/8/8/8/8/8/8/1RK5 w Qq - 0 1",
+            "1rk5/8/8/8/8/8/8/1RK5 b Qq - 0 1",
+        ];
+        let mut checked = 0;
+        for fen in fens {
+            let pos = Position::from_fen_ex(fen, true).unwrap();
+            let mut buf = ArrayBuf::<Move, 256>::new();
+            let n = movegen::generate_legal_moves(&pos, &mut buf);
+            for i in 0..n {
+                let m = buf[i];
+                checked += 1;
+                let piece = pos.board[m.from_sq().index()];
+                let mut child = pos.clone();
+                child.make_move(m);
+                assert_eq!(
+                    child_key(&pos, m, piece),
+                    child.key,
+                    "child_key mispredicts {} in {fen}",
+                    m.to_uci_960(true),
+                );
+            }
+        }
+        assert!(checked > 200, "only {checked} moves checked");
     }
 }

@@ -8,7 +8,8 @@ use crate::progress::{ProgressBar, ProgressStyle};
 
 use crate::position::Position;
 use crate::search;
-use crate::threads::{SharedState, ThreadData, COUNT_NODES, NODES_SEARCHED, STOP};
+use crate::threads::{SharedState, ThreadData, ThreadPool, NODES_SEARCHED, STOP,
+    close_node_meter, open_node_meter};
 use crate::timeman::SearchLimits;
 /// 27 unique positions from gaia3.0's profile() function (gaia3.0/src/util.c:328).
 pub(crate) const POSITIONS: [&str; 27] = [
@@ -48,10 +49,17 @@ const BENCH_DEPTH: i32 = 16;
 const BENCH_HASH_MB: usize = 64;
 
 /// Run the search benchmark. `depth_override` from CLI arg, or None for default.
-pub fn run(depth_override: Option<i32>) {
+/// `threads` above 1 hands the positions to a real thread pool instead (see
+/// [`run_threaded`]); the single-threaded path below is left untouched, because its
+/// node count is the regression contract.
+pub fn run(depth_override: Option<i32>, threads: Option<usize>) {
     let depth = depth_override.unwrap_or(BENCH_DEPTH);
+    if threads.unwrap_or(1) > 1 {
+        run_threaded(depth, threads.unwrap_or(1));
+        return;
+    }
     let total = POSITIONS.len() as u64;
-    let shared = SharedState::new(BENCH_HASH_MB);
+    let shared = SharedState::new(BENCH_HASH_MB, 1);
     // id=1 suppresses UCI info output (same pattern as datagen.rs)
     let mut td = ThreadData::new(1);
 
@@ -60,7 +68,7 @@ pub fn run(depth_override: Option<i32>) {
     #[cfg(feature = "stats")]
     let mut agg_stats = crate::stats::SearchStats::zeroed();
 
-    COUNT_NODES.store(true, Ordering::Relaxed);
+    open_node_meter();
 
     let pb = ProgressBar::new(total);
     pb.set_style(
@@ -98,7 +106,7 @@ pub fn run(depth_override: Option<i32>) {
         pb.set_position(i as u64 + 1);
     }
 
-    COUNT_NODES.store(false, Ordering::Relaxed);
+    close_node_meter();
 
     // Final summary
     let avg_nps = if total_time_ms > 0 {
@@ -126,6 +134,75 @@ pub fn run(depth_override: Option<i32>) {
     crate::stats::dbg::print();
 }
 
+/// The same 27 positions, searched by a pool of N threads.
+///
+/// What a single-threaded bench cannot show: what threads sharing a table cost each
+/// other in speed. False sharing and cross-CCD coherence traffic are paid in NPS
+/// alone, and a fixed-depth lane never sees them.
+///
+/// The node count is deliberately not reported as a checkable figure here: beyond one
+/// thread the helpers race for the transposition table and stop wherever the main
+/// thread happens to finish, so it moves from run to run. The measure is the
+/// **aggregate** NPS — every thread's nodes over the wall clock — and the
+/// node-identity contract stays with the single-threaded bench.
+///
+/// No meter is opened on the node counter: it would add an atomic increment every 512
+/// nodes on every thread, and measuring contention with a counter that manufactures its
+/// own is not a measurement.
+fn run_threaded(depth: i32, threads: usize) {
+    let total = POSITIONS.len() as u64;
+    let mut pool = ThreadPool::new(threads, BENCH_HASH_MB);
+    // Thread 0 owns the clock and the reporting; here nobody is listening.
+    for td in pool.threads.iter_mut() {
+        td.silent = true;
+    }
+
+    let mut total_nodes: u64 = 0;
+    let mut total_time_ms: u64 = 0;
+
+    let pb = ProgressBar::new(total);
+    pb.set_style(
+        ProgressStyle::with_template(
+            "  {spinner:.green} [{elapsed_precise}] {bar:40.cyan/blue} {pos}/{len} ({msg})",
+        )
+        .unwrap()
+        .progress_chars("##-"),
+    );
+    pb.set_message(format!("searching on {threads} threads..."));
+
+    for (i, fen) in POSITIONS.iter().enumerate() {
+        let pos = Position::from_fen(fen).expect("invalid bench FEN");
+
+        let start = Instant::now();
+        pool.start_search(&pos, SearchLimits::Depth(depth));
+        let elapsed_ms = start.elapsed().as_millis() as u64;
+
+        total_nodes += pool.threads.iter().map(|td| td.nodes).sum::<u64>();
+        total_time_ms += elapsed_ms;
+        pb.set_position(i as u64 + 1);
+    }
+
+    let avg_nps = if total_time_ms > 0 {
+        total_nodes * 1000 / total_time_ms
+    } else {
+        0
+    };
+
+    pb.finish_with_message("done");
+
+    println!(
+        "\n  {} aggregate ({} nodes in {:.1}s, depth {}, {} threads)",
+        format_nps(avg_nps),
+        format_number(total_nodes),
+        total_time_ms as f64 / 1000.0,
+        depth,
+        threads,
+    );
+    // Same shape as the single-threaded line so scripts can parse one format, but the
+    // node figure varies between runs at this thread count — compare the NPS.
+    println!("{total_nodes} nodes {avg_nps} nps");
+}
+
 /// Run the statistical benchmark: N runs with robust statistics.
 /// First run is discarded as warmup. Reports median, trimmed mean, CI, outliers.
 pub fn run_stats(depth_override: Option<i32>, num_runs: u32, verbose: bool) {
@@ -137,10 +214,10 @@ pub fn run_stats(depth_override: Option<i32>, num_runs: u32, verbose: bool) {
     let num_positions = POSITIONS.len();
 
     // Allocate once, clear between runs
-    let mut shared = SharedState::new(BENCH_HASH_MB);
+    let mut shared = SharedState::new(BENCH_HASH_MB, 1);
     let mut td = ThreadData::new(1);
 
-    COUNT_NODES.store(true, Ordering::Relaxed);
+    open_node_meter();
 
     // Storage: per-position NPS across measured runs, plus overall NPS per run
     let mut nps_per_position: Vec<Vec<f64>> = vec![Vec::with_capacity(num_runs); num_positions];
@@ -164,8 +241,8 @@ pub fn run_stats(depth_override: Option<i32>, num_runs: u32, verbose: bool) {
             pb.set_message(format!("run {}/{}", run_idx, num_runs));
         }
 
-        // Clear TT and histories for independence between runs
-        shared.tt.clear();
+        // Clear shared state and histories for independence between runs
+        shared.clear();
         td.clear_histories();
 
         let mut run_nodes: u64 = 0;
@@ -212,7 +289,7 @@ pub fn run_stats(depth_override: Option<i32>, num_runs: u32, verbose: bool) {
         }
     }
 
-    COUNT_NODES.store(false, Ordering::Relaxed);
+    close_node_meter();
     pb.finish_with_message("done");
 
     // Compute statistics

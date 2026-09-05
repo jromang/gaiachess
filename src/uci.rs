@@ -89,6 +89,7 @@ pub struct UciSession {
     pos: Position,
     pool: ThreadPool,
     ponder_enabled: bool,
+    chess960: bool,
 }
 
 impl UciSession {
@@ -109,6 +110,7 @@ impl UciSession {
             pos: Position::from_fen(STARTPOS).expect("startpos"),
             pool: ThreadPool::new(1, 16),
             ponder_enabled: true,
+            chess960: false,
         }
     }
 
@@ -128,6 +130,9 @@ impl UciSession {
                 out!("option name MultiPV type spin default 1 min 1 max 256");
                 out!("option name Move Overhead type spin default 100 min 0 max 5000");
                 out!("option name UseSoftNodes type check default false");
+                #[cfg(target_os = "linux")]
+                out!("option name SharedNetwork type check default true");
+                out!("option name UCI_Chess960 type check default false");
                 out!(
                     "option name Skill Level type spin default {} min {} max {}",
                     crate::skill::FULL_STRENGTH,
@@ -152,10 +157,10 @@ impl UciSession {
                 self.pool.clear();
                 #[cfg(feature = "online-tb")]
                 crate::online_tb::clear();
-                self.pos = Position::from_fen(STARTPOS).expect("startpos");
+                self.pos = Position::from_fen_ex(STARTPOS, self.chess960).expect("startpos");
             }
 
-            ["position", rest @ ..] => parse_position(rest, &mut self.pos),
+            ["position", rest @ ..] => parse_position(rest, &mut self.pos, self.chess960),
 
             ["go", rest @ ..] => {
                 if rest.contains(&"ponder") {
@@ -172,9 +177,9 @@ impl UciSession {
                     // "(none)" is what the protocol says to answer.
                     out!("bestmove (none)");
                 } else if self.ponder_enabled && let Some(pm) = ponder_move {
-                    out!("bestmove {} ponder {}", best.to_uci(), pm.to_uci());
+                    out!("bestmove {} ponder {}", best.to_uci_960(self.chess960), pm.to_uci_960(self.chess960));
                 } else {
-                    out!("bestmove {}", best.to_uci());
+                    out!("bestmove {}", best.to_uci_960(self.chess960));
                 }
                 PONDER.store(false, Ordering::Relaxed);
                 // Search statistics summary on stderr (invisible to GUIs)
@@ -203,7 +208,8 @@ impl UciSession {
             }
 
             ["setoption", rest @ ..] => {
-                parse_setoption(rest, &mut self.pool, &mut self.ponder_enabled);
+                parse_setoption(rest, &mut self.pool, &mut self.ponder_enabled, &mut self.chess960);
+                self.pos.set_chess960(self.chess960);
             }
 
             ["d"] => print_board(&self.pos),
@@ -237,16 +243,16 @@ pub fn uci_loop(rx: mpsc::Receiver<String>, first: Option<String>) {
 }
 
 /// Parse `position [startpos|fen ...] [moves ...]`.
-fn parse_position(tokens: &[&str], pos: &mut Position) {
+fn parse_position(tokens: &[&str], pos: &mut Position, chess960: bool) {
     let tokens = match tokens {
         ["startpos", rest @ ..] => {
-            *pos = Position::from_fen(STARTPOS).expect("startpos");
+            *pos = Position::from_fen_ex(STARTPOS, chess960).expect("startpos");
             rest
         }
         ["fen", rest @ ..] => {
             let fen_end = rest.iter().position(|&t| t == "moves").unwrap_or(rest.len());
             let fen = rest[..fen_end].join(" ");
-            match Position::from_fen(&fen) {
+            match Position::from_fen_ex(&fen, chess960) {
                 Ok(p) => *pos = p,
                 Err(e) => {
                     outerr!("info string Invalid FEN: {e}");
@@ -276,7 +282,7 @@ pub(crate) fn parse_uci_move(pos: &Position, s: &str) -> Option<Move> {
     let mut buf: ArrayBuf<Move, MAX_MOVES> = ArrayBuf::new();
     let count = movegen::generate_legal_moves(pos, &mut buf);
     for i in 0..count {
-        if buf[i].to_uci() == s {
+        if buf[i].to_uci_960(pos.chess960) == s {
             return Some(buf[i]);
         }
     }
@@ -353,7 +359,7 @@ fn parse_go(tokens: &[&str], pos: &Position) -> SearchLimits {
 
 /// Parse `setoption name <N...> value <V...>`.
 /// Supports multi-word option names (e.g. "Move Overhead").
-fn parse_setoption(tokens: &[&str], pool: &mut ThreadPool, ponder_enabled: &mut bool) {
+fn parse_setoption(tokens: &[&str], pool: &mut ThreadPool, ponder_enabled: &mut bool, chess960: &mut bool) {
     if tokens.first() != Some(&"name") || tokens.len() < 4 {
         return;
     }
@@ -384,6 +390,9 @@ fn parse_setoption(tokens: &[&str], pool: &mut ThreadPool, ponder_enabled: &mut 
         "ownbook" => {
             crate::book::set_enabled(value.eq_ignore_ascii_case("true"));
         }
+        "uci_chess960" => {
+            *chess960 = value.eq_ignore_ascii_case("true");
+        }
         "multipv" => {
             if let Ok(n) = value.parse::<usize>() {
                 pool.multi_pv = n.clamp(1, 256);
@@ -413,6 +422,15 @@ fn parse_setoption(tokens: &[&str], pool: &mut ThreadPool, ponder_enabled: &mut 
                 value.eq_ignore_ascii_case("true"),
                 Ordering::Relaxed,
             );
+        }
+        "sharednetwork" => {
+            // Same weights either way, so the hash and the accumulator caches
+            // stay valid: nothing is cleared and no generation is bumped.
+            // The new backing announces itself from where it is installed;
+            // only a refusal has to be reported from here.
+            if let Err(e) = crate::nnue::network::set_shared(value.eq_ignore_ascii_case("true")) {
+                outerr!("info string SharedNetwork: {e}");
+            }
         }
         "evalfile" => {
             if value == "<internal>" {
@@ -524,7 +542,7 @@ fn print_eval(pos: &Position) {
             out!("NNUE eval:  N/A (in check)");
         }
         let pieces = pos.occupied().count_ones();
-        let bucket = nnue::OUTPUT_BUCKET_MAP[pieces.min(32) as usize];
+        let bucket = nnue::output_bucket(pos);
         out!("Output bucket: {} (pieces: {})", bucket, pieces);
     } else {
         out!("NNUE: no network loaded");

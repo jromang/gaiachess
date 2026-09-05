@@ -7,8 +7,8 @@
 use crate::movegen;
 use crate::position::Position;
 use crate::types::{
-    ArrayBuf, BLACK_OO, BLACK_OOO, CASTLING_DATA, Color, MAX_MOVES, MT_CASTLING,
-    MT_EN_PASSANT, MT_PROMOTION, Move, Piece, PieceType, Square, WHITE_OO, WHITE_OOO,
+    ArrayBuf, Color, MAX_MOVES, MT_CASTLING,
+    MT_EN_PASSANT, MT_PROMOTION, Move, Piece, PieceType, Square,
 };
 
 pub const STARTPOS: &str = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
@@ -110,7 +110,7 @@ impl GameState {
     pub fn find_move(&self, from: Square, to: Square, promo: Option<PieceType>) -> Option<Move> {
         self.legal.iter().copied().find(|m| {
             m.from_sq() == from
-                && m.to_sq() == to
+                && drop_square(*m) == to
                 && match promo {
                     Some(pt) => m.move_type() == MT_PROMOTION && m.promo_type() == pt,
                     None => true,
@@ -152,19 +152,16 @@ pub fn captured_square(pos: &Position, m: Move) -> Option<Square> {
     (pos.piece_on(to) != Piece::NONE).then_some(to)
 }
 
-/// The rook's journey in a castling move, which the move itself leaves implicit: it
-/// only records the king's. Needed to animate the rook alongside the king.
+/// Square a player drops the piece onto: king destination for castling, else `to`.
+pub fn drop_square(m: Move) -> Square {
+    m.lands_on()
+}
+
+/// The rook's journey in a castling move. Encoded as king-captures-rook, so `to`
+/// is the rook origin.
 pub fn castle_rook(m: Move) -> (Square, Square) {
     debug_assert_eq!(m.move_type(), MT_CASTLING);
-    let right = match (m.to_sq().0, m.from_sq().0 < 32) {
-        (n, true) if n > m.from_sq().0 => WHITE_OO,
-        (_, true) => WHITE_OOO,
-        (n, false) if n > m.from_sq().0 => BLACK_OO,
-        _ => BLACK_OOO,
-    };
-    let data = &CASTLING_DATA[right as usize];
-    debug_assert_eq!(data.king_to, m.to_sq());
-    (data.rook_from, data.rook_to)
+    (m.to_sq(), m.castle_rook_to())
 }
 
 /// Draws that no amount of play can escape: bare kings, or a lone minor piece.
@@ -242,7 +239,7 @@ mod tests {
             let n = movegen::generate_legal_moves(&pos, &mut buf);
             let m = (0..n)
                 .map(|i| buf[i])
-                .find(|m| m.move_type() == MT_CASTLING && m.to_sq() == king_to)
+                .find(|m| m.move_type() == MT_CASTLING && m.castle_king_to() == king_to)
                 .expect("castling move must be generated");
             assert_eq!(castle_rook(m), (rook_from, rook_to));
         }

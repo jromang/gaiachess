@@ -1,26 +1,28 @@
 //! NNUE evaluation: efficiently updatable neural network.
 //!
-//! Architecture GaiaNet-T1:
+//! Architecture GaiaNet-T2:
 //!   ```text
 //!   Position
 //!     |
 //!     +-- HalfKA PST (12 king buckets x 768 = 9,216 features, i16 weights)
-//!     |     -> [PST Accumulator i16[640] x 2 perspectives, incremental + Finny cache]
+//!     |     -> [PST Accumulator i16[1024] x 2 perspectives, incremental + Finny cache]
 //!     |
-//!     +-- Filtered threats (41,272 features, i8 weights, incremental + dirty updates)
-//!     |   (all enemy threats; defenses only when a pawn is involved)
+//!     +-- Pawn pairs (4,560 features, i8, 3-file window) + pairwise threats (59,808, i8)
+//!     |     -> [ThreatAccumulator i16[1024] x 2, incremental + dirty updates]
 //!     |
-//!     +----> PST + Threats -> activate_ft -> within-side pairwise -> u8[640]
-//!              -> L1 sparse (640->16, dpbusd) -> CReLU+squared -> f32[32]
+//!     +----> PST + aux -> activate_ft -> within-side pairwise -> u8[1024]
+//!              -> L1 sparse (1024->16, dpbusd) -> CReLU+squared -> f32[32]
 //!              -> L2 dense (32->32, FMA) -> squared -> f32[32]
-//!              -> L3 dense (concat(l2[32], l1[32]) -> 1) x 8 output buckets -> centipawns
+//!              -> L3 dense (concat(l2[32], l1[32]) -> 1) x 8 output buckets
+//!              -> + PSQT head (i32 per feature per bucket, stm - ntm) -> centipawns
 //!   ```
 //!
 //! Submodules:
 //!   - `features`: HalfKA PST indexing (12 king buckets, horizontal mirroring)
-//!   - `threats`: filtered threat features (41,272), incremental dirty updates
+//!   - `threats`: pairwise threat features (59,808), incremental dirty updates
+//!   - `pawn_pairs`: 3-file pawn-pawn relations (4,560)
 //!   - `accumulator`: PST accumulator (Finny cache), incremental push/pop
-//!   - `network`: NNUEParams struct (~37 MB), weight loading (direct memcpy)
+//!   - `network`: NNUEParams struct (~85 MB), weight loading (direct memcpy)
 //!   - `forward`: forward pass (activate_ft, NNZ, L1/L2/L3 with skip connection)
 //!   - `simd`: SIMD primitives (AVX-512 > AVX2 > NEON > scalar)
 //!
@@ -32,8 +34,11 @@ pub mod integrity;
 pub(crate) mod forward;
 pub(crate) mod kernels;
 pub mod network;
+pub mod pawn_pairs;
 pub mod simd;
 pub mod threats;
+
+use std::mem::MaybeUninit;
 
 use crate::position::Position;
 use crate::types::*;
@@ -54,14 +59,28 @@ pub const INPUTS_PER_BUCKET: usize = 768;
 /// Total PST feature transformer input size.
 pub const FT_SIZE: usize = INPUT_BUCKETS * INPUTS_PER_BUCKET;
 
-/// Filtered threat feature transformer input size (GaiaNet-T1).
-/// Matches `threats::FEATURE_COUNT` exactly (derived from PIECE_TARGET_COUNT totals):
-/// per attacker color, slots × empty-board mobility:
-/// P 6×84 + N 6×336 + B 5×560 + R 5×896 + Q 6×1456 + K 5×420 = 20,636 → ×2 = 41,272.
-pub const THREAT_INPUT_SIZE: usize = 41_272;
+/// 3-file pawn-pair features: C(96, 2) = 4,560.
+/// 48 pawn squares × 2 colours, unordered pairs, i8 weights.
+pub const PAWN_PAIR_SIZE: usize = 96 * 95 / 2;
+
+/// Pairwise threat features (kings never attack or are targets; pawn-pawn
+/// relations live in `PAWN_PAIR_SIZE` instead).
+/// P 4×84 + N 10×336 + B 8×560 + R 8×896 + Q 10×1456 = 29,904 → ×2 colours = 59,808.
+pub const THREAT_FEATURE_COUNT: usize = 59_808;
+
+/// Offset of threat features inside the i8 aux-weight array (pawn pairs first).
+pub const THREAT_OFFSET: usize = PAWN_PAIR_SIZE;
+
+/// Combined i8 feature-transformer input: pawn pairs then threats.
+pub const THREAT_INPUT_SIZE: usize = PAWN_PAIR_SIZE + THREAT_FEATURE_COUNT;
 
 /// Feature transformer output / L1 input size (per perspective).
-pub const L1_SIZE: usize = 640;
+pub const L1_SIZE: usize = 1024;
+
+const _: () = assert!(PAWN_PAIR_SIZE == 4_560);
+const _: () = assert!(THREAT_FEATURE_COUNT == 59_808);
+const _: () = assert!(THREAT_INPUT_SIZE == 64_368);
+const _: () = assert!(L1_SIZE % 64 == 0, "packus permutation groups are 64 wide");
 
 /// L1 output (before pairing): matmul output size per bucket.
 pub const L2_SIZE: usize = 16;
@@ -90,23 +109,21 @@ pub const L1_NORMALISATION: f32 =
 /// Network output calibration constant (287 centipawns per unit).
 pub const NETWORK_SCALE: i32 = 287;
 
+/// PSQT head quantization factor: weights stored as `round(w × 16384)` in i32.
+/// Power of two so the dequantization divide is exact in f32.
+pub const PSQT_QUANT: i32 = 16384;
+
 // ============================================================
-// Output bucket mapping
+// Output bucket scheme
 // ============================================================
 
-/// Maps occupancy count (0..32) to output bucket (0..OUTPUT_BUCKETS-1).
-/// Must match Bullet's `MaterialCount<8>`: `(count - 2) / 4`.
-#[rustfmt::skip]
-pub const OUTPUT_BUCKET_MAP: [usize; 33] = [
-    0, 0, 0, 0, 0, 0,  //  0- 5 pieces (0-1 impossible but safe)
-    1, 1, 1, 1,         //  6- 9
-    2, 2, 2, 2,         // 10-13
-    3, 3, 3, 3,         // 14-17
-    4, 4, 4, 4,         // 18-21
-    5, 5, 5, 5,         // 22-25
-    6, 6, 6, 6,         // 26-29
-    7, 7, 7,            // 30-32
-];
+/// Output bucket scheme: material-value weighted.
+/// `[knight, bishop, rook, queen weight, divisor, max bucket]` —
+/// `bucket = min(max, (3N + 4B + 8R + 18Q) / 12)`, pawns and kings excluded,
+/// so pawn moves and pawn trades never change the bucket.
+/// Hashed into ARCH_HASH in this order; the trainer mirrors the same scheme
+/// from its own constants (an accidental drift fails the golden tests).
+pub const OUTPUT_BUCKET_SCHEME: [usize; 6] = [3, 4, 8, 18, 12, OUTPUT_BUCKETS - 1];
 
 // ============================================================
 // Network struct
@@ -125,6 +142,22 @@ pub struct Network {
     cache: FinnyTable,
     /// Threat accumulator stack: one per ply (pre-allocated).
     threat_acc: Box<[ThreatAccumulator]>,
+}
+
+/// The board a chain slot names: the position itself, or one of the rebuilt plies.
+#[inline]
+fn board_at<'a>(
+    pos: &'a Position,
+    rebuilt: &'a [MaybeUninit<threats::RebuiltBoard>],
+    slot: u8,
+    occ: u64,
+) -> threats::BoardView<'a> {
+    if slot == u8::MAX {
+        threats::BoardView::of(pos)
+    } else {
+        // SAFETY: a slot is named only after `ensure_threats_updated` wrote it.
+        unsafe { rebuilt[slot as usize].assume_init_ref() }.view(occ)
+    }
 }
 
 impl Network {
@@ -180,6 +213,8 @@ impl Network {
             moved_piece: pos.piece_on(from),
             captured_piece: if mv.move_type() == MT_EN_PASSANT {
                 Piece::new(PieceType::Pawn, !pos.side_to_move)
+            } else if mv.move_type() == MT_CASTLING {
+                Piece::NONE
             } else {
                 pos.piece_on(to)
             },
@@ -240,43 +275,113 @@ impl Network {
         debug_assert!(pos.checkers == 0,
             "NNUE evaluate: called while in check");
 
-        self.ensure_updated(pos);
-        self.ensure_threats_updated(pos);
+        self.ensure_all_updated(pos);
         self.forward(pos)
     }
 
-    /// Update the threat accumulator incrementally from the closest accurate ancestor,
-    /// or full recompute if no suitable parent exists.
+    /// Bring both the PST and threat accumulators up-to-date without evaluating.
     ///
-    /// Uses AccDelta (moved/captured pieces, old_occ) to enumerate
-    /// threats only for changed pieces (~2-4) + x-ray sliders, instead of all ~30 pieces.
+    /// Called at nodes that reuse a TT eval and never reach `evaluate`: their
+    /// children can then take the incremental update paths instead of paying a
+    /// full threat recompute each.
+    pub fn ensure_all_updated(&mut self, pos: &Position) {
+        self.ensure_updated(pos);
+        self.ensure_threats_updated(pos);
+    }
+
+    /// Bring the threat accumulator up-to-date from the nearest ancestor whose threats
+    /// are known, replaying the plies in between, or recompute it when none is close.
+    ///
+    /// A ply without a static eval (in check, lazy eval) leaves its threats unknown,
+    /// and every child of it used to pay a full recompute. Replaying two or three
+    /// plies costs a fraction of that, and the plies replayed become known for the
+    /// siblings that follow. Past `THREAT_CHAIN_MAX` plies the recompute is cheaper.
     fn ensure_threats_updated(&mut self, pos: &Position) {
         let idx = self.index;
         if self.threat_acc[idx].accurate == [true; 2] {
             return;
         }
 
-        // Try incremental from parent using AccDelta
-        if idx > 0 && self.threat_acc[idx - 1].accurate == [true; 2] {
-            let delta = &self.accumulators[idx].delta;
-            if delta.mv != Move::NONE {
-                let (left, right) = self.threat_acc.split_at_mut(idx);
-                if right[0].update_incremental(pos, &left[idx - 1], delta) {
-                    return;
-                }
+        let mut source = None;
+        for k in 1..=threats::THREAT_CHAIN_MAX.min(idx) {
+            if self.threat_acc[idx - k].accurate == [true; 2] {
+                source = Some(idx - k);
+                break;
+            }
+        }
+        let Some(source) = source else {
+            self.threat_acc[idx].update_full(pos);
+            return;
+        };
+        let len = idx - source;
+
+        // The boards of the plies between `pos` and the source, rebuilt backwards from
+        // the deltas and kept by reference: `slot[k]` says where the board k plies above
+        // `pos` lives — `POS` for the position itself, else an index into `rebuilt`. A
+        // null move leaves the board as it was, so its ply shares the slot of the ply
+        // after it. Nothing is copied but the arrays that have to be rebuilt.
+        const POS: u8 = u8::MAX;
+        let mut rebuilt: [MaybeUninit<threats::RebuiltBoard>; threats::THREAT_CHAIN_MAX] =
+            [const { MaybeUninit::uninit() }; threats::THREAT_CHAIN_MAX];
+        let mut slot = [POS; threats::THREAT_CHAIN_MAX + 1];
+        let mut occ = [0u64; threats::THREAT_CHAIN_MAX + 1];
+        occ[0] = pos.occupied();
+        let mut used = 0usize;
+        for k in 1..=len {
+            let delta = &self.accumulators[idx - k + 1].delta;
+            if delta.mv == Move::NONE {
+                slot[k] = slot[k - 1];
+                occ[k] = occ[k - 1];
             } else {
-                // Null move: no pieces changed → copy parent (1280 bytes vs full recompute)
-                let (left, right) = self.threat_acc.split_at_mut(idx);
-                let parent = &left[idx - 1];
-                right[0].values.0 = parent.values.0;
-                right[0].mirrored = parent.mirrored;
-                right[0].accurate = [true; 2];
-                return;
+                // The slot being written is never the one being read: the board below
+                // lives in `pos` or in an earlier slot.
+                let (done, free) = rebuilt.split_at_mut(used);
+                let below = board_at(pos, done, slot[k - 1], occ[k - 1]);
+                below.rebuild_before_into(delta, &mut free[0]);
+                slot[k] = used as u8;
+                occ[k] = delta.old_occ;
+                used += 1;
             }
         }
 
-        // Fallback: full recompute
-        self.threat_acc[idx].update_full(pos);
+        let mut replayed = true;
+        for ply in (source + 1)..=idx {
+            let k = idx - ply;
+            let delta = &self.accumulators[ply].delta;
+            let (left, right) = self.threat_acc.split_at_mut(ply);
+            let parent = &left[ply - 1];
+            let current = &mut right[0];
+            if delta.mv == Move::NONE {
+                current.copy_from(parent);
+                continue;
+            }
+            let new = board_at(pos, &rebuilt, slot[k], occ[k]);
+            let old = board_at(pos, &rebuilt, slot[k + 1], occ[k + 1]);
+            if !current.update_incremental(&new, &old, parent, delta) {
+                // A king crossed the centre at this ply: nothing before it carries over.
+                replayed = false;
+                break;
+            }
+        }
+        if !replayed {
+            self.threat_acc[idx].update_full(pos);
+        }
+
+        #[cfg(debug_assertions)]
+        {
+            let (full, full_psqt) = threats::compute_full_threats(pos);
+            let acc = &self.threat_acc[idx];
+            for pov in 0..2 {
+                debug_assert!(
+                    acc.values.0[pov][..] == full.0[pov][..],
+                    "threat chain mismatch against the full recompute: pov={pov}"
+                );
+                debug_assert_eq!(
+                    acc.psqt[pov], full_psqt[pov],
+                    "threat chain PSQT mismatch against the full recompute: pov={pov}"
+                );
+            }
+        }
     }
 
     /// Test helper: expose ensure_threats_updated (used by threats.rs tests).
@@ -291,17 +396,37 @@ impl Network {
         &self.threat_acc[self.index].values
     }
 
-    /// Forward pass through the dense layers (SIMD-accelerated).
+    /// Test helper: current ply's threat accumulator PSQT head sums.
+    #[cfg(test)]
+    pub(crate) fn threat_psqt_for_test(&self) -> &[[i32; OUTPUT_BUCKETS]; 2] {
+        &self.threat_acc[self.index].psqt
+    }
+
+    /// Test helper: current ply's PST accumulator PSQT head sums.
+    #[cfg(test)]
+    pub(crate) fn pst_psqt_for_test(&self) -> [[i32; OUTPUT_BUCKETS]; 2] {
+        self.accumulators[self.index].psqt
+    }
+
+    /// Forward pass through the dense layers (SIMD-accelerated),
+    /// plus the additive PSQT head (`stm − ntm`, selected bucket).
     fn forward(&self, pos: &Position) -> i32 {
         let stm = pos.side_to_move;
         let acc = &self.accumulators[self.index];
+        let threat_acc = &self.threat_acc[self.index];
         let bucket = output_bucket(pos);
 
         // Use threat accumulator (incrementally updated or full recomputed)
-        let threats = &self.threat_acc[self.index].values;
+        let threats = &threat_acc.values;
         let l3_out = unsafe { kernels::dispatch::forward_dense(acc, threats, stm, bucket) };
 
-        (l3_out * NETWORK_SCALE as f32) as i32
+        let stm_i = stm.index();
+        let ntm_i = (!stm).index();
+        let psqt_raw = (acc.psqt[stm_i][bucket] + threat_acc.psqt[stm_i][bucket])
+            - (acc.psqt[ntm_i][bucket] + threat_acc.psqt[ntm_i][bucket]);
+        let psqt = psqt_raw as f32 / PSQT_QUANT as f32;
+
+        ((l3_out + psqt) * NETWORK_SCALE as f32) as i32
     }
 }
 
@@ -320,12 +445,20 @@ impl Clone for Network {
 // Output bucket selection
 // ============================================================
 
-/// Select the output bucket based on the number of pieces on the board.
-fn output_bucket(pos: &Position) -> usize {
-    let count = pos.occupied().count_ones() as usize;
-    debug_assert!((2..=32).contains(&count),
-        "output_bucket: piece count {} out of range", count);
-    let bucket = OUTPUT_BUCKET_MAP[count.min(32)];
+/// Select the output bucket from the material value on the board
+/// (see `OUTPUT_BUCKET_SCHEME`).
+pub fn output_bucket(pos: &Position) -> usize {
+    let [wn, wb, wr, wq, div, max] = OUTPUT_BUCKET_SCHEME;
+    let knights = (pos.pieces[Piece::WHITE_KNIGHT.index()]
+        | pos.pieces[Piece::BLACK_KNIGHT.index()]).count_ones() as usize;
+    let bishops = (pos.pieces[Piece::WHITE_BISHOP.index()]
+        | pos.pieces[Piece::BLACK_BISHOP.index()]).count_ones() as usize;
+    let rooks = (pos.pieces[Piece::WHITE_ROOK.index()]
+        | pos.pieces[Piece::BLACK_ROOK.index()]).count_ones() as usize;
+    let queens = (pos.pieces[Piece::WHITE_QUEEN.index()]
+        | pos.pieces[Piece::BLACK_QUEEN.index()]).count_ones() as usize;
+    let value = wn * knights + wb * bishops + wr * rooks + wq * queens;
+    let bucket = (value / div).min(max);
     debug_assert!(bucket < OUTPUT_BUCKETS,
         "output_bucket: bucket {} >= OUTPUT_BUCKETS {}", bucket, OUTPUT_BUCKETS);
     bucket
@@ -346,6 +479,30 @@ mod tests {
         let net = Network::new();
         assert_eq!(net.index, 0);
         assert!(!net.accumulators.is_empty());
+    }
+
+    /// Pins the material-value bucket scheme on known positions; the trainer
+    /// pins the SAME expectations on its side (tools/trainer6/src/outputs.rs).
+    #[test]
+    fn the_output_bucket_follows_material_value_not_piece_count() {
+        let cases = [
+            // startpos: (3*4 + 4*4 + 8*4 + 18*2) / 12 = 96/12 = 8 → capped at 7
+            ("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1", 7),
+            // bare kings (pawns and kings are worth 0)
+            ("4k3/8/8/8/8/8/8/4K3 w - - 0 1", 0),
+            // king + 8 pawns each: still bucket 0
+            ("4k3/pppppppp/8/8/8/8/PPPPPPPP/4K3 w - - 0 1", 0),
+            // KRvK: 8/12 = 0
+            ("4k3/8/8/8/8/8/8/R3K3 w - - 0 1", 0),
+            // KQvKQ: 36/12 = 3
+            ("3qk3/8/8/8/8/8/8/3QK3 w - - 0 1", 3),
+            // KRRvKRR: 32/12 = 2
+            ("r3k2r/8/8/8/8/8/8/R3K2R w - - 0 1", 2),
+        ];
+        for (fen, want) in cases {
+            let pos = Position::from_fen(fen).unwrap();
+            assert_eq!(output_bucket(&pos), want, "{fen}");
+        }
     }
 
     #[test]
@@ -544,7 +701,7 @@ mod tests {
         // O-O: White kingside castling
         assert_incremental_matches_refresh(
             "r3k2r/pppppppp/8/8/8/8/PPPPPPPP/R3K2R w KQkq - 0 1",
-            Move::new_with_type(Square::E1, Square::G1, MT_CASTLING),
+            Move::new_with_type(Square::E1, Square::H1, MT_CASTLING),
             "O-O kingside",
         );
     }
@@ -554,7 +711,7 @@ mod tests {
         // O-O-O: White queenside castling
         assert_incremental_matches_refresh(
             "r3k2r/pppppppp/8/8/8/8/PPPPPPPP/R3K2R w KQkq - 0 1",
-            Move::new_with_type(Square::E1, Square::C1, MT_CASTLING),
+            Move::new_with_type(Square::E1, Square::A1, MT_CASTLING),
             "O-O-O queenside",
         );
     }
@@ -564,7 +721,7 @@ mod tests {
         // Black O-O
         assert_incremental_matches_refresh(
             "r3k2r/pppppppp/8/8/8/8/PPPPPPPP/R3K2R b KQkq - 0 1",
-            Move::new_with_type(Square::E8, Square::G8, MT_CASTLING),
+            Move::new_with_type(Square::E8, Square::H8, MT_CASTLING),
             "Black O-O",
         );
     }
@@ -574,8 +731,26 @@ mod tests {
         // Black O-O-O
         assert_incremental_matches_refresh(
             "r3k2r/pppppppp/8/8/8/8/PPPPPPPP/R3K2R b KQkq - 0 1",
-            Move::new_with_type(Square::E8, Square::C8, MT_CASTLING),
+            Move::new_with_type(Square::E8, Square::A8, MT_CASTLING),
             "Black O-O-O",
+        );
+    }
+
+    #[test]
+    fn test_incremental_castling_frc_swap() {
+        assert_incremental_matches_refresh(
+            "4k3/8/8/8/8/8/8/5KR1 w K - 0 1",
+            Move::new_with_type(Square::F1, Square::G1, MT_CASTLING),
+            "FRC king/rook swap O-O",
+        );
+    }
+
+    #[test]
+    fn test_incremental_castling_king_already_on_g() {
+        assert_incremental_matches_refresh(
+            "4k3/8/8/8/8/8/8/6KR w K - 0 1",
+            Move::new_with_type(Square::G1, Square::H1, MT_CASTLING),
+            "FRC king already on g1",
         );
     }
 

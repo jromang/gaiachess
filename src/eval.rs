@@ -218,6 +218,31 @@ pub(crate) const MG_TABLE: [[i32; 64]; 12] = TABLES.0;
 /// Combined EG piece-square table: `EG_TABLE[piece][square]`.
 pub(crate) const EG_TABLE: [[i32; 64]; 12] = TABLES.1;
 
+/// The combined tables with the side's sign folded in: White entries as they are,
+/// Black entries negated. The incremental update adds and subtracts these directly,
+/// instead of deriving a sign from the piece and multiplying by it on every move.
+const fn build_signed(t: &[[i32; 64]; 12]) -> [[i32; 64]; 12] {
+    let mut out = [[0i32; 64]; 12];
+    let mut pc = 0;
+    while pc < 12 {
+        // Piece = type * 2 + colour, White = 0.
+        let sign = if pc % 2 == 0 { 1 } else { -1 };
+        let mut sq = 0;
+        while sq < 64 {
+            out[pc][sq] = sign * t[pc][sq];
+            sq += 1;
+        }
+        pc += 1;
+    }
+    out
+}
+
+/// `MG_TABLE` with the side's sign applied (White positive, Black negative).
+pub(crate) static MG_SIGNED: [[i32; 64]; 12] = build_signed(&TABLES.0);
+
+/// `EG_TABLE` with the side's sign applied (White positive, Black negative).
+pub(crate) static EG_SIGNED: [[i32; 64]; 12] = build_signed(&TABLES.1);
+
 /// Dark squares bitmask (A1, C1, E1, G1, B2, D2, F2, H2, ...).
 /// In LERF: rank 1 = 0x55 (A1=dark), rank 2 = 0xAA (B2=dark), alternating.
 const DARK_SQUARES: u64 = 0xAA55_AA55_AA55_AA55;

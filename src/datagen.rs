@@ -32,12 +32,17 @@ use crate::see;
 // Datagen configuration
 // ============================================================
 
+/// Standard chess starting position.
+const STARTPOS: &str = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
+
 /// Configuration for data generation.
 struct DatagenConfig {
     /// Search depth for each move during self-play.
     depth: i32,
     /// Soft node limit (0 = no limit, use depth only).
     soft_nodes: u64,
+    /// Percentage of games started from a random DFRC position (0 = standard chess only).
+    dfrc_pct: u32,
     /// Number of random opening moves (per side).
     random_moves: usize,
     /// Maximum |eval| to accept opening position.
@@ -57,6 +62,7 @@ impl Default for DatagenConfig {
         DatagenConfig {
             depth: 8,
             soft_nodes: 5000,
+            dfrc_pct: 0,
             random_moves: 8,
             max_opening_eval: 1000,
             win_adj_score: 2500,
@@ -81,6 +87,12 @@ static EXPLOSIONS: AtomicU64 = AtomicU64::new(0);
 static TB_ADJUDICATIONS: AtomicU64 = AtomicU64::new(0);
 /// Max explosion FENs to collect (avoid unbounded memory).
 const MAX_EXPLOSION_FENS: usize = 50;
+/// How often a non-interactive run states where it is. Long enough to stay quiet in a
+/// log kept for days, short enough that a watcher sees movement.
+const PROGRESS_LINE_SECONDS: u64 = 60;
+/// How long a worker may hold finished games in its buffer. A campaign runs for days
+/// and must survive a reboot with at most a minute of each thread's work lost.
+const FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Simple xorshift64 RNG.
 struct Rng(u64);
@@ -101,6 +113,92 @@ impl Rng {
     fn next_usize(&mut self, n: usize) -> usize {
         (self.next_u64() % n as u64) as usize
     }
+}
+
+/// Derive a worker's seed from the run seed, so that two runs of the same command
+/// with different seeds play different games. Seeding from the thread id alone made
+/// every re-run replay the first one, silently duplicating appended data.
+fn seed_for_thread(run_seed: u64, thread_id: usize) -> u64 {
+    // SplitMix64 finaliser: neighbouring run seeds must not give correlated streams.
+    let mut z = run_seed.wrapping_add((thread_id as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+// ============================================================
+// DFRC starting positions
+// ============================================================
+
+/// The ten ways to place two knights on five squares, as (lower, higher) indices.
+const KNIGHT_PLACEMENTS: [(usize, usize); 10] = [
+    (0, 1), (0, 2), (0, 3), (0, 4), (1, 2),
+    (1, 3), (1, 4), (2, 3), (2, 4), (3, 4),
+];
+
+/// Put `piece` on the `n`-th still-empty square of a back rank.
+fn place_nth_free(rank: &mut [u8; 8], n: usize, piece: u8) {
+    let mut seen = 0;
+    for sq in rank.iter_mut() {
+        if *sq == 0 {
+            if seen == n {
+                *sq = piece;
+                return;
+            }
+            seen += 1;
+        }
+    }
+    debug_assert!(false, "place_nth_free: no {n}-th free square left");
+}
+
+/// Back rank for a Chess960 position number, in Scharnagl's numbering (0..960).
+fn scharnagl_back_rank(id: usize) -> [u8; 8] {
+    debug_assert!(id < 960, "chess960 id {id} out of range");
+    let mut rank = [0u8; 8];
+    let mut n = id;
+
+    // The bishops go first, one on a light square and one on a dark one, which is
+    // what makes the remaining placements a plain mixed-radix decomposition of `id`.
+    rank[2 * (n % 4) + 1] = b'B';
+    n /= 4;
+    rank[2 * (n % 4)] = b'B';
+    n /= 4;
+
+    place_nth_free(&mut rank, n % 6, b'Q');
+    n /= 6;
+
+    // Placing the higher-indexed knight first leaves the lower index still valid.
+    let (k1, k2) = KNIGHT_PLACEMENTS[n];
+    place_nth_free(&mut rank, k2, b'N');
+    place_nth_free(&mut rank, k1, b'N');
+
+    // Three squares are left, and the king must stand between the rooks.
+    for piece in [b'R', b'K', b'R'] {
+        place_nth_free(&mut rank, 0, piece);
+    }
+
+    rank
+}
+
+/// A random DFRC starting position: each side gets its own back rank, so the two
+/// kings need not face each other. Castling rights are written in Shredder notation
+/// (the rook's file), the only form that survives asymmetric back ranks.
+fn dfrc_start_fen(rng: &mut Rng) -> String {
+    let white = scharnagl_back_rank(rng.next_usize(960));
+    let black = scharnagl_back_rank(rng.next_usize(960));
+
+    let mut castling = String::with_capacity(4);
+    for (rank, first) in [(&white, b'A'), (&black, b'a')] {
+        let files: Vec<usize> = (0..8).filter(|&f| rank[f] == b'R').collect();
+        debug_assert_eq!(files.len(), 2, "a back rank has exactly two rooks");
+        // King-side rook first, matching the K-before-Q order of a classic FEN.
+        castling.push((first + files[1] as u8) as char);
+        castling.push((first + files[0] as u8) as char);
+    }
+
+    let black_rank: String = black.iter().map(|&c| c.to_ascii_lowercase() as char).collect();
+    let white_rank: String = white.iter().map(|&c| c as char).collect();
+    format!("{black_rank}/pppppppp/8/8/8/8/PPPPPPPP/{white_rank} w {castling} - 0 1")
 }
 
 /// Prepare a ThreadData for datagen search.
@@ -175,16 +273,8 @@ fn to_viri_move(m: Move, pos: &Position) -> ViriMove {
                 // Corrupted move type — treat as normal move
                 ViriMove::new(from, to)
             } else {
-                // Viriformat expects to = rook square (Chess960 convention)
-                let rook_sq = match m.to_sq().0 {
-                    6  => 7,  // g1 → h1 (O-O white)
-                    2  => 0,  // c1 → a1 (O-O-O white)
-                    62 => 63, // g8 → h8 (O-O black)
-                    58 => 56, // c8 → a8 (O-O-O black)
-                    s  => s,
-                };
-                let rook_to = unsafe { ViriSquare::new_unchecked(rook_sq) };
-                ViriMove::new_with_flags(from, rook_to, MoveFlags::Castle)
+                // Viriformat expects to = rook square, which is now the encoding.
+                ViriMove::new_with_flags(from, to, MoveFlags::Castle)
             }
         }
         _ => ViriMove::new(from, to),
@@ -214,22 +304,20 @@ fn play_game(
     explosion_fens: &Mutex<Vec<String>>,
 ) -> Option<Game> {
     // Phase 1: Opening position
-    let mut pos = if let Some(lines) = book {
-        // Pick a random line from the opening book + random moves for diversity
-        let idx = rng.next_usize(lines.len());
-        let mut p = match Position::from_fen(&lines[idx]) {
-            Ok(p) => p,
-            Err(_) => return None,
+    let mut pos = {
+        // A run with any DFRC in it writes every game in Shredder notation: viriformat's
+        // parser is switched globally, and once switched it rejects "KQkq" outright.
+        let shredder = config.dfrc_pct > 0;
+        let dfrc = shredder && rng.next_usize(100) < config.dfrc_pct as usize;
+        let parsed = if dfrc {
+            Position::from_fen_ex(&dfrc_start_fen(rng), true)
+        } else if let Some(lines) = book {
+            // Pick a random line from the opening book + random moves for diversity
+            Position::from_fen_ex(&lines[rng.next_usize(lines.len())], shredder)
+        } else {
+            Position::from_fen_ex(STARTPOS, shredder)
         };
-        let num_random = config.random_moves + (rng.next_u64() & 1) as usize;
-        if !apply_random_moves(&mut p, num_random, rng) {
-            return None;
-        }
-        p
-    } else {
-        // No book: startpos + random moves
-        let mut p = Position::from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1")
-            .expect("startpos");
+        let Ok(mut p) = parsed else { return None };
         let num_random = config.random_moves + (rng.next_u64() & 1) as usize;
         if !apply_random_moves(&mut p, num_random, rng) {
             return None;
@@ -470,6 +558,7 @@ fn format_finish_time(eta_secs: u64) -> String {
 #[allow(clippy::too_many_arguments)]
 fn worker(
     thread_id: usize,
+    run_seed: u64,
     target_positions: u64,
     existing_positions: u64,
     config: &DatagenConfig,
@@ -484,13 +573,14 @@ fn worker(
         .open(format!("{output_path}.{thread_id}"))
         .expect("failed to open output file");
     let mut writer = BufWriter::with_capacity(1 << 20, file); // 1MB buffer
+    let mut last_flush = Instant::now();
 
-    let mut rng = Rng::new(thread_id as u64 * 6364136223846793005 + 1442695040888963407);
+    let mut rng = Rng::new(seed_for_thread(run_seed, thread_id));
 
     // Each side gets its own TT (1MB) and ThreadData
     // Small TT = more diverse positions (limits cached-knowledge reuse)
-    let mut shared_white = SharedState::new(1);
-    let mut shared_black = SharedState::new(1);
+    let mut shared_white = SharedState::new(1, 1);
+    let mut shared_black = SharedState::new(1, 1);
     // id=1 suppresses UCI info output (only id=0 prints)
     // Box<ThreadData> to keep ~177 KB each off the stack (prevents stack overflow
     // when combined with search recursion's ~400 KB of MovePicker frames).
@@ -515,6 +605,14 @@ fn worker(
 
         game.serialise_into(&mut writer).expect("write failed");
 
+        // The 1 MiB buffer holds thousands of positions, and on a slow configuration it
+        // can take hours to fill — hours a power cut would destroy. Flushing on a timer
+        // bounds the loss to a minute of work per thread, at one syscall a minute.
+        if last_flush.elapsed() >= FLUSH_INTERVAL {
+            writer.flush().expect("flush failed");
+            last_flush = Instant::now();
+        }
+
         let n = game.len() as u64;
 
         pb.inc(n);
@@ -534,9 +632,10 @@ fn worker(
             ));
         }
 
-        // Clear TTs and histories every game to prevent pollution
-        shared_white.tt.clear();
-        shared_black.tt.clear();
+        // Clear shared state (TT and correction histories) and per-thread histories
+        // every game to prevent pollution
+        shared_white.clear();
+        shared_black.clear();
         td_white.clear_histories();
         td_black.clear_histories();
     }
@@ -549,11 +648,18 @@ fn worker(
 // ============================================================
 
 /// Run datagen: `gaiachess datagen --threads 12 --positions 10000000 --depth 8`
+///
+/// `seed` is the run seed (None = derive one from the clock); `dfrc_pct` is the
+/// percentage of games started from a random DFRC position; `assume_yes` skips the
+/// confirmation prompt when the output files already exist.
 pub fn run(
     threads: usize,
     target_positions: u64,
     depth: i32,
     soft_nodes: u64,
+    dfrc_pct: u32,
+    seed: Option<u64>,
+    assume_yes: bool,
     output: &str,
     book_path: Option<&str>,
 ) {
@@ -561,6 +667,22 @@ pub fn run(
         0 => std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1),
         n => n,
     };
+
+    assert!(dfrc_pct <= 100, "--dfrc takes a percentage, got {dfrc_pct}");
+
+    // Reproducibility: the seed is printed below, and re-running with it replays the run.
+    let run_seed = seed.unwrap_or_else(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0x2545_F491_4F6C_DD1D, |d| d.as_nanos() as u64)
+    });
+
+    // Shredder castling is a global switch in viriformat, so it is set for the whole
+    // run: with it off the DFRC games would not parse, with it on the standard ones
+    // are written as "HAha" instead of "KQkq" — the same rooks either way.
+    if dfrc_pct > 0 {
+        viriformat::chess::CHESS960.store(true, Ordering::SeqCst);
+    }
 
     // Load opening book if provided
     let book: Option<Arc<Vec<String>>> = book_path.map(|path| {
@@ -582,6 +704,7 @@ pub fn run(
     let config = DatagenConfig {
         depth,
         soft_nodes,
+        dfrc_pct,
         ..DatagenConfig::default()
     };
 
@@ -603,6 +726,10 @@ pub fn run(
     } else {
         eprintln!("  Depth:      {depth}");
     }
+    if dfrc_pct > 0 {
+        eprintln!("  DFRC:       {dfrc_pct}% of games (Shredder castling notation)");
+    }
+    eprintln!("  Seed:       {run_seed}");
     eprintln!("  Output:     {output}.*");
     if book.is_none() {
         eprintln!("  Book:       none (random openings)");
@@ -635,7 +762,7 @@ pub fn run(
         }
         if !existing.is_empty() {
             let positions: u64 = existing.iter()
-                .map(|f| std::fs::metadata(f).map(|m| m.len() / 32).unwrap_or(0))
+                .map(|f| count_positions(f))
                 .sum();
             eprintln!("WARNING: output files already exist:");
             for f in &existing {
@@ -644,12 +771,16 @@ pub fn run(
                 eprintln!("  {f} ({:.1} MB, ~{pos} positions)", size as f64 / (1024.0 * 1024.0));
             }
             eprintln!("  Total: {positions} existing positions");
-            eprint!("New data will be APPENDED (target: {target_positions}). Continue? [y/N] ");
-            let mut answer = String::new();
-            std::io::stdin().read_line(&mut answer).expect("failed to read stdin");
-            if !answer.trim().eq_ignore_ascii_case("y") {
-                eprintln!("Aborted.");
-                return;
+            if assume_yes {
+                eprintln!("New data will be APPENDED (target: {target_positions}). Continuing (--yes).");
+            } else {
+                eprint!("New data will be APPENDED (target: {target_positions}). Continue? [y/N] ");
+                let mut answer = String::new();
+                std::io::stdin().read_line(&mut answer).expect("failed to read stdin");
+                if !answer.trim().eq_ignore_ascii_case("y") {
+                    eprintln!("Aborted.");
+                    return;
+                }
             }
             eprintln!();
             positions
@@ -688,6 +819,38 @@ pub fn run(
 
     // Launch worker threads
     std::thread::scope(|s| {
+        // indicatif draws nothing when stderr is not a terminal, so a run whose output
+        // is redirected — every unattended one — reports no progress at all for days.
+        // A plain line now and then is greppable, costs nothing, and keeps the shape
+        // `done/total (…)` that readers already parse.
+        if !std::io::IsTerminal::is_terminal(&std::io::stderr()) {
+            let pb = &pb;
+            std::thread::Builder::new()
+                .spawn_scoped(s, move || {
+                    while !DATAGEN_STOP.load(Ordering::Relaxed)
+                        && pb.position() < target_positions
+                    {
+                        std::thread::sleep(std::time::Duration::from_secs(
+                            PROGRESS_LINE_SECONDS,
+                        ));
+                        let done = pb.position();
+                        let elapsed = pb.elapsed().as_secs_f64();
+                        let new_pos = done.saturating_sub(existing_positions);
+                        let rate = if elapsed > 0.0 { new_pos as f64 / elapsed } else { 0.0 };
+                        let remaining = target_positions.saturating_sub(done);
+                        let eta = if rate > 0.0 { (remaining as f64 / rate) as u64 } else { 0 };
+                        eprintln!(
+                            "progress: {done}/{target_positions} ({:.1}%, {rate:.0} pos/s, \
+                             ETA {}, {} games)",
+                            100.0 * done as f64 / target_positions as f64,
+                            format_duration(eta),
+                            GAMES_PLAYED.load(Ordering::Relaxed),
+                        );
+                    }
+                })
+                .expect("failed to spawn datagen reporter");
+        }
+
         for thread_id in 0..num_threads {
             let config = &config;
             let pb = &pb;
@@ -696,7 +859,7 @@ pub fn run(
             std::thread::Builder::new()
                 .stack_size(32 * 1024 * 1024) // 32 MB (PGO inlining enlarges frames)
                 .spawn_scoped(s, move || {
-                    worker(thread_id, target_positions, existing_positions, config, book_ref, output, pb, explosion_fens);
+                    worker(thread_id, run_seed, target_positions, existing_positions, config, book_ref, output, pb, explosion_fens);
                 })
                 .expect("failed to spawn datagen worker");
         }
@@ -757,6 +920,35 @@ pub fn run(
     }
 }
 
+/// Count the positions a viriformat file actually holds.
+///
+/// Not `len() / 32`, which is what this used to do: 32 is the size of a game's *header*,
+/// while a position costs four bytes. The estimate was therefore about seven times too
+/// low, and a resumed run believed it had barely started — generating far past its
+/// target. Games are self-delimiting, so counting them exactly is a single pass.
+fn count_positions(path: &str) -> u64 {
+    // The marlinformat header is not re-exported, so its size is pinned here and
+    // checked against a real file by the test below.
+    const HEADER: usize = 32;
+    const MOVE_SIZE: usize = 4;
+
+    let Ok(file) = std::fs::File::open(path) else { return 0 };
+    let mut reader = std::io::BufReader::with_capacity(1 << 20, file);
+    let mut buffer = Vec::new();
+    let mut total = 0u64;
+    loop {
+        buffer.clear();
+        // A truncated tail — a run killed mid-write — simply ends the count.
+        if Game::deserialise_fast_into_buffer(&mut reader, &mut buffer).is_err() {
+            break;
+        }
+        // The trailing null terminator is not a position.
+        let moves = buffer.len().saturating_sub(HEADER) / MOVE_SIZE;
+        total += moves.saturating_sub(1) as u64;
+    }
+    total
+}
+
 /// Merge per-thread output files into a single .vf file.
 fn merge_files(base: &str, num_threads: usize) {
     let dst_path = format!("{base}.vf");
@@ -778,6 +970,97 @@ fn merge_files(base: &str, num_threads: usize) {
 
     dst.flush().expect("merge: flush failed");
     eprintln!("  Output: {dst_path}");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The header size is pinned by hand because marlinformat does not export it.
+    /// A position costs four bytes, not thirty-two: reading the header size as the
+    /// position size made the resume counter seven times too low.
+    #[test]
+    fn a_position_costs_four_bytes_not_thirty_two() {
+        let path = "data/mini.vf";
+        if !std::path::Path::new(path).exists() {
+            return; // the corpus is not in git
+        }
+        let counted = count_positions(path);
+        let bytes = std::fs::metadata(path).unwrap().len();
+        assert!(counted > 0, "no game read from {path}");
+        assert!(
+            counted > bytes / 8 && counted < bytes / 2,
+            "{counted} positions for {bytes} bytes is not ~4 bytes each"
+        );
+    }
+
+    #[test]
+    fn scharnagl_518_is_the_standard_back_rank() {
+        assert_eq!(&scharnagl_back_rank(518), b"RNBQKBNR");
+    }
+
+    /// Every position number must yield a legal Chess960 back rank: the king between
+    /// its two rooks, and the bishops on squares of opposite colour.
+    #[test]
+    fn every_chess960_id_is_a_legal_back_rank() {
+        for id in 0..960 {
+            let rank = scharnagl_back_rank(id);
+            let file_of = |p: u8| rank.iter().position(|&c| c == p).unwrap();
+
+            let mut sorted = rank;
+            sorted.sort_unstable();
+            assert_eq!(&sorted, b"BBKNNQRR", "id {id} has the wrong pieces");
+
+            let rooks: Vec<usize> = (0..8).filter(|&f| rank[f] == b'R').collect();
+            let king = file_of(b'K');
+            assert!(rooks[0] < king && king < rooks[1], "id {id}: king outside its rooks");
+
+            let bishops: Vec<usize> = (0..8).filter(|&f| rank[f] == b'B').collect();
+            assert_ne!(bishops[0] % 2, bishops[1] % 2, "id {id}: bishops on one colour");
+        }
+    }
+
+    /// The generated FEN has to survive the engine's own parser, and come back out
+    /// unchanged — that round trip is what viriformat will later be handed.
+    #[test]
+    fn dfrc_start_positions_round_trip_through_fen() {
+        let mut rng = Rng::new(0xD1CE);
+        for _ in 0..200 {
+            let fen = dfrc_start_fen(&mut rng);
+            let pos = Position::from_fen_ex(&fen, true)
+                .unwrap_or_else(|e| panic!("{fen} rejected: {e:?}"));
+            assert_eq!(pos.to_fen(), fen);
+            assert_eq!(pos.castling_rights, ALL_CASTLING);
+        }
+    }
+
+    /// Standard chess is position 518 on both sides, and must come out as the ordinary
+    /// starting position written in Shredder notation.
+    #[test]
+    fn the_standard_position_is_reachable_as_dfrc() {
+        let rank = scharnagl_back_rank(518);
+        let white: String = rank.iter().map(|&c| c as char).collect();
+        assert_eq!(white, "RNBQKBNR");
+        let pos = Position::from_fen_ex(STARTPOS, true).unwrap();
+        assert_eq!(
+            pos.to_fen(),
+            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w HAha - 0 1"
+        );
+    }
+
+    /// Two runs differing only by their seed must not replay the same games.
+    #[test]
+    fn the_run_seed_changes_every_worker_stream() {
+        for thread_id in 0..8 {
+            assert_ne!(seed_for_thread(1, thread_id), seed_for_thread(2, thread_id));
+        }
+        // And within a run, workers must not share a stream either.
+        let seeds: Vec<u64> = (0..32).map(|t| seed_for_thread(42, t)).collect();
+        let mut sorted = seeds.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), seeds.len());
+    }
 }
 
 /// Set up graceful shutdown on Ctrl+C (SIGINT) and stdin "stop"/"quit".

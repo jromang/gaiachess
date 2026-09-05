@@ -1,10 +1,10 @@
 //! NNUE forward pass: NNZ extraction + per-stage entry points.
 //!
 //! Pipeline per evaluation:
-//!   1. `threats::compute_full_threats(pos)` — filtered threat features (41,272),
-//!      loaded as i8 weight rows → i16 buffer[640][2 perspectives]
-//!   2. `activate_ft(pst_acc, threats)` — element-wise PST + threats,
-//!      within-side pairwise product (i16 → u8[640])
+//!   1. `threats::compute_full_threats(pos)` — pawn pairs + pairwise threats,
+//!      loaded as i8 weight rows → i16 buffer[L1][2 perspectives]
+//!   2. `activate_ft(pst_acc, threats)` — element-wise PST + aux,
+//!      within-side pairwise product (i16 → u8[L1])
 //!   3. `find_nnz` — extract non-zero 4-byte group indices for sparse L1
 //!   4. `propagate_l1` — sparse u8 × i8 → i32, dequant, CReLU+squared → f32[32]
 //!   5. `propagate_l2` — dense f32 FMA + squared → f32[32]
@@ -131,7 +131,7 @@ pub unsafe fn find_nnz_compress512(
     let mut count = 0;
 
     // Process 32 i32 groups per iteration (2 × 16-lane nnz_bitmask = 32-bit mask).
-    // L1_SIZE / (4 * 32) = 640 / 128 = 5 iterations exactly.
+    // L1_SIZE / (4 * 32) = 1024 / 128 = 8 iterations exactly.
     let increment = _mm512_set1_epi16(32);
     let mut base = _mm512_set_epi16(
         31, 30, 29, 28, 27, 26, 25, 24, 23, 22, 21, 20, 19, 18, 17, 16,
@@ -424,7 +424,7 @@ mod tests {
     #[test]
     fn test_compute_full_threats_kk_endgame() {
         let pos = crate::position::Position::from_fen("4k3/8/8/8/8/8/8/4K3 w - - 0 1").unwrap();
-        let combined = threats::compute_full_threats(&pos);
+        let (combined, _psqt) = threats::compute_full_threats(&pos);
         // With zeroed weights the buffer should be all zeros.
         for pov in 0..2 {
             for i in 0..L1_SIZE {
@@ -439,7 +439,7 @@ mod tests {
         let pos = crate::position::Position::from_fen(
             "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
         ).unwrap();
-        let combined = threats::compute_full_threats(&pos);
+        let (combined, _psqt) = threats::compute_full_threats(&pos);
 
         if !crate::nnue::network::has_network() {
             // Nothing embedded, so every weight is zero and so is every sum.

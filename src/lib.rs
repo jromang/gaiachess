@@ -42,6 +42,7 @@ pub mod tree;
 #[cfg(any(feature = "stats", feature = "tree"))]
 pub mod dump;
 pub mod threads;
+pub mod shm;
 pub mod bench;
 pub mod bench_stats;
 #[cfg(feature = "datagen")]

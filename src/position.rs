@@ -195,6 +195,16 @@ pub struct Position {
 
     pub side_to_move: Color,
     pub castling_rights: u8,
+    /// When set, UCI/FEN use Shredder encoding (king-captures-rook / file letters).
+    pub chess960: bool,
+    /// Starting square of the castling rook, indexed by [`castling_idx`].
+    pub castling_rook: [Square; CASTLING_NB],
+    /// Squares that must be empty for each right (origins excluded).
+    pub castling_path: [u64; CASTLING_NB],
+    /// Squares the king occupies or crosses (must not be attacked).
+    pub castling_king_path: [u64; CASTLING_NB],
+    /// Rights that survive a move from/to each square.
+    pub castling_rights_mask: [u8; 64],
     pub ep_square: Square,
     pub halfmove_clock: u8,
     pub fullmove_number: u16,
@@ -261,6 +271,135 @@ impl Position {
     #[inline(always)]
     pub fn king_sq(&self, c: Color) -> Square {
         lsb(self.pieces[Piece::new(PieceType::King, c).index()])
+    }
+
+    /// Switch UCI/FEN castling encoding without touching the board.
+    #[inline]
+    pub fn set_chess960(&mut self, on: bool) {
+        self.chess960 = on;
+    }
+
+    #[inline(always)]
+    pub fn castle_rook_sq(&self, right: u8) -> Square {
+        debug_assert!(right == WHITE_OO || right == WHITE_OOO || right == BLACK_OO || right == BLACK_OOO);
+        self.castling_rook[castling_idx(right)]
+    }
+
+    fn back_rank(us: Color) -> u8 {
+        match us {
+            Color::White => 0,
+            Color::Black => 7,
+        }
+    }
+
+    fn set_castling_from_token(
+        &mut self, us: Color, kingside: bool, rook_file: Option<u8>,
+    ) -> Result<(), FenParseError> {
+        let king_bb = self.pieces[Piece::new(PieceType::King, us).index()];
+        if king_bb == 0 {
+            let color = if us == Color::White { "white" } else { "black" };
+            return Err(FenParseError::InvalidKingCount { color, count: 0 });
+        }
+        let king = self.king_sq(us);
+        let rank = Self::back_rank(us);
+        if king.rank() != rank {
+            return Err(FenParseError::CastlingRightsIncoherent {
+                detail: "castling king is not on its back rank",
+            });
+        }
+        let rook_sq = if let Some(file) = rook_file {
+            Square::new(file, rank)
+        } else {
+            match self.outermost_rook(us, kingside, king) {
+                Some(sq) => sq,
+                None => {
+                    return Err(FenParseError::CastlingRightsIncoherent {
+                        detail: "castling right with no rook on the back rank",
+                    });
+                }
+            }
+        };
+        let rook = Piece::new(PieceType::Rook, us);
+        if self.board[rook_sq.index()] != rook {
+            return Err(FenParseError::CastlingRightsIncoherent {
+                detail: "castling file does not hold a friendly rook",
+            });
+        }
+        if rook_file.is_some() && rook_sq.file() == king.file() {
+            return Err(FenParseError::CastlingRightsIncoherent {
+                detail: "castling rook file overlaps the king",
+            });
+        }
+        self.set_castling_right(us, rook_sq);
+        Ok(())
+    }
+
+    fn set_castling_from_file(&mut self, us: Color, file: u8) -> Result<(), FenParseError> {
+        debug_assert!(file < 8);
+        let king_bb = self.pieces[Piece::new(PieceType::King, us).index()];
+        if king_bb == 0 {
+            let color = if us == Color::White { "white" } else { "black" };
+            return Err(FenParseError::InvalidKingCount { color, count: 0 });
+        }
+        let king = self.king_sq(us);
+        if file == king.file() {
+            return Err(FenParseError::CastlingRightsIncoherent {
+                detail: "castling rook file overlaps the king",
+            });
+        }
+        let kingside = file > king.file();
+        self.set_castling_from_token(us, kingside, Some(file))
+    }
+
+    fn outermost_rook(&self, us: Color, kingside: bool, king: Square) -> Option<Square> {
+        let rank = Self::back_rank(us);
+        let rook = Piece::new(PieceType::Rook, us);
+        if kingside {
+            let mut file = 7u8;
+            while file > king.file() {
+                let sq = Square::new(file, rank);
+                if self.board[sq.index()] == rook {
+                    return Some(sq);
+                }
+                file -= 1;
+            }
+        } else {
+            let mut file = 0u8;
+            while file < king.file() {
+                let sq = Square::new(file, rank);
+                if self.board[sq.index()] == rook {
+                    return Some(sq);
+                }
+                file += 1;
+            }
+        }
+        None
+    }
+
+    fn set_castling_right(&mut self, us: Color, rook_from: Square) {
+        let king_from = self.king_sq(us);
+        debug_assert!(king_from.rank() == rook_from.rank());
+        debug_assert!(king_from.file() != rook_from.file());
+        let kingside = rook_from.file() > king_from.file();
+        let cr = match (us, kingside) {
+            (Color::White, true) => WHITE_OO,
+            (Color::White, false) => WHITE_OOO,
+            (Color::Black, true) => BLACK_OO,
+            (Color::Black, false) => BLACK_OOO,
+        };
+        let idx = castling_idx(cr);
+        let rank = king_from.rank();
+        let king_to = Square::new(if kingside { 6 } else { 2 }, rank);
+        let rook_to = Square::new(if kingside { 5 } else { 3 }, rank);
+
+        self.castling_rights |= cr;
+        self.castling_rook[idx] = rook_from;
+        self.castling_path[idx] = (between_bb(king_from, king_to) | between_bb(rook_from, rook_to))
+            & !king_from.bb()
+            & !rook_from.bb();
+        self.castling_king_path[idx] = between_bb(king_from, king_to) | king_from.bb();
+        self.castling_rights_mask[king_from.index()] &= !cr;
+        self.castling_rights_mask[rook_from.index()] &= !cr;
     }
 
     #[allow(dead_code)]
@@ -539,29 +678,26 @@ impl Position {
     /// Add a piece's PeSTO contribution (called from put_piece).
     #[inline(always)]
     fn psq_add(&mut self, pc: Piece, sq: Square) {
-        let sign = if pc.color() == Color::White { 1 } else { -1 };
-        self.psq_mg += sign * eval::MG_TABLE[pc.index()][sq.index()];
-        self.psq_eg += sign * eval::EG_TABLE[pc.index()][sq.index()];
+        self.psq_mg += eval::MG_SIGNED[pc.index()][sq.index()];
+        self.psq_eg += eval::EG_SIGNED[pc.index()][sq.index()];
         self.game_phase += eval::PHASE_INC[pc.piece_type() as usize];
     }
 
     /// Remove a piece's PeSTO contribution (called from remove_piece).
     #[inline(always)]
     fn psq_sub(&mut self, pc: Piece, sq: Square) {
-        let sign = if pc.color() == Color::White { 1 } else { -1 };
-        self.psq_mg -= sign * eval::MG_TABLE[pc.index()][sq.index()];
-        self.psq_eg -= sign * eval::EG_TABLE[pc.index()][sq.index()];
+        self.psq_mg -= eval::MG_SIGNED[pc.index()][sq.index()];
+        self.psq_eg -= eval::EG_SIGNED[pc.index()][sq.index()];
         self.game_phase -= eval::PHASE_INC[pc.piece_type() as usize];
     }
 
     /// Move a piece's PeSTO contribution (from → to).
     #[inline(always)]
     fn psq_move(&mut self, pc: Piece, from: Square, to: Square) {
-        let sign = if pc.color() == Color::White { 1 } else { -1 };
-        self.psq_mg += sign * (eval::MG_TABLE[pc.index()][to.index()]
-            - eval::MG_TABLE[pc.index()][from.index()]);
-        self.psq_eg += sign * (eval::EG_TABLE[pc.index()][to.index()]
-            - eval::EG_TABLE[pc.index()][from.index()]);
+        let mg = &eval::MG_SIGNED[pc.index()];
+        let eg = &eval::EG_SIGNED[pc.index()];
+        self.psq_mg += mg[to.index()] - mg[from.index()];
+        self.psq_eg += eg[to.index()] - eg[from.index()];
         // Phase unchanged (same piece type moving, not added/removed)
     }
 
@@ -602,6 +738,11 @@ impl Position {
     /// Parse a [FEN](https://www.chessprogramming.org/Forsyth-Edwards_Notation) string
     /// into a fully initialized position (with Zobrist keys, check info, and threats).
     pub fn from_fen(fen: &str) -> Result<Position, FenParseError> {
+        Self::from_fen_ex(fen, false)
+    }
+
+    /// Like [`from_fen`], and records whether UCI/FEN should use Chess960 encoding.
+    pub fn from_fen_ex(fen: &str, chess960: bool) -> Result<Position, FenParseError> {
         // Pre-filter: reject excessively long or non-ASCII input
         if fen.len() > 100 {
             return Err(FenParseError::TooLong { len: fen.len() });
@@ -616,6 +757,11 @@ impl Position {
             board: [Piece::NONE; 64],
             side_to_move: Color::White,
             castling_rights: 0,
+            chess960: false,
+            castling_rook: [Square::NONE; CASTLING_NB],
+            castling_path: [0; CASTLING_NB],
+            castling_king_path: [0; CASTLING_NB],
+            castling_rights_mask: [ALL_CASTLING; 64],
             ep_square: Square::NONE,
             halfmove_clock: 0,
             fullmove_number: 1,
@@ -687,14 +833,26 @@ impl Position {
             _ => return Err(FenParseError::InvalidSideToMove { found: parts[1].to_string() }),
         };
 
-        // 3. Castling rights
+        // 3. Castling rights (KQkq = outermost rook, A-H/a-h = Shredder file)
+        pos.chess960 = chess960;
         if parts[2] != "-" {
+            if parts[2].len() > 4 {
+                return Err(FenParseError::InvalidCastlingChar { ch: parts[2].chars().next().unwrap_or('?') });
+            }
             for ch in parts[2].chars() {
                 match ch {
-                    'K' => pos.castling_rights |= WHITE_OO,
-                    'Q' => pos.castling_rights |= WHITE_OOO,
-                    'k' => pos.castling_rights |= BLACK_OO,
-                    'q' => pos.castling_rights |= BLACK_OOO,
+                    'K' => pos.set_castling_from_token(Color::White, true, None)?,
+                    'Q' => pos.set_castling_from_token(Color::White, false, None)?,
+                    'k' => pos.set_castling_from_token(Color::Black, true, None)?,
+                    'q' => pos.set_castling_from_token(Color::Black, false, None)?,
+                    'A'..='H' => {
+                        let file = ch as u8 - b'A';
+                        pos.set_castling_from_file(Color::White, file)?;
+                    }
+                    'a'..='h' => {
+                        let file = ch as u8 - b'a';
+                        pos.set_castling_from_file(Color::Black, file)?;
+                    }
                     _ => return Err(FenParseError::InvalidCastlingChar { ch }),
                 }
             }
@@ -727,6 +885,17 @@ impl Position {
 
         // 7. Validate position legality (release-mode checks)
         pos.validate_legality()?;
+
+        // 8. Keep the en passant square only where a pawn stands ready to take on it:
+        // that is the condition make_move records it on, and hashes it on, so a
+        // position read from a FEN gets the same key as the one the moves would have
+        // built. The legality check above still sees the square as written.
+        if pos.ep_square != Square::NONE {
+            let us = pos.side_to_move;
+            if pawn_attacks(pos.ep_square, !us) & pos.piece_type_bb(PieceType::Pawn, us) == 0 {
+                pos.ep_square = Square::NONE;
+            }
+        }
 
         // Compute Zobrist key from scratch
         pos.key = pos.compute_key();
@@ -786,6 +955,19 @@ impl Position {
         fen.push(' ');
         if self.castling_rights == 0 {
             fen.push('-');
+        } else if self.chess960 {
+            if self.castling_rights & WHITE_OO != 0 {
+                fen.push((b'A' + self.castle_rook_sq(WHITE_OO).file()) as char);
+            }
+            if self.castling_rights & WHITE_OOO != 0 {
+                fen.push((b'A' + self.castle_rook_sq(WHITE_OOO).file()) as char);
+            }
+            if self.castling_rights & BLACK_OO != 0 {
+                fen.push((b'a' + self.castle_rook_sq(BLACK_OO).file()) as char);
+            }
+            if self.castling_rights & BLACK_OOO != 0 {
+                fen.push((b'a' + self.castle_rook_sq(BLACK_OOO).file()) as char);
+            }
         } else {
             if self.castling_rights & WHITE_OO != 0 { fen.push('K'); }
             if self.castling_rights & WHITE_OOO != 0 { fen.push('Q'); }
@@ -919,10 +1101,15 @@ impl Position {
         let us = self.side_to_move;
         let them = !us;
         let moving_piece = self.board[from.index()];
-        let captured = self.board[to.index()];
+        let captured = if mt == MT_CASTLING {
+            Piece::NONE
+        } else {
+            self.board[to.index()]
+        };
 
-        // Capture validation (BUG 3: TT king capture)
-        if captured != Piece::NONE {
+        // Capture validation (BUG 3: TT king capture). Castling is encoded as
+        // king-captures-own-rook, so the destination holds a friendly rook.
+        if mt != MT_CASTLING && captured != Piece::NONE {
             debug_assert!(captured.piece_type() != PieceType::King,
                 "make_move: KING CAPTURE on {} (move={}, BUG 3)", to.0, m.to_uci());
             debug_assert!(captured.color() == them,
@@ -1009,33 +1196,26 @@ impl Position {
             MT_CASTLING => {
                 debug_assert!(moving_piece.piece_type() == PieceType::King,
                     "make_move castle: not a king {:?}", moving_piece);
-                let expected_ksq = if us == Color::White { Square::E1 } else { Square::E8 };
-                debug_assert!(from == expected_ksq,
-                    "make_move castle: king not on origin {} (expected {})",
-                    from.0, expected_ksq.0);
-                // Determine which castling right this corresponds to
-                let right = if to.file() > from.file() {
-                    // Kingside
-                    if us == Color::White { WHITE_OO } else { BLACK_OO }
-                } else {
-                    // Queenside
-                    if us == Color::White { WHITE_OOO } else { BLACK_OOO }
-                };
-                let data = &CASTLING_DATA[right as usize];
+                debug_assert!(from != to, "make_move castle: king and rook on the same square");
+                let king_to = m.castle_king_to();
+                let rook_from = to;
+                let rook_to = m.castle_rook_to();
+                debug_assert!(self.board[rook_from.index()] == Piece::new(PieceType::Rook, us),
+                    "make_move castle: no friendly rook on {}", rook_from.0);
                 let king = Piece::new(PieceType::King, us);
                 let rook = Piece::new(PieceType::Rook, us);
-
-                self.remove_piece(data.king_from, king);
-                self.remove_piece(data.rook_from, rook);
-                self.put_piece(data.king_to, king);
-                self.put_piece(data.rook_to, rook);
+                // Remove both first: in Chess960 the four squares can overlap.
+                self.remove_piece(from, king);
+                self.remove_piece(rook_from, rook);
+                self.put_piece(king_to, king);
+                self.put_piece(rook_to, rook);
             }
             _ => unreachable!(),
         }
 
         // Update castling rights
         self.castling_rights &=
-            CASTLING_RIGHTS_MASK[from.index()] & CASTLING_RIGHTS_MASK[to.index()];
+            self.castling_rights_mask[from.index()] & self.castling_rights_mask[to.index()];
         self.key ^= ZOBRIST.castling[self.castling_rights as usize];
 
         // Switch side
@@ -1118,19 +1298,15 @@ impl Position {
                 self.put_piece_nz(cap_sq, saved.captured_piece);
             }
             MT_CASTLING => {
-                let right = if to.file() > from.file() {
-                    if us == Color::White { WHITE_OO } else { BLACK_OO }
-                } else {
-                    if us == Color::White { WHITE_OOO } else { BLACK_OOO }
-                };
-                let data = &CASTLING_DATA[right as usize];
+                let king_to = m.castle_king_to();
+                let rook_from = to;
+                let rook_to = m.castle_rook_to();
                 let king = Piece::new(PieceType::King, us);
                 let rook = Piece::new(PieceType::Rook, us);
-
-                self.remove_piece_nz(data.king_to, king);
-                self.remove_piece_nz(data.rook_to, rook);
-                self.put_piece_nz(data.king_from, king);
-                self.put_piece_nz(data.rook_from, rook);
+                self.remove_piece_nz(king_to, king);
+                self.remove_piece_nz(rook_to, rook);
+                self.put_piece_nz(from, king);
+                self.put_piece_nz(rook_from, rook);
             }
             _ => unreachable!(),
         }
@@ -1241,24 +1417,70 @@ impl Position {
         self.checkers != 0
     }
 
-    /// Does this move give direct check to the opponent's king?
-    /// ~95% accurate (ignores discovered checks, promotion piece changes,
-    /// en passant removal, castling rook).
+    /// Does this move check the opponent's king?
+    ///
+    /// Exact: the piece that lands is asked what it attacks from where it lands, and
+    /// the squares the move empties are asked whether they uncover a slider of ours.
+    /// That covers what the move type changes about either question — a promotion
+    /// arrives as its new piece, en passant empties the captured pawn's square as well
+    /// as the mover's, and castling checks with the rook it brings to d1/f1, never with
+    /// the king. Called before the move is made, so everything reads from `occ_after`,
+    /// the occupancy the move will produce.
     pub fn gives_check(&self, m: Move) -> bool {
         let from = m.from_sq();
         let to = m.to_sq();
-        let their_king = self.king_sq(self.side_to_move.flip());
-        let occ = (self.occupancies[2] ^ from.bb()) | to.bb();
+        let us = self.side_to_move;
+        let their_king = self.king_sq(!us);
+        let mt = m.move_type();
+        let occ = self.occupancies[2];
 
-        let attacks = match self.board[from.index()].piece_type() {
-            PieceType::Pawn => pawn_attacks(to, self.side_to_move),
-            PieceType::Knight => knight_attacks(to),
-            PieceType::Bishop => bishop_attacks(to, occ),
-            PieceType::Rook => rook_attacks(to, occ),
-            PieceType::Queen => queen_attacks(to, occ),
-            _ => 0,
+        // In Chess960 any two of a castle's four squares may coincide, so both origins
+        // clear before both destinations set — the reverse order would lose a piece.
+        let occ_after = match mt {
+            MT_CASTLING => {
+                (occ ^ from.bb() ^ to.bb()) | m.castle_king_to().bb() | m.castle_rook_to().bb()
+            }
+            MT_EN_PASSANT => {
+                let capsq = Square::new(to.file(), from.rank());
+                (occ ^ from.bb() ^ capsq.bb()) | to.bb()
+            }
+            _ => (occ ^ from.bb()) | to.bb(),
         };
-        attacks & their_king.bb() != 0
+
+        // Direct check, by whatever piece ends up on whatever square.
+        let (lands_sq, lands_pt) = match mt {
+            MT_CASTLING => (m.castle_rook_to(), PieceType::Rook),
+            MT_PROMOTION => (to, m.promo_type()),
+            _ => (to, self.board[from.index()].piece_type()),
+        };
+        let attacks = match lands_pt {
+            PieceType::Pawn => pawn_attacks(lands_sq, us),
+            PieceType::Knight => knight_attacks(lands_sq),
+            PieceType::Bishop => bishop_attacks(lands_sq, occ_after),
+            PieceType::Rook => rook_attacks(lands_sq, occ_after),
+            PieceType::Queen => queen_attacks(lands_sq, occ_after),
+            PieceType::King => 0,
+        };
+        if attacks & their_king.bb() != 0 {
+            return true;
+        }
+
+        // Discovered check. Only a square the move leaves empty can open a line, and
+        // only one sharing a rank, file, or diagonal with their king — a single masked
+        // test, so the two magic probes below are paid for by the rare move that could
+        // actually deliver one.
+        let vacated = occ & !occ_after;
+        if vacated & aligned_bb(their_king) == 0 {
+            return false;
+        }
+        // Our sliders, minus the ones this move displaces: what those attack from where
+        // they land is the direct check already answered above.
+        let moved = if mt == MT_CASTLING { from.bb() | to.bb() } else { from.bb() };
+        let queens = self.piece_type_bb(PieceType::Queen, us);
+        let rooks_queens = (self.piece_type_bb(PieceType::Rook, us) | queens) & !moved;
+        let bishops_queens = (self.piece_type_bb(PieceType::Bishop, us) | queens) & !moved;
+        rook_attacks(their_king, occ_after) & rooks_queens != 0
+            || bishop_attacks(their_king, occ_after) & bishops_queens != 0
     }
 
     // ============================================================
@@ -1409,39 +1631,11 @@ impl Position {
             return Err(FenParseError::OpponentKingInCheck);
         }
 
-        // 7. Castling rights coherence (king + rook on starting squares)
-        if self.castling_rights & WHITE_OO != 0
-            && (self.board[Square::E1.index()] != Piece::WHITE_KING
-                || self.board[Square::H1.index()] != Piece::WHITE_ROOK)
-        {
-            return Err(FenParseError::CastlingRightsIncoherent {
-                detail: "white O-O requires king on e1 and rook on h1",
-            });
-        }
-        if self.castling_rights & WHITE_OOO != 0
-            && (self.board[Square::E1.index()] != Piece::WHITE_KING
-                || self.board[Square::A1.index()] != Piece::WHITE_ROOK)
-        {
-            return Err(FenParseError::CastlingRightsIncoherent {
-                detail: "white O-O-O requires king on e1 and rook on a1",
-            });
-        }
-        if self.castling_rights & BLACK_OO != 0
-            && (self.board[Square::E8.index()] != Piece::BLACK_KING
-                || self.board[Square::H8.index()] != Piece::BLACK_ROOK)
-        {
-            return Err(FenParseError::CastlingRightsIncoherent {
-                detail: "black O-O requires king on e8 and rook on h8",
-            });
-        }
-        if self.castling_rights & BLACK_OOO != 0
-            && (self.board[Square::E8.index()] != Piece::BLACK_KING
-                || self.board[Square::A8.index()] != Piece::BLACK_ROOK)
-        {
-            return Err(FenParseError::CastlingRightsIncoherent {
-                detail: "black O-O-O requires king on e8 and rook on a8",
-            });
-        }
+        // 7. Castling rights coherence (king on back rank, rook on its recorded square)
+        self.check_castling_coherence(WHITE_OO, Color::White, Piece::WHITE_KING, Piece::WHITE_ROOK)?;
+        self.check_castling_coherence(WHITE_OOO, Color::White, Piece::WHITE_KING, Piece::WHITE_ROOK)?;
+        self.check_castling_coherence(BLACK_OO, Color::Black, Piece::BLACK_KING, Piece::BLACK_ROOK)?;
+        self.check_castling_coherence(BLACK_OOO, Color::Black, Piece::BLACK_KING, Piece::BLACK_ROOK)?;
 
         // 8. En passant square requires an enemy pawn behind it
         if self.ep_square != Square::NONE {
@@ -1453,6 +1647,27 @@ impl Position {
             }
         }
 
+        Ok(())
+    }
+
+    fn check_castling_coherence(
+        &self, right: u8, us: Color, king: Piece, rook: Piece,
+    ) -> Result<(), FenParseError> {
+        if self.castling_rights & right == 0 {
+            return Ok(());
+        }
+        let ksq = self.king_sq(us);
+        let rsq = self.castle_rook_sq(right);
+        if ksq.rank() != Self::back_rank(us) || self.board[ksq.index()] != king {
+            return Err(FenParseError::CastlingRightsIncoherent {
+                detail: "castling king is not on its back rank",
+            });
+        }
+        if rsq.0 >= 64 || self.board[rsq.index()] != rook || rsq.rank() != ksq.rank() {
+            return Err(FenParseError::CastlingRightsIncoherent {
+                detail: "castling rook is not on its recorded square",
+            });
+        }
         Ok(())
     }
 
@@ -1580,29 +1795,21 @@ impl Position {
         }
 
         // 9. Castling rights coherence
-        if self.castling_rights & WHITE_OO != 0 {
-            debug_assert!(self.board[Square::E1.index()] == Piece::WHITE_KING,
-                "check_validity: WHITE_OO but no white king on e1");
-            debug_assert!(self.board[Square::H1.index()] == Piece::WHITE_ROOK,
-                "check_validity: WHITE_OO but no white rook on h1");
-        }
-        if self.castling_rights & WHITE_OOO != 0 {
-            debug_assert!(self.board[Square::E1.index()] == Piece::WHITE_KING,
-                "check_validity: WHITE_OOO but no white king on e1");
-            debug_assert!(self.board[Square::A1.index()] == Piece::WHITE_ROOK,
-                "check_validity: WHITE_OOO but no white rook on a1");
-        }
-        if self.castling_rights & BLACK_OO != 0 {
-            debug_assert!(self.board[Square::E8.index()] == Piece::BLACK_KING,
-                "check_validity: BLACK_OO but no black king on e8");
-            debug_assert!(self.board[Square::H8.index()] == Piece::BLACK_ROOK,
-                "check_validity: BLACK_OO but no black rook on h8");
-        }
-        if self.castling_rights & BLACK_OOO != 0 {
-            debug_assert!(self.board[Square::E8.index()] == Piece::BLACK_KING,
-                "check_validity: BLACK_OOO but no black king on e8");
-            debug_assert!(self.board[Square::A8.index()] == Piece::BLACK_ROOK,
-                "check_validity: BLACK_OOO but no black rook on a8");
+        for &(right, us, king, rook) in &[
+            (WHITE_OO, Color::White, Piece::WHITE_KING, Piece::WHITE_ROOK),
+            (WHITE_OOO, Color::White, Piece::WHITE_KING, Piece::WHITE_ROOK),
+            (BLACK_OO, Color::Black, Piece::BLACK_KING, Piece::BLACK_ROOK),
+            (BLACK_OOO, Color::Black, Piece::BLACK_KING, Piece::BLACK_ROOK),
+        ] {
+            if self.castling_rights & right == 0 {
+                continue;
+            }
+            let ksq = self.king_sq(us);
+            let rsq = self.castle_rook_sq(right);
+            debug_assert!(ksq.rank() == Self::back_rank(us) && self.board[ksq.index()] == king,
+                "check_validity: right {right} but king not on back rank (ksq={})", ksq.0);
+            debug_assert!(rsq.0 < 64 && self.board[rsq.index()] == rook && rsq.rank() == ksq.rank(),
+                "check_validity: right {right} but rook missing on {}", rsq.0);
         }
 
         // 10. Zobrist hash integrity (catches any incremental drift)
@@ -1693,6 +1900,11 @@ mod tests {
         assert_eq!(pos.ep_square, Square::NONE);
         assert_eq!(pos.halfmove_clock, 0);
         assert_eq!(pos.fullmove_number, 1);
+        assert_eq!(pos.castle_rook_sq(WHITE_OO), Square::H1);
+        assert_eq!(pos.castle_rook_sq(WHITE_OOO), Square::A1);
+        assert_eq!(pos.castle_rook_sq(BLACK_OO), Square::H8);
+        assert_eq!(pos.castle_rook_sq(BLACK_OOO), Square::A8);
+        assert!(!pos.chess960);
 
         // Check piece counts
         assert_eq!(popcount(pos.piece_type_bb(PieceType::Pawn, Color::White)), 8);
@@ -1713,11 +1925,139 @@ mod tests {
     }
 
     #[test]
+    fn test_fen_shredder_startpos() {
+        let kq = Position::from_fen(STARTPOS).unwrap();
+        let ah = Position::from_fen(
+            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w AHah - 0 1",
+        ).unwrap();
+        assert_eq!(kq.castling_rights, ah.castling_rights);
+        assert_eq!(kq.castle_rook_sq(WHITE_OO), ah.castle_rook_sq(WHITE_OO));
+        assert_eq!(kq.castle_rook_sq(WHITE_OOO), ah.castle_rook_sq(WHITE_OOO));
+        assert_eq!(kq.key, ah.key);
+    }
+
+    #[test]
+    fn test_fen_chess960_shredder_roundtrip() {
+        let fen = "bbqnnrkr/pppppppp/8/8/8/8/PPPPPPPP/BBQNNRKR w HFhf - 0 1";
+        let pos = Position::from_fen_ex(fen, true).unwrap();
+        assert!(pos.chess960);
+        assert_eq!(pos.castle_rook_sq(WHITE_OO), Square::H1);
+        assert_eq!(pos.castle_rook_sq(WHITE_OOO), Square::F1);
+        assert_eq!(pos.to_fen(), fen);
+    }
+
+    #[test]
+    fn test_fen_chess324() {
+        let pos = Position::from_fen(
+            "rnqbknbr/pppppppp/8/8/8/8/PPPPPPPP/RNBBKNQR w KQkq - 0 1",
+        ).unwrap();
+        assert_eq!(pos.king_sq(Color::White), Square::E1);
+        assert_eq!(pos.castle_rook_sq(WHITE_OO), Square::H1);
+        assert_eq!(pos.castle_rook_sq(WHITE_OOO), Square::A1);
+        assert_eq!(pos.board[Square::C1.index()].piece_type(), PieceType::Bishop);
+        assert_eq!(pos.board[Square::D1.index()].piece_type(), PieceType::Bishop);
+    }
+
+    #[test]
+    fn test_fen_dfrc_asymmetric() {
+        let pos = Position::from_fen(
+            "nrkbnqbr/pppppppp/8/8/8/8/PPPPPPPP/BBNRKQNR w HDhb - 0 1",
+        ).unwrap();
+        assert_eq!(pos.castle_rook_sq(WHITE_OO), Square::H1);
+        assert_eq!(pos.castle_rook_sq(WHITE_OOO), Square::D1);
+        assert_eq!(pos.castle_rook_sq(BLACK_OO), Square::H8);
+        assert_eq!(pos.castle_rook_sq(BLACK_OOO), Square::B8);
+        assert_ne!(pos.king_sq(Color::White).file(), pos.king_sq(Color::Black).file());
+    }
+
+    /// `gives_check` is consulted before the move is made, and pruning trusts it, so
+    /// it has to answer what the position itself would answer afterwards. Walking whole
+    /// trees is the only way to cover the combinations that make it hard: a discovery
+    /// and a direct check at once, an en passant that empties two squares on the same
+    /// rank, a promotion checking as its new piece, a castle checking with its rook.
+    #[test]
+    fn gives_check_answers_what_the_move_actually_produces() {
+        fn walk(pos: &mut Position, depth: u32) {
+            let mut buf: ArrayBuf<Move, MAX_MOVES> = ArrayBuf::new();
+            let n = movegen::generate_legal_moves(pos, &mut buf);
+            for i in 0..n {
+                let m = buf[i];
+                let predicted = pos.gives_check(m);
+                pos.make_move(m);
+                let actual = pos.in_check();
+                if depth > 1 {
+                    walk(pos, depth - 1);
+                }
+                pos.unmake_move(m);
+                assert_eq!(
+                    predicted,
+                    actual,
+                    "gives_check said {predicted} for {} in {}",
+                    m.to_uci_960(true),
+                    pos.to_fen(),
+                );
+            }
+        }
+
+        let suite = [
+            (STARTPOS, 4),
+            // Kiwipete: castling both sides, pins, a board full of sliders.
+            ("r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1", 3),
+            // The classic en passant position: captures that empty two squares on the
+            // rank a rook already eyes, which is where discovered checks hide.
+            ("8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1", 4),
+            // Promotions on both wings, checking as knight, bishop, rook or queen.
+            ("r3k2r/Pppp1ppp/1b3nbN/nP6/BBP1P3/q4N2/Pp1P2PP/R2Q1RK1 w kq - 0 1", 3),
+            // Chess960, where the castling rook can land anywhere on the back rank.
+            ("rqnkbrnb/1pppp1pp/8/5p2/p1P5/3P1N2/PP2PPPP/RQNKBR1B w KQkq - 0 4", 3),
+            ("1r1qnbkr/ppp1pppp/1n1p4/5b2/2PP4/3N4/PP2PPPP/NRBQ1BKR w KQkq - 3 4", 3),
+            // A castle that checks, and a Chess960 one whose king does not move.
+            ("5k2/8/8/8/8/8/8/4K2R w K - 0 1", 4),
+            ("3k4/8/8/8/8/8/8/1RK5 w Q - 0 1", 4),
+        ];
+        for (fen, depth) in suite {
+            let mut pos = Position::from_fen(fen).unwrap();
+            walk(&mut pos, depth);
+        }
+    }
+
+    /// The rook a castling move brings to d1/f1 can check, and it is the only piece
+    /// in the move that can — which is why answering `false` for every king move
+    /// let a checking castle through the pruning guards that consult this.
+    #[test]
+    fn castling_checks_with_the_rook_it_brings_over() {
+        // O-O drops the rook on f1, facing the black king down an open f-file.
+        let pos = Position::from_fen("5k2/8/8/8/8/8/8/4K2R w K - 0 1").unwrap();
+        assert!(pos.gives_check(Move::new_with_type(Square::E1, Square::H1, MT_CASTLING)));
+
+        // Same rook, same file, black king one square over: nothing.
+        let pos = Position::from_fen("4k3/8/8/8/8/8/8/4K2R w K - 0 1").unwrap();
+        assert!(!pos.gives_check(Move::new_with_type(Square::E1, Square::H1, MT_CASTLING)));
+
+        // Chess960 O-O-O where the king never leaves c1: the rook b1 → d1 checks alone.
+        let pos = Position::from_fen("3k4/8/8/8/8/8/8/1RK5 w Q - 0 1").unwrap();
+        let ooo = Move::new_with_type(Square::C1, Square::B1, MT_CASTLING);
+        assert_eq!(ooo.castle_king_to(), Square::C1);
+        assert_eq!(ooo.castle_rook_to(), Square::D1);
+        assert!(pos.gives_check(ooo));
+    }
+
+    #[test]
+    fn test_fen_castling_file_overlaps_king() {
+        assert!(matches!(
+            Position::from_fen("4k3/8/8/8/8/8/8/4K3 w E - 0 1"),
+            Err(FenParseError::CastlingRightsIncoherent { .. })
+        ));
+    }
+
+    #[test]
     fn test_fen_roundtrip() {
 
         let fens = [
             STARTPOS,
-            "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq e3 0 1",
+            // An en passant square a pawn can take on survives the round trip; one
+            // nobody can take reads back as "-" (see the en passant test below).
+            "rnbqkbnr/pppp1ppp/8/8/3Pp3/8/PPP1PPPP/RNBQKBNR b KQkq d3 0 3",
             "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
             "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1",
             "r3k2r/Pppp1ppp/1b3nbN/nP6/BBP1P3/q4N2/Pp1P2PP/R2Q1RK1 w kq - 0 1",
@@ -1864,6 +2204,57 @@ mod tests {
             .find(|m| m.to_uci() == uci)
             .unwrap_or_else(|| panic!("illegal move: {uci}"));
         pos.make_move(m);
+    }
+
+    /// The cuckoo test asks whether the side to move can undo one of its own reversible
+    /// moves and land on a position seen before. Two kings shuffling on the e-file
+    /// offer that from the third ply on (no castling rights: losing them would
+    /// make the earlier positions unreachable). The king that would move stands on
+    /// the lower of its two squares in some of those positions and on the higher one
+    /// in the others; the path check between the squares must not take the king
+    /// itself for an obstacle.
+    #[test]
+    fn an_upcoming_repetition_is_seen_whichever_end_the_piece_stands_on() {
+        let mut pos = Position::from_fen("4k3/8/8/8/8/8/8/4K3 w - - 0 1").unwrap();
+        let line = ["e1e2", "e8e7", "e2e1", "e7e8", "e1e2", "e8e7"];
+        let expected = [false, false, true, true, true, true];
+        for (i, (uci, want)) in line.iter().zip(expected).enumerate() {
+            make_uci(&mut pos, uci);
+            assert_eq!(
+                pos.upcoming_repetition(10),
+                want,
+                "after ply {} ({uci}): upcoming repetition should be {want}",
+                i + 1
+            );
+        }
+    }
+
+    /// make_move records an en passant square only where a pawn can take on it, and
+    /// hashes it on the same condition. A FEN naming one nobody can take must not give
+    /// the position a different key from the one the moves would have built.
+    #[test]
+    fn a_fen_en_passant_square_nobody_can_take_is_dropped() {
+        let spurious = Position::from_fen(
+            "rnbqkbnr/pp1ppppp/8/2p5/4P3/8/PPPP1PPP/RNBQKBNR w KQkq c6 0 2",
+        )
+        .unwrap();
+        let plain = Position::from_fen(
+            "rnbqkbnr/pp1ppppp/8/2p5/4P3/8/PPPP1PPP/RNBQKBNR w KQkq - 0 2",
+        )
+        .unwrap();
+        assert_eq!(spurious.ep_square, Square::NONE);
+        assert_eq!(spurious.key, plain.key);
+        assert_eq!(spurious.to_fen(), plain.to_fen(), "the FEN reads back normalised");
+        let mut played = Position::from_fen(STARTPOS).unwrap();
+        make_uci(&mut played, "e2e4");
+        make_uci(&mut played, "c7c5");
+        assert_eq!(played.key, plain.key, "the FEN and the moves must agree on the key");
+        // Where the capture exists, the square stays.
+        let live = Position::from_fen(
+            "rnbqkbnr/ppp1p1pp/8/3pPp2/8/8/PPPP1PPP/RNBQKBNR w KQkq f6 0 3",
+        )
+        .unwrap();
+        assert_eq!(live.ep_square, Square::F6);
     }
 
     #[test]

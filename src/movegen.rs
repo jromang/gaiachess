@@ -495,27 +495,33 @@ fn generate_king_moves(
     }
 }
 
+fn can_castle(pos: &Position, us: Color, right: u8, occupied: u64) -> Option<Move> {
+    if pos.castling_rights & right == 0 {
+        return None;
+    }
+    let idx = castling_idx(right);
+    let rook_from = pos.castling_rook[idx];
+    debug_assert!(rook_from.0 < 64, "can_castle: rook square unset for right {right}");
+    if pos.pinned & rook_from.bb() != 0 {
+        return None;
+    }
+    if pos.castling_path[idx] & occupied != 0 {
+        return None;
+    }
+    let ksq = pos.king_sq(us);
+    debug_assert!(ksq != rook_from, "can_castle: king and rook overlap");
+    Some(Move::new_with_type(ksq, rook_from, MT_CASTLING))
+}
+
 fn generate_castling(
     pos: &Position, buf: &mut ArrayBuf<Move, MAX_MOVES>, count: &mut usize,
     us: Color, occupied: u64,
 ) {
-    let rights = pos.castling_rights;
-    let (oo, ooo) = match us {
-        Color::White => (WHITE_OO, WHITE_OOO),
-        Color::Black => (BLACK_OO, BLACK_OOO),
-    };
-    let ksq = pos.king_sq(us);
-
+    let (oo, ooo) = castling_rights_for(us);
     for right in [oo, ooo] {
-        if rights & right == 0 {
-            continue;
+        if let Some(m) = can_castle(pos, us, right, occupied) {
+            emit(buf, count, m);
         }
-        let path = CASTLING_PATH[right as usize];
-        if path & occupied != 0 {
-            continue; // path not clear
-        }
-        let data = &CASTLING_DATA[right as usize];
-        emit(buf, count, Move::new_with_type(ksq, data.king_to, MT_CASTLING));
     }
 }
 
@@ -523,23 +529,11 @@ fn generate_castling_scored(
     pos: &Position, buf: &mut ArrayBuf<ScoredMove, MAX_MOVES>, count: &mut usize,
     us: Color, occupied: u64,
 ) {
-    let rights = pos.castling_rights;
-    let (oo, ooo) = match us {
-        Color::White => (WHITE_OO, WHITE_OOO),
-        Color::Black => (BLACK_OO, BLACK_OOO),
-    };
-    let ksq = pos.king_sq(us);
-
+    let (oo, ooo) = castling_rights_for(us);
     for right in [oo, ooo] {
-        if rights & right == 0 {
-            continue;
+        if let Some(m) = can_castle(pos, us, right, occupied) {
+            emit_scored(buf, count, m);
         }
-        let path = CASTLING_PATH[right as usize];
-        if path & occupied != 0 {
-            continue; // path not clear
-        }
-        let data = &CASTLING_DATA[right as usize];
-        emit_scored(buf, count, Move::new_with_type(ksq, data.king_to, MT_CASTLING));
     }
 }
 
@@ -580,11 +574,12 @@ pub fn is_legal(pos: &Position, m: Move) -> bool {
         } else {
             if us == Color::White { WHITE_OOO } else { BLACK_OOO }
         };
-        let king_path = KING_CASTLING_PATH[right as usize];
-        // Check each square on king's path
+        debug_assert!(pos.castling_rights & right != 0);
+        debug_assert!(to == pos.castle_rook_sq(right));
+        let king_path = pos.castling_king_path[castling_idx(right)];
+        // Remove king and rook so sliders x-ray through both moving pieces
+        let occ = pos.occupied() ^ ksq.bb() ^ to.bb();
         let mut path = king_path;
-        // Remove king from occupied for slider attack calculation
-        let occ = pos.occupied() ^ ksq.bb();
         while path != 0 {
             let sq = pop_lsb(&mut path);
             if attackers_to_color(sq, them, occ, &pos.pieces) != 0 {
@@ -635,7 +630,7 @@ pub fn is_pseudo_legal(pos: &Position, m: Move) -> bool {
         return false;
     }
 
-    // Castling: delegate to specific checks (rights, path clear)
+    // Castling: delegate to specific checks (rights, path clear, dest is the rook)
     if mt == MT_CASTLING {
         if pc.piece_type() != PieceType::King {
             return false;
@@ -648,7 +643,14 @@ pub fn is_pseudo_legal(pos: &Position, m: Move) -> bool {
         if pos.castling_rights & right == 0 {
             return false;
         }
-        return CASTLING_PATH[right as usize] & pos.occupied() == 0;
+        if to != pos.castle_rook_sq(right) {
+            return false;
+        }
+        let idx = castling_idx(right);
+        if pos.pinned & to.bb() != 0 {
+            return false;
+        }
+        return pos.castling_path[idx] & pos.occupied() == 0;
     }
 
     // Destination must not have our own piece

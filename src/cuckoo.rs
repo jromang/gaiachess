@@ -190,7 +190,10 @@ pub fn upcoming_repetition(
         let sb = Square(CUCKOO.sq_b[i]);
 
         // Check that the path between the two squares is unobstructed
-        if between_bb(sa, sb) & occupied != 0 {
+        // The path between the two squares must be clear. `between_bb` includes its
+        // second square, and that is where the piece stands whenever it sits on the
+        // higher of the two — it is no obstacle to its own move.
+        if (between_bb(sa, sb) & !sb.bb()) & occupied != 0 {
             d += 2;
             continue;
         }

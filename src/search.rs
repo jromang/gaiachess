@@ -9,11 +9,11 @@
 use crate::eval;
 use crate::nnue;
 use crate::history::{
-    ContCorrectionHistory, ContinuationHistory, PieceToTable, stat_bonus, stat_malus,
+    ContCorrectionHistory, ContinuationHistory, CorrKind, PieceToTable, stat_bonus, stat_malus,
     CORRHIST_LIMIT,
 };
 use crate::movegen;
-use crate::movepick::{MovePicker, get_captured_pt};
+use crate::movepick::{MovePicker, child_key, get_captured_pt};
 use crate::position::Position;
 use crate::skill;
 use crate::stats::st;
@@ -75,10 +75,19 @@ const LMR_LN: [i32; 64] = [
 ];
 
 /// A move is quiet if it is not a capture, not a promotion, and not en passant.
+/// Castling is encoded as king-captures-own-rook, so the destination is occupied.
 #[inline(always)]
 fn is_quiet(pos: &Position, m: Move) -> bool {
     let mt = m.move_type();
+    if mt == MT_CASTLING {
+        return true;
+    }
     mt != MT_PROMOTION && mt != MT_EN_PASSANT && pos.board[m.to_sq().index()] == Piece::NONE
+}
+
+#[inline(always)]
+fn is_capture(pos: &Position, m: Move) -> bool {
+    m.move_type() != MT_CASTLING && pos.board[m.to_sq().index()] != Piece::NONE
 }
 
 /// Whether a move is one of the ones that are hard to miss.
@@ -99,7 +108,7 @@ fn easy_to_notice(td: &ThreadData, m: Move, ply: usize) -> bool {
     // The two quiet moves that still come to mind: carrying on with the piece moved a
     // move ago, and giving check.
     let own_previous = td.ss(ply - 2).played_move;
-    (own_previous != Move::NONE && own_previous.to_sq() == m.from_sq()) || td.pos.gives_check(m)
+    (own_previous != Move::NONE && own_previous.lands_on() == m.from_sq()) || td.pos.gives_check(m)
 }
 
 /// Evaluate the position using NNUE (if a trained network is loaded) or PeSTO fallback.
@@ -299,7 +308,7 @@ fn syzygy_extend_pv(pos: &mut Position, rm: &mut crate::threads::RootMove) {
                 let opp_count = movegen::generate_legal_moves(pos, &mut opp_buf);
                 let mut score = -(opp_count as i32);
                 for i in 0..opp_count {
-                    if pos.board[opp_buf[i].to_sq().index()] != Piece::NONE {
+                    if is_capture(pos, opp_buf[i]) {
                         score -= 100;
                     }
                 }
@@ -337,7 +346,10 @@ fn syzygy_extend_pv(pos: &mut Position, rm: &mut crate::threads::RootMove) {
 /// Print UCI info lines for all PV lines at the current depth.
 fn print_multi_pv_info(td: &ThreadData, shared: &SharedState, depth: i32, multi_pv: usize) {
     let elapsed = td.tm.elapsed_ms().max(1);
-    let nps = td.nodes * 1000 / elapsed;
+    // With helpers running, the shared counter (to the nearest 512 per thread) is the
+    // search's total; alone, the thread's own count is exact and never smaller.
+    let nodes = td.nodes.max(crate::threads::NODES_SEARCHED.load(std::sync::atomic::Ordering::Relaxed));
+    let nps = nodes * 1000 / elapsed;
     let hashfull = shared.tt.hashfull();
 
     for (i, rm) in td.root_moves[..multi_pv].iter().enumerate() {
@@ -371,7 +383,7 @@ fn print_multi_pv_info(td: &ThreadData, shared: &SharedState, depth: i32, multi_
         let mut pv_str = String::new();
         for j in 0..rm.pv_len {
             if j > 0 { pv_str.push(' '); }
-            pv_str.push_str(&rm.pv[j].to_uci());
+            pv_str.push_str(&rm.pv[j].to_uci_960(td.pos.chess960));
         }
 
         // Only include "multipv N" when multi_pv > 1 (some GUIs don't expect it for single PV)
@@ -383,7 +395,7 @@ fn print_multi_pv_info(td: &ThreadData, shared: &SharedState, depth: i32, multi_
 
         out!(
             "info depth {d} seldepth {}{multipv_str} score {score_str} nodes {} nps {nps} time {elapsed} hashfull {hashfull} tbhits {} pv {pv_str}",
-            rm.sel_depth, td.nodes, td.tb_hits,
+            rm.sel_depth, nodes, td.tb_hits,
         );
     }
 }
@@ -1108,10 +1120,11 @@ fn alpha_beta<NT: NodeType>(
         // score a weakened search stored, which never reaches evaluate_pos and so would
         // otherwise be fed to the correction tables as if it were the network's opinion.
         lazy_eval_this_node = td.used_lazy_eval || td.skill.active;
-        // Ensure NNUE threat features are up-to-date even when TT eval is used,
-        // so children can do incremental threat updates instead of full recomputes.
+        // Bring the NNUE accumulators (PST and threats) up-to-date even when
+        // TT eval is used, so children can do incremental updates instead of
+        // full recomputes.
         if tt_eval != SCORE_NONE && nnue::network::has_network() {
-            td.nnue.ensure_updated(&td.pos);
+            td.nnue.ensure_all_updated(&td.pos);
         }
         if lazy_eval_this_node {
             // Lazy eval: PeSTO score used, skip correction history (trained against NNUE)
@@ -1124,12 +1137,13 @@ fn alpha_beta<NT: NodeType>(
         } else {
             // Pawn correction history (weighted sum / 65536)
             let stm = td.pos.side_to_move;
-            let pawn_entry = td.pawn_correction.get(td.pos.pawn_key, stm) as i64;
+            let pawn_entry = shared.corr.get(CorrKind::Pawn, td.pos.pawn_key, stm) as i64;
             // Non-pawn correction: sum of both colors' non-pawn keys
-            let non_pawn_entry = td.non_pawn_correction.get(td.pos.non_pawn_key[0], Color::White, stm) as i64
-                + td.non_pawn_correction.get(td.pos.non_pawn_key[1], Color::Black, stm) as i64;
+            let non_pawn_entry =
+                shared.corr.get(CorrKind::NonPawnWhite, td.pos.non_pawn_key[0], stm) as i64
+                + shared.corr.get(CorrKind::NonPawnBlack, td.pos.non_pawn_key[1], stm) as i64;
             // Minor piece correction: N+B+K combined key
-            let minor_entry = td.minor_correction.get(td.pos.minor_key, stm) as i64;
+            let minor_entry = shared.corr.get(CorrKind::Minor, td.pos.minor_key, stm) as i64;
             // Continuation correction history: subtable[ply-offset] indexed by move at ply-1
             let cont_corr = {
                 let base = ply + SS_OFFSET;
@@ -1312,7 +1326,8 @@ fn alpha_beta<NT: NodeType>(
             && tt_move != Move::NONE
             && {
                 let cap = td.pos.board[tt_move.to_sq().index()];
-                cap != Piece::NONE && (cap.piece_type() as u8) >= (PieceType::Rook as u8)
+                tt_move.move_type() != MT_CASTLING
+                    && cap != Piece::NONE && (cap.piece_type() as u8) >= (PieceType::Rook as u8)
             })
     {
         debug_assert!(!in_check, "null move en echec");
@@ -1410,6 +1425,7 @@ fn alpha_beta<NT: NodeType>(
         // is validated by the MovePicker before use, but SEE is probed here first.
         let pc_tt_move = if tt_move != Move::NONE
             && movegen::is_pseudo_legal(&td.pos, tt_move)
+            && tt_move.move_type() != MT_CASTLING
             && (tt_move.move_type() != MT_NORMAL
                 || td.pos.board[tt_move.to_sq().index()] != Piece::NONE)
             && crate::see::see(&td.pos, tt_move, see_threshold)
@@ -1444,6 +1460,7 @@ fn alpha_beta<NT: NodeType>(
             let pc_piece = td.pos.board[m.from_sq().index()];
             debug_assert!(pc_piece != Piece::NONE,
                 "probcut: piece NONE for {} at ply {}", m.to_uci(), ply);
+            shared.tt.prefetch(child_key(&td.pos, m, pc_piece));
             {
                 let conthist_ptr = td.cont_history.subtable_ptr(true, pc_piece, m.to_sq());
                 let cont_corr_ptr = td.cont_correction.subtable_ptr(pc_piece, m.to_sq());
@@ -1514,11 +1531,11 @@ fn alpha_beta<NT: NodeType>(
     let mut move_count = 0u32;
 
     // Track quiet moves searched (for history malus on cutoff)
-    let mut quiets_searched: [Move; MAX_QUIETS_SEARCHED] = [Move::NONE; MAX_QUIETS_SEARCHED];
+    let mut quiets_searched: ArrayBuf<Move, MAX_QUIETS_SEARCHED> = ArrayBuf::new();
     let mut quiet_count: usize = 0;
 
     // Track capture moves searched (for capture history malus on cutoff)
-    let mut captures_searched: [Move; MAX_CAPTURES_SEARCHED] = [Move::NONE; MAX_CAPTURES_SEARCHED];
+    let mut captures_searched: ArrayBuf<Move, MAX_CAPTURES_SEARCHED> = ArrayBuf::new();
     let mut capture_count: usize = 0;
 
     // Look up countermove from previous ply
@@ -1551,6 +1568,10 @@ fn alpha_beta<NT: NodeType>(
             continue;
         }
 
+        // The child's cluster is fetched now, so that by the time the child probes it
+        // the pruning below and make_move have covered the latency.
+        shared.tt.prefetch(child_key(&td.pos, m, td.pos.board[m.from_sq().index()]));
+
         // Multi-PV: skip moves already assigned to earlier PV lines
         if NT::ROOT && td.pv_index > 0
             && td.root_moves[..td.pv_index].iter().any(|rm| rm.mv == m)
@@ -1575,6 +1596,13 @@ fn alpha_beta<NT: NodeType>(
         move_count += 1;
 
         let is_quiet_move = is_quiet(&td.pos, m);
+
+        // Whether the move checks is asked at most once: the three pruning tests
+        // below all guard on it, it is the dearest of their terms, and nothing
+        // between them touches the position or the move.
+        let mut check_known: Option<bool> = None;
+        let mut move_gives_check =
+            |pos: &Position| -> bool { *check_known.get_or_insert_with(|| pos.gives_check(m)) };
 
         // Quiet skipping is enforced inside the MovePicker (skip_quiet_moves):
         // once armed, quiet stages are bypassed so skipped quiets never reach
@@ -1607,6 +1635,48 @@ fn alpha_beta<NT: NodeType>(
         } else {
             td.cap_history.get(moved_piece, m.to_sq(), captured_pt)
         };
+
+        // Bad-noisy futility: on the losing-capture stage, if static eval plus
+        // a margin that grows with the would-be LMR depth and the captured
+        // piece still cannot reach alpha, the remaining worse captures will
+        // not either. Breaks the move loop (last stage).
+        if !NT::ROOT
+            && !in_check
+            && !is_quiet_move
+            && picker.in_bad_captures()
+            && best_score > -SCORE_MATE_IN_MAX
+            && alpha.abs() < 2000
+            && (m.move_type() == MT_EN_PASSANT
+                || is_capture(&td.pos, m))
+        {
+            let ln_mc = LMR_LN[(move_count as usize).min(63)];
+            let ln_d = LMR_LN[(depth as usize).min(63)];
+            let mut r = tune::LMR_LOG_MUL() * ln_mc * ln_d / 1024 + tune::LMR_LOG_BASE();
+            r += tune::LMR_CAPTURE_BASE();
+            r -= tune::LMR_CAPTURE_HIST_MUL() * combined_history / 1024;
+            let lmr_depth_cp = (depth * 1024 - r).max(0);
+            debug_assert!(lmr_depth_cp >= 0, "bnfp: lmr_depth_cp {}", lmr_depth_cp);
+            if lmr_depth_cp <= tune::BNFP_DEPTH_LIMIT() {
+                let captured_value = PIECE_VALUE[captured_pt as usize];
+                debug_assert!(
+                    (captured_pt as usize) < 6,
+                    "bnfp: captured_pt {:?}",
+                    captured_pt
+                );
+                let futility = static_eval
+                    + tune::BNFP_BASE()
+                    + (lmr_depth_cp * tune::BNFP_MULT()
+                        + captured_value * tune::BNFP_CAPTURED())
+                        / 1024;
+                if futility <= alpha {
+                    if !is_tb_score(best_score) && best_score < futility {
+                        best_score = futility;
+                    }
+                    st!(td, s, s.bnfp_pruned[crate::stats::db(depth)] += 1;);
+                    break;
+                }
+            }
+        }
 
         // SEE pruning: use Static Exchange Evaluation to estimate material outcome.
         // Skip moves losing more than a depth-scaled threshold. Quiet moves use a
@@ -1659,13 +1729,13 @@ fn alpha_beta<NT: NodeType>(
         // Reference: CPW — History Leaf Pruning
         if !NT::PV
             && !in_check
-            && !td.pos.gives_check(m)
             && is_quiet_move
             && best_score > -SCORE_MATE_IN_MAX
             && m != killers[0]
             && m != killers[1]
             && m != countermove
             && combined_history < (tune::HIST_PRUNE_MARGIN() + tune::HIST_PRUNE_DEPTH() * depth / 1024) * (depth + improving as i32 - 1)
+            && !move_gives_check(&td.pos)
         {
             st!(td, s, s.hist_pruned[crate::stats::db(depth)] += 1;);
             tr!(td, t, {
@@ -1687,9 +1757,9 @@ fn alpha_beta<NT: NodeType>(
         // Reference: CPW — Futility Pruning § Move Count Based Pruning
         if !NT::PV
             && !in_check
-            && !td.pos.gives_check(m)
             && best_score > -SCORE_MATE_IN_MAX
             && move_count as i32 >= (depth * depth + tune::LMP_BASE()) / (2 - improving as i32)
+            && !move_gives_check(&td.pos)
         {
             skip_quiets = true;
             picker.skip_quiet_moves();
@@ -1713,11 +1783,11 @@ fn alpha_beta<NT: NodeType>(
         // Reference: CPW — Futility Pruning
         if !NT::PV
             && !in_check
-            && !td.pos.gives_check(m)
-            && best_score > -SCORE_MATE_IN_MAX
             && is_quiet_move
+            && best_score > -SCORE_MATE_IN_MAX
             && depth <= tune::FP_MAX_DEPTH()
             && static_eval + tune::FP_COEFF() * depth - tune::FP_BASE() <= alpha
+            && !move_gives_check(&td.pos)
         {
             let fp_value = static_eval + tune::FP_COEFF() * depth - tune::FP_BASE();
             if best_score < fp_value {
@@ -2117,7 +2187,7 @@ fn alpha_beta<NT: NodeType>(
                         update_continuation_histories(td, ply, moved_piece, m.to_sq(), bonus, in_check);
 
                         // Malus for other tried quiets
-                        for &q in quiets_searched.iter().take(quiet_count) {
+                        for &q in quiets_searched.filled(quiet_count) {
                             if q != m {
                                 let q_piece = td.pos.board[q.from_sq().index()];
                                 td.history.update(stm, q, td.pos.threats, -malus);
@@ -2131,7 +2201,7 @@ fn alpha_beta<NT: NodeType>(
                     }
 
                     // Malus for all non-best captures that were tried
-                    for &cap_m in captures_searched.iter().take(capture_count) {
+                    for &cap_m in captures_searched.filled(capture_count) {
                         if cap_m != m {
                             let cap_piece = td.pos.board[cap_m.from_sq().index()];
                             let cap_captured_pt = get_captured_pt(&td.pos, cap_m);
@@ -2235,6 +2305,7 @@ fn alpha_beta<NT: NodeType>(
         // (SEE < 0), since these are structurally similar to quiet moves from the
         // evaluation's point of view.
         let best_is_tactical = best_move != Move::NONE
+            && best_move.move_type() != MT_CASTLING
             && (td.pos.board[best_move.to_sq().index()] != Piece::NONE
                 || best_move.move_type() == MT_EN_PASSANT
                 || best_move.move_type() == MT_PROMOTION);
@@ -2249,16 +2320,13 @@ fn alpha_beta<NT: NodeType>(
         {
             let bonus = ((best_score - static_eval) * depth * tune::CORR_UPDATE_FACTOR() / 1024)
                 .clamp(-CORRHIST_LIMIT / 4, CORRHIST_LIMIT / 4);
-            td.pawn_correction
-                .update(td.pos.pawn_key, td.pos.side_to_move, bonus);
+            let corr_stm = td.pos.side_to_move;
+            shared.corr.update(CorrKind::Pawn, td.pos.pawn_key, corr_stm, bonus);
             // Non-pawn correction: update both colors' tables
-            td.non_pawn_correction.update(
-                td.pos.non_pawn_key[0], Color::White, td.pos.side_to_move, bonus);
-            td.non_pawn_correction.update(
-                td.pos.non_pawn_key[1], Color::Black, td.pos.side_to_move, bonus);
+            shared.corr.update(CorrKind::NonPawnWhite, td.pos.non_pawn_key[0], corr_stm, bonus);
+            shared.corr.update(CorrKind::NonPawnBlack, td.pos.non_pawn_key[1], corr_stm, bonus);
             // Minor piece correction
-            td.minor_correction
-                .update(td.pos.minor_key, td.pos.side_to_move, bonus);
+            shared.corr.update(CorrKind::Minor, td.pos.minor_key, corr_stm, bonus);
             // Continuation correction: update subtables at offsets 2 and 4
             let base = ply + SS_OFFSET;
             for &offset in &[2, 4] {
@@ -2315,6 +2383,9 @@ fn capture_value(pos: &Position, m: Move) -> i32 {
     if mt == MT_PROMOTION {
         // Promotion value (even if also a capture, promo piece is the big gain)
         return PIECE_VALUE[m.promo_type() as usize];
+    }
+    if mt == MT_CASTLING {
+        return 0;
     }
     let victim = pos.board[m.to_sq().index()];
     if victim == Piece::NONE {
@@ -2446,10 +2517,11 @@ fn quiescence<NT: NodeType>(
         td.used_lazy_eval = false;
         raw_eval = if tt_eval != SCORE_NONE { tt_eval } else { evaluate_pos(td) };
         let lazy_eval_qs = td.used_lazy_eval || td.skill.active;
-        // Ensure NNUE threat features are up-to-date even when TT eval is used,
-        // so children can do incremental threat updates instead of full recomputes.
+        // Bring the NNUE accumulators (PST and threats) up-to-date even when
+        // TT eval is used, so children can do incremental updates instead of
+        // full recomputes.
         if tt_eval != SCORE_NONE && nnue::network::has_network() {
-            td.nnue.ensure_updated(&td.pos);
+            td.nnue.ensure_all_updated(&td.pos);
         }
         // Lazy eval: PeSTO score used, skip correction history (trained against NNUE)
         let corr_val = if lazy_eval_qs {
@@ -2457,10 +2529,11 @@ fn quiescence<NT: NodeType>(
         } else {
             // Stand-pat with correction history
             let qs_stm = td.pos.side_to_move;
-            let pawn_entry = td.pawn_correction.get(td.pos.pawn_key, qs_stm) as i64;
-            let non_pawn_entry = td.non_pawn_correction.get(td.pos.non_pawn_key[0], Color::White, qs_stm) as i64
-                + td.non_pawn_correction.get(td.pos.non_pawn_key[1], Color::Black, qs_stm) as i64;
-            let minor_entry = td.minor_correction.get(td.pos.minor_key, qs_stm) as i64;
+            let pawn_entry = shared.corr.get(CorrKind::Pawn, td.pos.pawn_key, qs_stm) as i64;
+            let non_pawn_entry =
+                shared.corr.get(CorrKind::NonPawnWhite, td.pos.non_pawn_key[0], qs_stm) as i64
+                + shared.corr.get(CorrKind::NonPawnBlack, td.pos.non_pawn_key[1], qs_stm) as i64;
+            let minor_entry = shared.corr.get(CorrKind::Minor, td.pos.minor_key, qs_stm) as i64;
             let cont_corr = {
                 let base = ply + SS_OFFSET;
                 let mut cc = 0i64;
@@ -2583,6 +2656,8 @@ fn quiescence<NT: NodeType>(
             continue;
         }
 
+        shared.tt.prefetch(child_key(&td.pos, m, td.pos.board[m.from_sq().index()]));
+
         // The same blind spots the main search has (see the move loop there). This is
         // the one that matters most: a beginner who resolved every capture to the end
         // would never leave a piece en prise, however badly it judged the result.
@@ -2604,7 +2679,8 @@ fn quiescence<NT: NodeType>(
             continue;
         }
 
-        let is_recapture = m.to_sq() == recapture_sq;
+        // Castling is encoded as king-captures-rook; that square is not a recapture.
+        let is_recapture = m.move_type() != MT_CASTLING && m.to_sq() == recapture_sq;
 
         // Skip remaining quiet evasions after one improved position.
         // Prevents check chain explosion in Q vs Q endgames.
@@ -2755,7 +2831,7 @@ mod tests {
         // this one: without the lock they would hand this search a handicap.
         let _guard = skill::lock_level();
         let pos = Position::from_fen(fen).unwrap();
-        let shared = SharedState::new(4);
+        let shared = SharedState::new(4, 1);
         let mut td = ThreadData::new(0);
         // STOP is a process global and other tests leave it raised — an interface
         // engine dropped by its test aborts through it and nothing lowers it after.
@@ -2775,7 +2851,7 @@ mod tests {
     /// process and the test harness runs tests in parallel.
     fn search_at_level(fen: &str, level: i32, seed: u64, depth: i32) -> (Move, i32, u64) {
         let pos = Position::from_fen(fen).unwrap();
-        let shared = SharedState::new(4);
+        let shared = SharedState::new(4, 1);
         let mut td = ThreadData::new(0);
         // Same residue as in `search_depth`: cleared, or the search never starts.
         crate::threads::STOP.store(false, std::sync::atomic::Ordering::Relaxed);
@@ -2857,7 +2933,7 @@ mod tests {
         for level in [1, 4, 8, 12, 16, 19] {
             let allowed = skill::depth_for(level);
             for seed in 0..8u64 {
-                let shared = SharedState::new(4);
+                let shared = SharedState::new(4, 1);
                 let mut td = ThreadData::new(0);
                 skill::set(level, seed * 0x9E37);
                 // Ask for far more than the rung permits: the rung must still win.
@@ -2947,7 +3023,7 @@ mod tests {
 
         // Soft budget: the iteration that crosses it is allowed to finish,
         // so the search overshoots the budget but stays under the hard cap.
-        let shared = SharedState::new(4);
+        let shared = SharedState::new(4, 1);
         let mut td = ThreadData::new(0);
         crate::threads::STOP.store(false, std::sync::atomic::Ordering::Relaxed);
         td.prepare_search(&pos, &SearchLimits::SoftNodes { soft: 2000, hard: 200_000 });
@@ -2960,7 +3036,7 @@ mod tests {
 
         // Bare node limit stays hard: the search aborts within one 512-node
         // tick of the limit instead of finishing the iteration.
-        let shared = SharedState::new(4);
+        let shared = SharedState::new(4, 1);
         let mut td = ThreadData::new(0);
         crate::threads::STOP.store(false, std::sync::atomic::Ordering::Relaxed);
         td.prepare_search(&pos, &SearchLimits::Nodes(2000));

@@ -208,7 +208,7 @@ pub(crate) const fn init_king_attacks() -> [u64; 64] {
     table
 }
 
-const fn init_pawn_attacks() -> [[u64; 64]; 2] {
+pub(crate) const fn init_pawn_attacks() -> [[u64; 64]; 2] {
     let mut table = [[0u64; 64]; 2];
     let mut sq = 0u8;
     while sq < 64 {
@@ -312,6 +312,23 @@ static BISHOP_TABLE: [u64; 5248] = init_bishop_table();
 const _BETWEEN_LINE: ([[u64; 64]; 64], [[u64; 64]; 64]) = init_between_line();
 static BETWEEN_BB: [[u64; 64]; 64] = _BETWEEN_LINE.0;
 static LINE_BB: [[u64; 64]; 64] = _BETWEEN_LINE.1;
+static ALIGNED_BB: [u64; 64] = init_aligned();
+
+/// One row of `LINE_BB` folded into a mask per square.
+const fn init_aligned() -> [u64; 64] {
+    let line = _BETWEEN_LINE.1;
+    let mut out = [0u64; 64];
+    let mut s = 0;
+    while s < 64 {
+        let mut t = 0;
+        while t < 64 {
+            out[s] |= line[s][t];
+            t += 1;
+        }
+        s += 1;
+    }
+    out
+}
 
 // ============================================================
 // Public attack lookup functions
@@ -354,7 +371,7 @@ fn magic_rook_attacks(sq: Square, occupied: u64) -> u64 {
 }
 
 // ============================================================
-// PEXT attack tables (BMI2) — ~840 KB heap, initialized once at startup
+// PEXT attack tables (BMI2) — ~840 KB of read-only data, built at compile time
 // ============================================================
 
 #[cfg(target_arch = "x86_64")]
@@ -362,22 +379,14 @@ fn magic_rook_attacks(sq: Square, occupied: u64) -> u64 {
 mod pext {
     #![allow(unsafe_op_in_unsafe_fn)]
 
-    use std::sync::OnceLock;
     use super::{sliding_attack_otf, BISHOP_DELTAS, ROOK_DELTAS};
     use crate::types::Square;
 
+    #[derive(Clone, Copy)]
     struct PextEntry {
         mask: u64,
         offset: u32,
     }
-
-    struct PextTables {
-        rook: [PextEntry; 64],
-        bishop: [PextEntry; 64],
-        attacks: Vec<u64>,
-    }
-
-    static TABLES: OnceLock<PextTables> = OnceLock::new();
 
     /// Rook occupancy mask for square `sq` (edges excluded).
     const fn rook_mask(sq: u8) -> u64 {
@@ -418,101 +427,145 @@ mod pext {
         mask
     }
 
-    /// Software PEXT emulation (for table initialization — avoids hardware dependency).
-    const fn soft_pext(val: u64, mask: u64) -> usize {
-        let mut result = 0usize;
-        let mut bit = 0;
-        let mut m = mask;
-        while m != 0 {
-            let lsb = m & m.wrapping_neg();
-            if val & lsb != 0 { result |= 1 << bit; }
-            bit += 1;
-            m &= m - 1;
+    /// One ray of a slider: the squares along `ray` up to and including the first
+    /// blocker in `occ`. `towards_higher` says which end of the ray is nearest the
+    /// piece — the lowest set blocker for a ray running up the board, the highest
+    /// for one running down.
+    const fn ray_attack(ray: u64, occ: u64, towards_higher: bool) -> u64 {
+        let blockers = ray & occ;
+        if blockers == 0 {
+            return ray;
         }
-        result
+        if towards_higher {
+            let first = blockers & blockers.wrapping_neg();
+            ray & (first << 1).wrapping_sub(1)
+        } else {
+            let first = 1u64 << (63 - blockers.leading_zeros());
+            ray & !first.wrapping_sub(1)
+        }
     }
 
-    fn init() -> PextTables {
-        let mut attacks = Vec::new();
-        let mut rook = std::array::from_fn::<_, 64, _>(|_| PextEntry { mask: 0, offset: 0 });
-        let mut bishop = std::array::from_fn::<_, 64, _>(|_| PextEntry { mask: 0, offset: 0 });
+    /// The empty-board ray from `sq` along one delta.
+    const fn ray_mask(sq: u8, delta: i8) -> u64 {
+        sliding_attack_otf(sq, 0, &[delta, delta, delta, delta])
+    }
 
-        for sq in 0..64u8 {
-            let mask = rook_mask(sq);
-            let base = attacks.len();
-            attacks.resize(base + (1 << mask.count_ones()), 0u64);
-            let mut occ = 0u64;
-            loop {
-                attacks[base + soft_pext(occ, mask)] = sliding_attack_otf(sq, occ, &ROOK_DELTAS);
-                occ = occ.wrapping_sub(mask) & mask;
-                if occ == 0 { break; }
+    /// Slider attacks from `sq` on `occ`, one ray at a time. The same answer as
+    /// walking the rays square by square, at a fraction of the compile-time steps —
+    /// this runs a hundred thousand times when the tables are built.
+    const fn slider_attacks(rays: &[u64; 4], deltas: &[i8; 4], occ: u64) -> u64 {
+        let mut attacks = 0u64;
+        let mut d = 0;
+        while d < 4 {
+            attacks |= ray_attack(rays[d], occ, deltas[d] > 0);
+            d += 1;
+        }
+        attacks
+    }
+
+    const fn table_size(rook: bool) -> usize {
+        let mut total = 0usize;
+        let mut sq = 0u8;
+        while sq < 64 {
+            let mask = if rook { rook_mask(sq) } else { bishop_mask(sq) };
+            total += 1 << mask.count_ones();
+            sq += 1;
+        }
+        total
+    }
+
+    const ROOK_TABLE_SIZE: usize = table_size(true);
+    const BISHOP_TABLE_SIZE: usize = table_size(false);
+    const ATTACK_TABLE_SIZE: usize = ROOK_TABLE_SIZE + BISHOP_TABLE_SIZE;
+    const _: () = assert!(ROOK_TABLE_SIZE == 102_400 && BISHOP_TABLE_SIZE == 5_248);
+
+    /// Rook entries index the front of the attack table, bishop entries the back.
+    const fn build_entries(rook: bool) -> [PextEntry; 64] {
+        let mut out = [PextEntry { mask: 0, offset: 0 }; 64];
+        let mut offset = if rook { 0usize } else { ROOK_TABLE_SIZE };
+        let mut sq = 0u8;
+        while sq < 64 {
+            let mask = if rook { rook_mask(sq) } else { bishop_mask(sq) };
+            out[sq as usize] = PextEntry { mask, offset: offset as u32 };
+            offset += 1 << mask.count_ones();
+            sq += 1;
+        }
+        out
+    }
+
+    const fn build_attacks() -> [u64; ATTACK_TABLE_SIZE] {
+        let mut attacks = [0u64; ATTACK_TABLE_SIZE];
+        let mut kind = 0;
+        while kind < 2 {
+            let rook = kind == 0;
+            let entries = build_entries(rook);
+            let deltas = if rook { &ROOK_DELTAS } else { &BISHOP_DELTAS };
+            let mut sq = 0u8;
+            while sq < 64 {
+                let entry = entries[sq as usize];
+                let base = entry.offset as usize;
+                let rays = [
+                    ray_mask(sq, deltas[0]),
+                    ray_mask(sq, deltas[1]),
+                    ray_mask(sq, deltas[2]),
+                    ray_mask(sq, deltas[3]),
+                ];
+                // The carry-rippler visits the subsets of the mask in increasing
+                // order of their PEXT index, so a running counter is that index.
+                let mut occ = 0u64;
+                let mut i = 0usize;
+                loop {
+                    attacks[base + i] = slider_attacks(&rays, deltas, occ);
+                    i += 1;
+                    occ = occ.wrapping_sub(entry.mask) & entry.mask;
+                    if occ == 0 {
+                        break;
+                    }
+                }
+                sq += 1;
             }
-            rook[sq as usize] = PextEntry { mask, offset: base as u32 };
+            kind += 1;
         }
-
-        for sq in 0..64u8 {
-            let mask = bishop_mask(sq);
-            let base = attacks.len();
-            attacks.resize(base + (1 << mask.count_ones()), 0u64);
-            let mut occ = 0u64;
-            loop {
-                attacks[base + soft_pext(occ, mask)] = sliding_attack_otf(sq, occ, &BISHOP_DELTAS);
-                occ = occ.wrapping_sub(mask) & mask;
-                if occ == 0 { break; }
-            }
-            bishop[sq as usize] = PextEntry { mask, offset: base as u32 };
-        }
-
-        PextTables { rook, bishop, attacks }
+        attacks
     }
 
-    /// Initialize PEXT tables (idempotent, called once at startup).
-    pub fn ensure_init() {
-        TABLES.get_or_init(init);
-    }
+    // Everything is computed at compile time and lives in read-only data: nothing to
+    // build before the first search, no initialisation word to read before each
+    // lookup, and the attack row is indexed directly instead of through a pointer
+    // loaded first. Two dependent loads per attack — the entry, then the row.
+    static ROOK_ENTRIES: [PextEntry; 64] = build_entries(true);
+    static BISHOP_ENTRIES: [PextEntry; 64] = build_entries(false);
+    static ATTACKS: [u64; ATTACK_TABLE_SIZE] = build_attacks();
 
-    /// The tables are read without checking they exist, which is what keeps these two
-    /// functions branchless and is worth a noticeable slice of the node rate. The
-    /// engine earns that by building them in `main` before anything can search.
-    ///
-    /// A unit-test binary has no `main` of ours, so nothing would build them and the
-    /// first slider attack in a test would read an unbuilt table. Test builds therefore
-    /// build them on demand; the shipped engine keeps the branchless read.
-    #[inline(always)]
-    fn tables() -> &'static PextTables {
-        #[cfg(test)]
-        return TABLES.get_or_init(init);
-        #[cfg(not(test))]
-        unsafe {
-            debug_assert!(TABLES.get().is_some(), "slider tables read before init_pext");
-            TABLES.get().unwrap_unchecked()
-        }
-    }
+    /// Kept for the callers that used to order the table build before the first
+    /// search; there is nothing left to build.
+    pub fn ensure_init() {}
 
     #[target_feature(enable = "bmi2")]
     #[inline]
     pub unsafe fn rook_attacks(sq: Square, occupied: u64) -> u64 {
         use std::arch::x86_64::_pext_u64;
-        let tables = tables();
-        let entry = tables.rook.get_unchecked(sq.index());
+        debug_assert!(sq.0 < 64, "rook_attacks: square {} OOB", sq.0);
+        let entry = ROOK_ENTRIES.get_unchecked(sq.index());
         let idx = _pext_u64(occupied, entry.mask) as usize + entry.offset as usize;
-        *tables.attacks.get_unchecked(idx)
+        debug_assert!(idx < ATTACK_TABLE_SIZE);
+        *ATTACKS.get_unchecked(idx)
     }
 
     #[target_feature(enable = "bmi2")]
     #[inline]
     pub unsafe fn bishop_attacks(sq: Square, occupied: u64) -> u64 {
         use std::arch::x86_64::_pext_u64;
-        let tables = tables();
-        let entry = tables.bishop.get_unchecked(sq.index());
+        debug_assert!(sq.0 < 64, "bishop_attacks: square {} OOB", sq.0);
+        let entry = BISHOP_ENTRIES.get_unchecked(sq.index());
         let idx = _pext_u64(occupied, entry.mask) as usize + entry.offset as usize;
-        *tables.attacks.get_unchecked(idx)
+        debug_assert!(idx < ATTACK_TABLE_SIZE);
+        *ATTACKS.get_unchecked(idx)
     }
 }
 
-/// Build the PEXT tables (idempotent). `soft_pext` does the enumeration, so
-/// this works — and is only called — when the *running* CPU was elected for
-/// PEXT, whatever the build target.
+/// The PEXT tables are compile-time constants; this is kept so that the callers
+/// that ordered their construction before the first search still compile.
 #[cfg(target_arch = "x86_64")]
 pub fn init_pext() { pext::ensure_init(); }
 
@@ -604,6 +657,17 @@ pub fn between_bb(s1: Square, s2: Square) -> u64 {
 #[inline(always)]
 pub fn line_bb(s1: Square, s2: Square) -> u64 {
     LINE_BB[s1.index()][s2.index()]
+}
+
+/// Every square sharing a rank, file, or diagonal with `sq`, `sq` itself included.
+///
+/// The same question as `line_bb(x, sq) != 0` asked of many squares at once, and the
+/// reason to prefer it on a hot path: 512 bytes that stay in L1 against 32 KB of
+/// two-index lookups. Emptying a square outside this mask cannot uncover a slider
+/// bearing on `sq`.
+#[inline(always)]
+pub fn aligned_bb(sq: Square) -> u64 {
+    ALIGNED_BB[sq.index()]
 }
 
 /// All pieces of either color attacking a square (used by SEE in Phase 3).
@@ -864,11 +928,63 @@ mod tests {
         assert!(between & Square::A8.bb() != 0);
     }
 
+    /// The mask is folded out of `LINE_BB`, so it is worth holding to a definition
+    /// that owes nothing to that table: two squares are aligned when they share a
+    /// file, a rank, or a diagonal.
+    #[test]
+    fn aligned_squares_are_the_ones_sharing_a_file_rank_or_diagonal() {
+        for s in 0..64u8 {
+            let sq = Square(s);
+            for t in 0..64u8 {
+                let other = Square(t);
+                let df = sq.file() as i32 - other.file() as i32;
+                let dr = sq.rank() as i32 - other.rank() as i32;
+                let aligned = df == 0 || dr == 0 || df.abs() == dr.abs();
+                assert_eq!(
+                    aligned_bb(sq) & other.bb() != 0,
+                    aligned,
+                    "squares {s} and {t}",
+                );
+            }
+        }
+    }
+
     #[test]
     fn test_shift_no_wrap() {
         // Shifting H-file east should produce nothing
         assert_eq!(shift_east(FILE_H), 0);
         // Shifting A-file west should produce nothing
         assert_eq!(shift_west(FILE_A), 0);
+    }
+
+    /// The compile-time PEXT tables answer exactly what the ray walker answers, for
+    /// every square and a spread of sparse and dense occupancies.
+    #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+    #[test]
+    fn the_pext_tables_agree_with_the_ray_walker() {
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        };
+        for sq in 0..64u8 {
+            for _ in 0..512 {
+                let occ = match next() % 3 {
+                    0 => next(),
+                    1 => next() & next(),
+                    _ => next() & next() & next(),
+                };
+                let square = Square(sq);
+                // SAFETY: the test only runs on a build target that has BMI2.
+                let (rook, bishop) = unsafe {
+                    (super::pext::rook_attacks(square, occ), super::pext::bishop_attacks(square, occ))
+                };
+                assert_eq!(rook, sliding_attack_otf(sq, occ, &ROOK_DELTAS), "rook from {sq} on {occ:#x}");
+                assert_eq!(bishop, sliding_attack_otf(sq, occ, &BISHOP_DELTAS), "bishop from {sq} on {occ:#x}");
+            }
+        }
     }
 }

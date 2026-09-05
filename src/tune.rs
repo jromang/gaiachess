@@ -222,6 +222,16 @@ tunable! {
     /// Futility pruning base margin subtracted (centipawns).
     FP_BASE = 128, 30, 300, 15;
 
+    // === Bad-noisy futility pruning (4) ===
+    /// Apply BNFP while lmr_depth in 1024ths of a ply is at most X (~8.9 ply).
+    BNFP_DEPTH_LIMIT = 9131, 1024, 16384, 256;
+    /// BNFP base margin added to static eval (centipawns).
+    BNFP_BASE = 159, 0, 400, 16;
+    /// BNFP margin per 1024ths of lmr_depth.
+    BNFP_MULT = 74, 0, 256, 8;
+    /// BNFP captured-piece term: `value * X / 1024`.
+    BNFP_CAPTURED = 1056, 256, 2048, 64;
+
     // === History pruning (1) ===
     /// History pruning margin: prune quiets with history < X * depth.
     HIST_PRUNE_MARGIN = -5132, -10000, -1000, 500;
@@ -466,8 +476,7 @@ tunable! {
 }
 
 // === Move Overhead — standalone, exposed as UCI option ===
-static MOVE_OVERHEAD_VALUE: std::sync::atomic::AtomicI32 =
-    std::sync::atomic::AtomicI32::new(100);
+static MOVE_OVERHEAD_VALUE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(100);
 
 /// Overhead subtracted from available time to prevent flagging (ms).
 #[allow(non_snake_case)]
@@ -527,6 +536,8 @@ mod tests {
         assert_eq!(NMP_BASE_R(), 5);
         assert_eq!(STAT_BONUS_MUL(), 153);
         assert_eq!(MVV_MULTIPLIER(), 17);
+        assert_eq!(BNFP_BASE(), 159);
+        assert_eq!(BNFP_DEPTH_LIMIT(), 9131);
         assert_eq!(QS_SEE_THRESHOLD(), -83);
     }
 
@@ -573,7 +584,10 @@ mod tests {
         // against a number written here by hand is what this used to do, and the number
         // was left behind at 90 while the list grew past a hundred: a test that has to
         // be edited every time a technique lands is a test nobody edits.
-        assert_eq!(csv.lines().count(), emit_json().matches("\"min_value\"").count());
+        assert_eq!(
+            csv.lines().count(),
+            emit_json().matches("\"min_value\"").count()
+        );
         assert!(csv.lines().count() > 80, "the tunable list has collapsed");
     }
 

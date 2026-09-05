@@ -96,7 +96,10 @@ impl<const N: usize> StatField for [u64; N] {
 #[cfg(feature = "stats")]
 impl StatField for TechDepth {
     fn zeroed() -> Self {
-        TechDepth { tried: [0; 8], cut: [0; 8] }
+        TechDepth {
+            tried: [0; 8],
+            cut: [0; 8],
+        }
     }
     fn clear_field(&mut self) {
         self.tried = [0; 8];
@@ -238,6 +241,8 @@ define_stats! {
     lmp_pruned: [u64; 8];
     /// Quiet moves pruned by futility pruning, by remaining depth.
     fp_pruned: [u64; 8];
+    /// Losing captures pruned by bad-noisy futility, by remaining depth.
+    bnfp_pruned: [u64; 8];
 
     /// Singular extension verification searches run.
     se_tried: u64;
@@ -275,7 +280,8 @@ pub fn move_category(
     }
     let mt = m.move_type();
     let is_noisy =
-        mt == MT_PROMOTION || mt == MT_EN_PASSANT || pos.board[m.to_sq().index()] != Piece::NONE;
+        mt == MT_PROMOTION || mt == MT_EN_PASSANT
+        || (mt != MT_CASTLING && pos.board[m.to_sq().index()] != Piece::NONE);
     if is_noisy {
         return if crate::see::see(pos, m, 0) { 1 } else { 2 };
     }
@@ -296,7 +302,11 @@ impl SearchStats {
         use std::fmt::Write;
         let mut out = String::new();
         let pct = |num: u64, den: u64| -> f64 {
-            if den == 0 { 0.0 } else { num as f64 * 100.0 / den as f64 }
+            if den == 0 {
+                0.0
+            } else {
+                num as f64 * 100.0 / den as f64
+            }
         };
 
         let ab: u64 = self.ab_nodes.iter().sum();
@@ -306,7 +316,12 @@ impl SearchStats {
         let _ = writeln!(
             out,
             "nodes        ab {} (root {} pv {} nonpv {})  qs {} ({:.1}% of total)",
-            ab, self.ab_nodes[0], self.ab_nodes[1], self.ab_nodes[2], qs, pct(qs, total)
+            ab,
+            self.ab_nodes[0],
+            self.ab_nodes[1],
+            self.ab_nodes[2],
+            qs,
+            pct(qs, total)
         );
 
         // Move ordering quality
@@ -316,22 +331,35 @@ impl SearchStats {
                 sum += (i as u64 + 1) * c;
                 n += c;
             }
-            if n == 0 { 0.0 } else { sum as f64 / n as f64 }
+            if n == 0 {
+                0.0
+            } else {
+                sum as f64 / n as f64
+            }
         };
         let _ = writeln!(
             out,
             "cutoffs      {} (first move {:.1}%, mean index {:.2})",
-            self.cutoffs, pct(self.cutoff_first, self.cutoffs), mean_idx
+            self.cutoffs,
+            pct(self.cutoff_first, self.cutoffs),
+            mean_idx
         );
         let mut cats = String::new();
         for (i, name) in CAT_NAMES.iter().enumerate() {
-            let _ = write!(cats, "{} {:.1}%  ", name, pct(self.cutoff_by_cat[i], self.cutoffs));
+            let _ = write!(
+                cats,
+                "{} {:.1}%  ",
+                name,
+                pct(self.cutoff_by_cat[i], self.cutoffs)
+            );
         }
         let _ = writeln!(out, "cutoff by    {}", cats.trim_end());
         let _ = writeln!(
             out,
             "qsearch      standpat cuts {}  tt cuts {}  move cuts {} (first {:.1}%)",
-            self.qs_standpat_cutoffs, self.qs_tt_cutoffs, self.qs_cutoffs,
+            self.qs_standpat_cutoffs,
+            self.qs_tt_cutoffs,
+            self.qs_cutoffs,
             pct(self.qs_cutoff_first, self.qs_cutoffs)
         );
 
@@ -349,7 +377,9 @@ impl SearchStats {
         let _ = writeln!(
             out,
             "eval         calls {}  lazy {:.1}%  tt reuse {}",
-            self.eval_calls, pct(self.lazy_evals, self.eval_calls), self.tt_eval_reused
+            self.eval_calls,
+            pct(self.lazy_evals, self.eval_calls),
+            self.tt_eval_reused
         );
 
         // Aspiration + re-searches
@@ -374,13 +404,22 @@ impl SearchStats {
             let mut per_depth = String::new();
             for d in 1..8 {
                 if t.tried[d] > 0 {
-                    let _ = write!(per_depth, " d{}{}:{:.0}%", d,
-                        if d == 7 { "+" } else { "" }, pct(t.cut[d], t.tried[d]));
+                    let _ = write!(
+                        per_depth,
+                        " d{}{}:{:.0}%",
+                        d,
+                        if d == 7 { "+" } else { "" },
+                        pct(t.cut[d], t.tried[d])
+                    );
                 }
             }
             format!(
                 "{:<8} tried {:>10}  cut {:>9} ({:>5.1}%) {}",
-                name, tried, cut, pct(cut, tried), per_depth
+                name,
+                tried,
+                cut,
+                pct(cut, tried),
+                per_depth
             )
         };
         let _ = writeln!(out, "{}", tech("rfp", &self.rfp));
@@ -408,14 +447,19 @@ impl SearchStats {
         let _ = writeln!(out, "{}", prune("hist_pr", &self.hist_pruned));
         let _ = writeln!(out, "{}", prune("lmp_pr", &self.lmp_pruned));
         let _ = writeln!(out, "{}", prune("fp_pr", &self.fp_pruned));
+        let _ = writeln!(out, "{}", prune("bnfp_pr", &self.bnfp_pruned));
         let _ = writeln!(out, "skip_q       {}", self.quiets_skipped);
 
         // Singular extensions
         let _ = writeln!(
             out,
             "se           tried {}  ext1 {}  ext2 {}  ext3 {}  negext {}  multicut {}",
-            self.se_tried, self.se_ext1, self.se_ext2, self.se_ext3,
-            self.se_negext, self.se_multicut
+            self.se_tried,
+            self.se_ext1,
+            self.se_ext2,
+            self.se_ext3,
+            self.se_negext,
+            self.se_multicut
         );
 
         out
@@ -435,12 +479,10 @@ pub mod dbg {
     pub const SLOTS: usize = 32;
 
     /// Hit-rate slots: [0] = calls, [1] = hits.
-    static HIT: [[AtomicU64; 2]; SLOTS] =
-        [const { [const { AtomicU64::new(0) }; 2] }; SLOTS];
+    static HIT: [[AtomicU64; 2]; SLOTS] = [const { [const { AtomicU64::new(0) }; 2] }; SLOTS];
 
     /// Mean slots: [0] = count, [1] = sum, [2] = min, [3] = max.
-    static MEAN: [[AtomicI64; 4]; SLOTS] =
-        [const { [const { AtomicI64::new(0) }; 4] }; SLOTS];
+    static MEAN: [[AtomicI64; 4]; SLOTS] = [const { [const { AtomicI64::new(0) }; 4] }; SLOTS];
 
     /// Record a boolean condition into a hit-rate slot; returns the condition.
     #[allow(dead_code)]

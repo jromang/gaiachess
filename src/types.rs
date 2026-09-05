@@ -304,7 +304,8 @@ pub const MT_NORMAL: u16 = 0;
 pub const MT_PROMOTION: u16 = 1 << 14;
 /// En passant capture.
 pub const MT_EN_PASSANT: u16 = 2 << 14;
-/// Castling (king move to rook's destination; the rook is moved implicitly).
+/// Castling, encoded as king-from → rook-from (the king "captures" its own rook).
+/// Final squares are always c/g (king) and d/f (rook) on the back rank.
 pub const MT_CASTLING: u16 = 3 << 14;
 
 /// A chess move encoded in 16 bits.
@@ -379,8 +380,18 @@ impl Move {
     }
 
     pub fn to_uci(self) -> String {
+        self.to_uci_960(false)
+    }
+
+    /// UCI move string. With `chess960`, castling is king-from + rook-from
+    /// (`e1h1`); otherwise the king destination is rewritten to c/g (`e1g1`).
+    pub fn to_uci_960(self, chess960: bool) -> String {
         let from = self.from_sq();
-        let to = self.to_sq();
+        let to = if self.move_type() == MT_CASTLING && !chess960 {
+            self.castle_king_to()
+        } else {
+            self.to_sq()
+        };
         let mut s = format!("{from}{to}");
         if self.move_type() == MT_PROMOTION {
             let promo = match self.promo_type() {
@@ -393,6 +404,34 @@ impl Move {
             s.push(promo);
         }
         s
+    }
+
+    /// King destination after this castling move (file c or g, same rank).
+    #[inline(always)]
+    pub const fn castle_king_to(self) -> Square {
+        debug_assert!(self.move_type() == MT_CASTLING);
+        let from = self.from_sq();
+        let rook = self.to_sq();
+        Square::new(if rook.file() > from.file() { 6 } else { 2 }, from.rank())
+    }
+
+    /// Rook destination after this castling move (file d or f, same rank).
+    #[inline(always)]
+    pub const fn castle_rook_to(self) -> Square {
+        debug_assert!(self.move_type() == MT_CASTLING);
+        let from = self.from_sq();
+        let rook = self.to_sq();
+        Square::new(if rook.file() > from.file() { 5 } else { 3 }, from.rank())
+    }
+
+    /// Square the moving piece lands on: king dest for castling, `to` otherwise.
+    #[inline(always)]
+    pub const fn lands_on(self) -> Square {
+        if self.move_type() == MT_CASTLING {
+            self.castle_king_to()
+        } else {
+            self.to_sq()
+        }
     }
 }
 
@@ -448,20 +487,35 @@ impl<T: Copy, const N: usize> ArrayBuf<T, N> {
     pub fn copy_within(&mut self, src: usize, dst: usize) {
         self.data[dst] = self.data[src];
     }
+
+    /// The first `len` entries as a slice. The caller vouches that all of them
+    /// have been written.
+    #[inline(always)]
+    pub fn filled(&self, len: usize) -> &[T] {
+        debug_assert!(len <= N, "ArrayBuf::filled: {len} > {N}");
+        // SAFETY: MaybeUninit<T> has the layout of T, and the caller guarantees
+        // that indices 0..len were initialised.
+        unsafe { std::slice::from_raw_parts(self.data.as_ptr() as *const T, len) }
+    }
 }
 
+// The index is always a count the caller maintains below the capacity (asserted at
+// every push site in debug builds); the release build skips the bounds check that a
+// slice index would put on every generated move and every sort step.
 impl<T: Copy, const N: usize> std::ops::Index<usize> for ArrayBuf<T, N> {
     type Output = T;
     #[inline(always)]
     fn index(&self, i: usize) -> &T {
-        unsafe { self.data[i].assume_init_ref() }
+        debug_assert!(i < N, "ArrayBuf: index {} out of capacity {}", i, N);
+        unsafe { self.data.get_unchecked(i).assume_init_ref() }
     }
 }
 
 impl<T: Copy, const N: usize> std::ops::IndexMut<usize> for ArrayBuf<T, N> {
     #[inline(always)]
     fn index_mut(&mut self, i: usize) -> &mut T {
-        unsafe { self.data[i].assume_init_mut() }
+        debug_assert!(i < N, "ArrayBuf: index {} out of capacity {}", i, N);
+        unsafe { self.data.get_unchecked_mut(i).assume_init_mut() }
     }
 }
 
@@ -480,72 +534,26 @@ pub const BLACK_OOO: u8 = 8;
 /// All four castling rights set.
 pub const ALL_CASTLING: u8 = 15;
 
-/// For each square, the castling rights that survive when a piece
-/// moves from or to that square. AND with current rights.
-pub const CASTLING_RIGHTS_MASK: [u8; 64] = {
-    let mut mask = [ALL_CASTLING; 64];
-    // White king on E1: loses both white castling rights
-    mask[Square::E1.0 as usize] = ALL_CASTLING ^ (WHITE_OO | WHITE_OOO);
-    // White rooks
-    mask[Square::H1.0 as usize] = ALL_CASTLING ^ WHITE_OO;
-    mask[Square::A1.0 as usize] = ALL_CASTLING ^ WHITE_OOO;
-    // Black king on E8
-    mask[Square::E8.0 as usize] = ALL_CASTLING ^ (BLACK_OO | BLACK_OOO);
-    // Black rooks
-    mask[Square::H8.0 as usize] = ALL_CASTLING ^ BLACK_OO;
-    mask[Square::A8.0 as usize] = ALL_CASTLING ^ BLACK_OOO;
-    mask
-};
+/// Number of distinct castling rights (K, Q, k, q).
+pub const CASTLING_NB: usize = 4;
 
-/// King and rook source/destination squares for a single castling move.
-pub struct CastlingData {
-    pub king_from: Square,
-    pub king_to: Square,
-    pub rook_from: Square,
-    pub rook_to: Square,
+/// Index of a single right bit (1, 2, 4, 8) into the 4-slot castling tables.
+#[inline(always)]
+pub const fn castling_idx(right: u8) -> usize {
+    debug_assert!(right == WHITE_OO || right == WHITE_OOO || right == BLACK_OO || right == BLACK_OOO);
+    right.trailing_zeros() as usize
 }
 
-// Indexed by castling right bit value (1, 2, 4, 8)
-pub const CASTLING_DATA: [CastlingData; 9] = [
-    // 0: unused
-    CastlingData { king_from: Square::A1, king_to: Square::A1, rook_from: Square::A1, rook_to: Square::A1 },
-    // 1: WHITE_OO
-    CastlingData { king_from: Square::E1, king_to: Square::G1, rook_from: Square::H1, rook_to: Square::F1 },
-    // 2: WHITE_OOO
-    CastlingData { king_from: Square::E1, king_to: Square::C1, rook_from: Square::A1, rook_to: Square::D1 },
-    // 3: unused
-    CastlingData { king_from: Square::A1, king_to: Square::A1, rook_from: Square::A1, rook_to: Square::A1 },
-    // 4: BLACK_OO
-    CastlingData { king_from: Square::E8, king_to: Square::G8, rook_from: Square::H8, rook_to: Square::F8 },
-    // 5-7: unused
-    CastlingData { king_from: Square::A1, king_to: Square::A1, rook_from: Square::A1, rook_to: Square::A1 },
-    CastlingData { king_from: Square::A1, king_to: Square::A1, rook_from: Square::A1, rook_to: Square::A1 },
-    CastlingData { king_from: Square::A1, king_to: Square::A1, rook_from: Square::A1, rook_to: Square::A1 },
-    // 8: BLACK_OOO
-    CastlingData { king_from: Square::E8, king_to: Square::C8, rook_from: Square::A8, rook_to: Square::D8 },
-];
+/// The two rights of `us`: (kingside, queenside).
+#[inline(always)]
+pub const fn castling_rights_for(us: Color) -> (u8, u8) {
+    match us {
+        Color::White => (WHITE_OO, WHITE_OOO),
+        Color::Black => (BLACK_OO, BLACK_OOO),
+    }
+}
 
-/// Squares that must be empty for castling (between king and rook, exclusive)
-pub const CASTLING_PATH: [u64; 9] = [
-    0,
-    Square::F1.bb() | Square::G1.bb(),                                   // WHITE_OO
-    Square::B1.bb() | Square::C1.bb() | Square::D1.bb(),                 // WHITE_OOO
-    0,
-    Square::F8.bb() | Square::G8.bb(),                                   // BLACK_OO
-    0, 0, 0,
-    Square::B8.bb() | Square::C8.bb() | Square::D8.bb(),                 // BLACK_OOO
-];
 
-/// Squares the king passes through (must not be attacked)
-pub const KING_CASTLING_PATH: [u64; 9] = [
-    0,
-    Square::E1.bb() | Square::F1.bb() | Square::G1.bb(),                 // WHITE_OO
-    Square::E1.bb() | Square::D1.bb() | Square::C1.bb(),                 // WHITE_OOO
-    0,
-    Square::E8.bb() | Square::F8.bb() | Square::G8.bb(),                 // BLACK_OO
-    0, 0, 0,
-    Square::E8.bb() | Square::D8.bb() | Square::C8.bb(),                 // BLACK_OOO
-];
 
 // ============================================================
 // Direction constants (square index offsets on the 8x8 board)
@@ -675,8 +683,12 @@ mod tests {
         let ep = Move::new_with_type(Square::E5, Square::D6, MT_EN_PASSANT);
         assert_eq!(ep.move_type(), MT_EN_PASSANT);
 
-        let castle = Move::new_with_type(Square::E1, Square::G1, MT_CASTLING);
+        let castle = Move::new_with_type(Square::E1, Square::H1, MT_CASTLING);
         assert_eq!(castle.move_type(), MT_CASTLING);
+        assert_eq!(castle.castle_king_to(), Square::G1);
+        assert_eq!(castle.castle_rook_to(), Square::F1);
+        assert_eq!(castle.to_uci(), "e1g1");
+        assert_eq!(castle.to_uci_960(true), "e1h1");
     }
 
     #[test]
@@ -696,12 +708,19 @@ mod tests {
     }
 
     #[test]
-    fn test_castling_rights_mask() {
-        // Moving king from E1 loses both white castling rights
-        assert_eq!(CASTLING_RIGHTS_MASK[Square::E1.index()], ALL_CASTLING ^ (WHITE_OO | WHITE_OOO));
-        // Moving rook from H1 loses white kingside
-        assert_eq!(CASTLING_RIGHTS_MASK[Square::H1.index()], ALL_CASTLING ^ WHITE_OO);
-        // Random square preserves all rights
-        assert_eq!(CASTLING_RIGHTS_MASK[Square::E4.index()], ALL_CASTLING);
+    fn test_castling_idx() {
+        assert_eq!(castling_idx(WHITE_OO), 0);
+        assert_eq!(castling_idx(WHITE_OOO), 1);
+        assert_eq!(castling_idx(BLACK_OO), 2);
+        assert_eq!(castling_idx(BLACK_OOO), 3);
+    }
+
+    #[test]
+    fn test_castle_destinations_queenside() {
+        let castle = Move::new_with_type(Square::E1, Square::A1, MT_CASTLING);
+        assert_eq!(castle.castle_king_to(), Square::C1);
+        assert_eq!(castle.castle_rook_to(), Square::D1);
+        assert_eq!(castle.to_uci(), "e1c1");
+        assert_eq!(castle.to_uci_960(true), "e1a1");
     }
 }

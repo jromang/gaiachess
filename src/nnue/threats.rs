@@ -3,32 +3,32 @@
 // lockstep, steps by a SIMD lane count, and feeds raw pointer arithmetic — an
 // iterator would hide the arithmetic these kernels exist to control.
 #![allow(clippy::needless_range_loop)]
-//! Threat features for NNUE (GaiaNet-T1 filtered pairwise encoding).
+//! Threat features for NNUE (GaiaNet-T2 pairwise encoding).
 //!
-//! 41,272 features encoding "piece A on square S attacks/defends piece B on square T",
-//! with a GaiaChess-original filter: all threats on ENEMY pieces are encoded, but
-//! defenses (same-color targets) are kept only when a pawn is involved (pawn defending
-//! P/N/R, or any piece defending a pawn). This halves the feature space vs full
-//! pairwise encodings while keeping pawn-structure and anchored-piece information.
+//! 59,808 features encoding "piece A on square S attacks/defends piece B on square T".
+//! Kings never attack and are never targets. Pawn-pawn relations are *not* in this
+//! set: they live in `pawn_pairs` (4,560 features, 3-file window) and share the i8
+//! weight array at indices `0 .. PAWN_PAIR_SIZE`; threats start at `THREAT_OFFSET`.
 //!
-//! Feature index: `baseFeature(att, def, enemy) + PIECE_OFFSET_LOOKUP[att][att_sq] + ATTACK_INDEX_LOOKUP[att][att_sq][def_sq]`
+//! Feature index: `base(att, def) + piece_offset[att][att_sq] + attack_index[att][att_sq][def_sq]`
 //!
-//! Lookup tables are initialized once via `OnceLock` at startup.
+//! Lookup tables are computed at compile time.
 //!
 //! **Incremental updates**: `ThreatAccumulator` stores per-ply threat
 //! values. On eval, dirty threats are computed from `AccDelta` (which pieces moved/captured),
 //! enumerating threats only for changed pieces (~2-4) + x-ray sliders (~0-2), instead of
-//! all ~30 pieces. Avoids full re-enumeration of the 41,272-feature space.
+//! all ~30 pieces. Pawn pairs are re-enumerated from the pawn bitboards (at most 64).
 
-use std::sync::OnceLock;
+use std::mem::MaybeUninit;
 
 use crate::bitboard::{
-    attackers_to, bishop_attacks, king_attacks, knight_attacks, pawn_attacks, pop_lsb,
-    rook_attacks,
+    attackers_to, bishop_attacks, init_king_attacks, init_knight_attacks, init_pawn_attacks,
+    king_attacks, knight_attacks, pawn_attacks, pop_lsb, rook_attacks, sliding_attack_otf,
+    BISHOP_DELTAS, ROOK_DELTAS,
 };
 use crate::position::Position;
 use crate::types::{
-    Color, Piece, PieceType, Square, Move,
+    ArrayBuf, Color, Piece, PieceType, Square, Move,
     MT_NORMAL, MT_PROMOTION, MT_EN_PASSANT, MT_CASTLING,
     pawn_push,
 };
@@ -36,45 +36,32 @@ use crate::types::{
 use super::accumulator::AccDelta;
 use super::kernels::dispatch::threat_batch;
 use super::network::{self, Aligned};
-use super::{L1_SIZE, THREAT_INPUT_SIZE};
+use super::{L1_SIZE, OUTPUT_BUCKETS, THREAT_FEATURE_COUNT, THREAT_OFFSET};
+use super::pawn_pairs;
 
 // ============================================================
 // Constants
 // ============================================================
 
-/// Total number of filtered threat features.
-pub const FEATURE_COUNT: usize = THREAT_INPUT_SIZE; // 41,272
+/// Total number of pairwise threat features (not including pawn pairs).
+pub const FEATURE_COUNT: usize = THREAT_FEATURE_COUNT;
 
-/// ENEMY_SLOT_MAP[attacker_type][defender_type]: interaction slot for ENEMY targets
-/// (threats proper), or -1 (excluded). All tactically relevant enemy pairs are kept;
-/// kings are never targets (checks are search territory, not eval).
+/// PIECE_INTERACTION_MAP[attacker_type][defender_type]: slot among the
+/// defender *types* this attacker cares about, or -1 (excluded).
+/// Colour of the defender is a separate dimension (`PIECE_TARGET_COUNT / 2`).
+/// Kings never participate. Pawn→pawn is excluded (those go to pawn-pairs).
 #[rustfmt::skip]
-const ENEMY_SLOT_MAP: [[i8; 6]; 6] = [
-    [ 0,  1, -1,  2, -1, -1],  // Pawn   → P,N,R
+const PIECE_INTERACTION_MAP: [[i8; 6]; 6] = [
+    [-1,  0, -1,  1, -1, -1],  // Pawn   → N, R
     [ 0,  1,  2,  3,  4, -1],  // Knight → P,N,B,R,Q
     [ 0,  1,  2,  3, -1, -1],  // Bishop → P,N,B,R
     [ 0,  1,  2,  3, -1, -1],  // Rook   → P,N,B,R
     [ 0,  1,  2,  3,  4, -1],  // Queen  → P,N,B,R,Q
-    [ 0,  1,  2,  3, -1, -1],  // King   → P,N,B,R
+    [-1, -1, -1, -1, -1, -1],  // King   → none
 ];
 
-/// OWN_SLOT_MAP[attacker_type][defender_type]: interaction slot for SAME-COLOR targets
-/// (defenses), or -1 (excluded). GaiaNet-T1 filter: defenses are kept only when a pawn
-/// is involved — pawn defending P/N/R (pawn chains, pawn-supported pieces) or any piece
-/// defending a pawn. Slots continue after the enemy slots of the same attacker.
-#[rustfmt::skip]
-const OWN_SLOT_MAP: [[i8; 6]; 6] = [
-    [ 3,  4, -1,  5, -1, -1],  // Pawn   defends P,N,R
-    [ 5, -1, -1, -1, -1, -1],  // Knight defends P
-    [ 4, -1, -1, -1, -1, -1],  // Bishop defends P
-    [ 4, -1, -1, -1, -1, -1],  // Rook   defends P
-    [ 5, -1, -1, -1, -1, -1],  // Queen  defends P
-    [ 4, -1, -1, -1, -1, -1],  // King   defends P
-];
-
-/// Number of valid interaction slots per attacker type (enemy + own combined).
-/// PIECE_TARGET_COUNT[t] = count of non(-1) in ENEMY_SLOT_MAP[t] + OWN_SLOT_MAP[t].
-const PIECE_TARGET_COUNT: [usize; 6] = [6, 6, 5, 5, 6, 5];
+/// Slots per attacker type = 2 colours × (non -1 entries in the row).
+const PIECE_TARGET_COUNT: [usize; 6] = [4, 10, 8, 8, 10, 0];
 
 // ============================================================
 // PiecePairData — base feature index for each (att, def) pair
@@ -115,20 +102,34 @@ struct ThreatTables {
     piece_pair: [[PiecePairData; 14]; 14],
 }
 
-static THREAT_TABLES: OnceLock<ThreatTables> = OnceLock::new();
+// Computed at compile time: no initialisation word to read on every lookup.
+static THREAT_TABLES: ThreatTables = build_tables();
 
+#[inline(always)]
 fn get_tables() -> &'static ThreatTables {
-    THREAT_TABLES.get_or_init(init_tables)
+    &THREAT_TABLES
 }
+
+/// The leaper attack tables, built once for the compile-time construction below.
+struct Leapers {
+    knight: [u64; 64],
+    king: [u64; 64],
+    pawn: [[u64; 64]; 2],
+}
+
+const LEAPERS: Leapers = Leapers {
+    knight: init_knight_attacks(),
+    king: init_king_attacks(),
+    pawn: init_pawn_attacks(),
+};
 
 /// Compute empty-board attacks for a given piece index and square.
 ///
 /// Piece index encoding: `piece_type | (color << 3)`.
 /// Pawns on rank 0 (white) and rank 7 (black) return 0 (unreachable ranks).
-fn empty_board_attacks(piece_idx: usize, sq: usize) -> u64 {
+const fn empty_board_attacks(piece_idx: usize, sq: usize) -> u64 {
     let piece_type = piece_idx & 7; // 0-5: P,N,B,R,Q,K
     let color = (piece_idx >> 3) & 1; // 0=white, 1=black
-    let square = Square(sq as u8);
     let rank = sq / 8;
     match piece_type {
         0 => {
@@ -136,20 +137,18 @@ fn empty_board_attacks(piece_idx: usize, sq: usize) -> u64 {
             if rank == 0 || rank == 7 {
                 return 0;
             }
-            let pawn_color = if color == 0 { Color::White } else { Color::Black };
-            pawn_attacks(square, pawn_color)
+            LEAPERS.pawn[color][sq]
         }
-        1 => knight_attacks(square),
-        2 => bishop_attacks(square, 0),
-        3 => rook_attacks(square, 0),
-        4 => bishop_attacks(square, 0) | rook_attacks(square, 0), // queen
-        5 => king_attacks(square),
+        1 => LEAPERS.knight[sq],
+        2 => sliding_attack_otf(sq as u8, 0, &BISHOP_DELTAS),
+        3 => sliding_attack_otf(sq as u8, 0, &ROOK_DELTAS),
+        4 => sliding_attack_otf(sq as u8, 0, &BISHOP_DELTAS) | sliding_attack_otf(sq as u8, 0, &ROOK_DELTAS),
+        5 => LEAPERS.king[sq],
         _ => 0,
     }
 }
 
-fn init_tables() -> ThreatTables {
-    // SAFETY: all-zero init is valid for [i32], [u8], PiecePairData (i32 + bool).
+const fn build_tables() -> ThreatTables {
     let mut piece_offset = [[0i32; 64]; 14];
     let mut attack_index = [[[0u8; 64]; 64]; 14];
     let mut piece_pair = [[PiecePairData { base_feature: -1, semi_excluded: false }; 14]; 14];
@@ -159,31 +158,41 @@ fn init_tables() -> ThreatTables {
     // cumulative_piece_offset[piece_type][color] = total attacks across all squares
     let mut cumulative_piece_offset = [[0i32; 2]; 6];
 
-    for att_type in 0..6usize {
-        for att_color in 0..2usize {
+    let mut att_type = 0usize;
+    while att_type < 6 {
+        let mut att_color = 0usize;
+        while att_color < 2 {
             let att_idx = att_type | (att_color << 3);
             let mut cumulative = 0i32;
-            for sq in 0..64usize {
+            let mut sq = 0usize;
+            while sq < 64 {
                 piece_offset[att_idx][sq] = cumulative;
                 let attacks = empty_board_attacks(att_idx, sq);
                 // Fill attack_index for this (att_idx, sq)
-                for target in 0..64usize {
+                let mut target = 0usize;
+                while target < 64 {
                     let mask = if target > 0 { (1u64 << target) - 1 } else { 0 };
                     attack_index[att_idx][sq][target] = (attacks & mask).count_ones() as u8;
+                    target += 1;
                 }
                 cumulative += attacks.count_ones() as i32;
+                sq += 1;
             }
             cumulative_piece_offset[att_type][att_color] = cumulative;
+            att_color += 1;
         }
+        att_type += 1;
     }
 
     // Verify FEATURE_COUNT
-    let total: i32 = (0..6).map(|t| {
+    let mut total = 0i32;
+    let mut t = 0usize;
+    while t < 6 {
         let cnt = PIECE_TARGET_COUNT[t] as i32;
-        (0..2).map(|c| cnt * cumulative_piece_offset[t][c]).sum::<i32>()
-    }).sum();
-    debug_assert_eq!(total as usize, FEATURE_COUNT,
-        "init_tables: expected FEATURE_COUNT={FEATURE_COUNT}, computed={total}");
+        total += cnt * (cumulative_piece_offset[t][0] + cumulative_piece_offset[t][1]);
+        t += 1;
+    }
+    assert!(total as usize == FEATURE_COUNT, "threat tables: computed feature count != FEATURE_COUNT");
 
     // --- Phase 2: PIECE_PAIR_LOOKUP with base features ---
 
@@ -191,45 +200,54 @@ fn init_tables() -> ThreatTables {
     {
         let mut running = 0i32;
         // Color outer, piece inner ordering
-        for att_color in 0..2usize {
-            for att_type in 0..6usize {
+        let mut att_color = 0usize;
+        while att_color < 2 {
+            let mut att_type = 0usize;
+            while att_type < 6 {
                 cumulative_offset[att_type][att_color] = running;
                 running += PIECE_TARGET_COUNT[att_type] as i32
                     * cumulative_piece_offset[att_type][att_color];
+                att_type += 1;
             }
+            att_color += 1;
         }
-        debug_assert_eq!(running as usize, FEATURE_COUNT);
+        assert!(running as usize == FEATURE_COUNT, "threat tables: running offset != FEATURE_COUNT");
     }
 
-    for att_type in 0..6usize {
-        for def_type in 0..6usize {
-            for att_color in 0..2usize {
-                for def_color in 0..2usize {
-                    let att_idx = att_type | (att_color << 3);
-                    let def_idx = def_type | (def_color << 3);
+    let mut att_type = 0usize;
+    while att_type < 6 {
+        let mut def_type = 0usize;
+        while def_type < 6 {
+            let map = PIECE_INTERACTION_MAP[att_type][def_type];
+            if map >= 0 {
+                assert!((map as usize) < PIECE_TARGET_COUNT[att_type] / 2);
+                let mut att_color = 0usize;
+                while att_color < 2 {
+                    let mut def_color = 0usize;
+                    while def_color < 2 {
+                        let att_idx = att_type | (att_color << 3);
+                        let def_idx = def_type | (def_color << 3);
 
-                    let enemy = att_color != def_color;
-                    let slot = if enemy {
-                        ENEMY_SLOT_MAP[att_type][def_type]
-                    } else {
-                        OWN_SLOT_MAP[att_type][def_type]
-                    };
-                    if slot < 0 {
-                        continue;
+                        let slot = def_color as i32 * (PIECE_TARGET_COUNT[att_type] as i32 / 2) + map as i32;
+                        assert!((slot as usize) < PIECE_TARGET_COUNT[att_type]);
+
+                        let base_feature = cumulative_offset[att_type][att_color]
+                            + slot * cumulative_piece_offset[att_type][att_color];
+                        let enemy = att_color != def_color;
+                        let semi_excluded = att_type == def_type && (enemy || att_type != 0);
+
+                        piece_pair[att_idx][def_idx] = PiecePairData {
+                            base_feature,
+                            semi_excluded,
+                        };
+                        def_color += 1;
                     }
-                    debug_assert!((slot as usize) < PIECE_TARGET_COUNT[att_type]);
-
-                    let base_feature = cumulative_offset[att_type][att_color]
-                        + (slot as i32) * cumulative_piece_offset[att_type][att_color];
-                    let semi_excluded = att_type == def_type && (enemy || att_type != 0);
-
-                    piece_pair[att_idx][def_idx] = PiecePairData {
-                        base_feature,
-                        semi_excluded,
-                    };
+                    att_color += 1;
                 }
             }
+            def_type += 1;
         }
+        att_type += 1;
     }
 
     ThreatTables { piece_offset, attack_index, piece_pair }
@@ -334,6 +352,7 @@ pub fn dump_features(pos: &Position) {
         let strs: Vec<String> = v.iter().map(|f| f.to_string()).collect();
         println!("{label}:{}", strs.join(","));
     }
+    pawn_pairs::dump_features(pos);
 }
 
 /// Collect all active threat feature indices for one perspective.
@@ -388,12 +407,16 @@ fn collect_features_for_pov(
 // ============================================================
 
 /// Maximum dirty features per perspective (adds or subs separately).
-const MAX_DIRTY: usize = 128;
+/// Threats (~80) plus pawn-pair replace (up to 64 old + 64 new).
+const MAX_DIRTY: usize = 256;
 
 /// Collected dirty feature indices for register-batched application.
+///
+/// The two buffers are not zeroed on construction: an update pushes a dozen
+/// indices, and clearing 2 KB per perspective per node cost more than writing them.
 struct DirtyFeatures {
-    adds: [u32; MAX_DIRTY],
-    subs: [u32; MAX_DIRTY],
+    adds: ArrayBuf<u32, MAX_DIRTY>,
+    subs: ArrayBuf<u32, MAX_DIRTY>,
     n_adds: usize,
     n_subs: usize,
 }
@@ -401,9 +424,66 @@ struct DirtyFeatures {
 impl DirtyFeatures {
     #[inline]
     fn new() -> Self {
-        DirtyFeatures { adds: [0; MAX_DIRTY], subs: [0; MAX_DIRTY], n_adds: 0, n_subs: 0 }
+        DirtyFeatures { adds: ArrayBuf::new(), subs: ArrayBuf::new(), n_adds: 0, n_subs: 0 }
     }
 
+    #[inline]
+    fn adds(&self) -> &[u32] {
+        self.adds.filled(self.n_adds)
+    }
+
+    #[inline]
+    fn subs(&self) -> &[u32] {
+        self.subs.filled(self.n_subs)
+    }
+}
+
+/// Dirty features of both perspectives, filled by one enumeration of the changes.
+struct DirtyPair {
+    by_pov: [DirtyFeatures; 2],
+}
+
+impl DirtyPair {
+    #[inline]
+    fn new() -> Self {
+        DirtyPair { by_pov: [DirtyFeatures::new(), DirtyFeatures::new()] }
+    }
+
+    /// Record one attack for both perspectives. `feats` are the raw threat indices,
+    /// `FEATURE_COUNT` where a side has no feature for that direction: the mutual
+    /// attacks of like pieces keep one direction per side, and which one depends on
+    /// that side's orientation, so the two sides are decided independently.
+    #[inline]
+    fn push_threat(&mut self, feats: [usize; 2], is_add: bool) {
+        for pov in 0..2 {
+            if feats[pov] < FEATURE_COUNT {
+                let idx = (feats[pov] + THREAT_OFFSET) as u32;
+                if is_add {
+                    self.by_pov[pov].push_add(idx);
+                } else {
+                    self.by_pov[pov].push_sub(idx);
+                }
+            }
+        }
+    }
+}
+
+/// The threat index of one attack, for each perspective.
+#[inline]
+fn threat_feature_pair(
+    mirrored: &[bool; 2],
+    att_piece_idx: usize,
+    def_piece_idx: usize,
+    att_sq: usize,
+    def_sq: usize,
+) -> [usize; 2] {
+    [
+        get_threat_feature(0, mirrored[0], att_piece_idx, def_piece_idx, att_sq, def_sq),
+        get_threat_feature(1, mirrored[1], att_piece_idx, def_piece_idx, att_sq, def_sq),
+    ]
+}
+
+impl DirtyFeatures {
     #[inline]
     fn push_add(&mut self, feat: u32) {
         debug_assert!(self.n_adds < MAX_DIRTY);
@@ -421,11 +501,15 @@ impl DirtyFeatures {
 
 /// Compute full threat features for both perspectives (standalone, no caching).
 ///
+/// Returns the accumulated FT values and the PSQT head sums.
 /// Used as reference implementation for debug_assert validation and for
 /// positions without a parent threat accumulator.
-pub fn compute_full_threats(pos: &Position) -> Aligned<[[i16; L1_SIZE]; 2]> {
+pub fn compute_full_threats(
+    pos: &Position,
+) -> (Aligned<[[i16; L1_SIZE]; 2]>, [[i32; OUTPUT_BUCKETS]; 2]) {
     let params = network::params();
     let mut result = Aligned([[0i16; L1_SIZE]; 2]);
+    let mut psqt = [[0i32; OUTPUT_BUCKETS]; 2];
 
     let occ = pos.occupied();
     let king_sq = [pos.king_sq(Color::White), pos.king_sq(Color::Black)];
@@ -436,6 +520,18 @@ pub fn compute_full_threats(pos: &Position) -> Aligned<[[i16; L1_SIZE]; 2]> {
 
         let mut features = [0u32; MAX_ACTIVE_THREATS];
         let n = collect_features_for_pov(pos, pov, mirrored, occ, &mut features);
+        for feat in features[..n].iter_mut() {
+            *feat += THREAT_OFFSET as u32;
+        }
+
+        let mut pp = [0u32; pawn_pairs::MAX_ACTIVE_PAIRS];
+        let n_pp = pawn_pairs::collect_for_pov(
+            pos.pieces[Piece::WHITE_PAWN.index()],
+            pos.pieces[Piece::BLACK_PAWN.index()],
+            pov,
+            mirrored,
+            &mut pp,
+        );
 
         let acc = result.0[pov].as_mut_ptr();
         let weights_base = params.ft_threat_weights.0.as_ptr();
@@ -444,15 +540,105 @@ pub fn compute_full_threats(pos: &Position) -> Aligned<[[i16; L1_SIZE]; 2]> {
                 std::ptr::null(), acc, weights_base,
                 &features[..n], &[],
             );
+            if n_pp > 0 {
+                threat_batch(
+                    acc, acc, weights_base,
+                    &pp[..n_pp], &[],
+                );
+            }
+        }
+
+        for &f in features[..n].iter().chain(pp[..n_pp].iter()) {
+            let w = &params.psqt_threat_weights.0[f as usize];
+            for b in 0..OUTPUT_BUCKETS {
+                psqt[pov][b] += w[b];
+            }
         }
     }
 
-    result
+    (result, psqt)
 }
 
 // ============================================================
 // ThreatAccumulator — per-ply threat state with dirty incremental updates
 // ============================================================
+
+/// How many plies `ensure_threats_updated` walks back to find known threats before
+/// it recomputes from scratch. A full recompute costs about four incremental steps
+/// on the bench (~1.0 µs against ~0.25 µs), so a longer chain is not worth replaying.
+pub(super) const THREAT_CHAIN_MAX: usize = 4;
+
+/// What a threat update reads of the board, borrowed from a `Position` or from the
+/// arrays of an intermediate ply rebuilt from the deltas that followed it.
+#[derive(Clone, Copy)]
+pub(super) struct BoardView<'a> {
+    pub(super) pieces: &'a [u64; 12],
+    pub(super) board: &'a [Piece; 64],
+    pub(super) occ: u64,
+    pub(super) king_sq: [Square; 2],
+}
+
+/// The arrays of a ply that no `Position` holds any more, rebuilt from the ply after
+/// it and the delta that separated them.
+#[derive(Clone, Copy)]
+pub(super) struct RebuiltBoard {
+    pieces: [u64; 12],
+    board: [Piece; 64],
+}
+
+impl<'a> BoardView<'a> {
+    pub(super) fn of(pos: &'a Position) -> Self {
+        BoardView {
+            pieces: &pos.pieces,
+            board: &pos.board,
+            occ: pos.occupied(),
+            king_sq: [pos.king_sq(Color::White), pos.king_sq(Color::Black)],
+        }
+    }
+
+    /// Rebuild in `out` the board one ply earlier, before `delta` was played on this
+    /// one. Built in place: a rebuilt board that is first assembled elsewhere and then
+    /// moved into its slot is read back with wide loads right after the narrow stores
+    /// that patched it, and the store-to-load forwarding that fails there cost more
+    /// than the rebuild itself.
+    pub(super) fn rebuild_before_into(&self, delta: &AccDelta, out: &mut MaybeUninit<RebuiltBoard>) {
+        debug_assert!(delta.mv != Move::NONE, "a null move has no board to rebuild");
+        let slot = out.as_mut_ptr();
+        // SAFETY: both arrays are copied whole into the slot before being patched, so
+        // the slot is fully initialised when this returns; nothing reads it before.
+        unsafe {
+            let pieces = std::ptr::addr_of_mut!((*slot).pieces);
+            let board = std::ptr::addr_of_mut!((*slot).board);
+            std::ptr::write(pieces, *self.pieces);
+            std::ptr::write(board, *self.board);
+            undo_move_pieces(&mut *pieces, delta);
+            undo_move_board(&mut *board, delta);
+        }
+    }
+}
+
+impl RebuiltBoard {
+    /// This board as a view; `occ` is the occupancy the delta recorded for it.
+    pub(super) fn view(&self, occ: u64) -> BoardView<'_> {
+        let wk = self.pieces[Piece::new(PieceType::King, Color::White).index()];
+        let bk = self.pieces[Piece::new(PieceType::King, Color::Black).index()];
+        debug_assert!(wk != 0 && bk != 0, "a rebuilt board has lost a king");
+        debug_assert_eq!(
+            occ,
+            self.pieces.iter().fold(0u64, |acc, &bb| acc | bb),
+            "the recorded occupancy disagrees with the rebuilt bitboards"
+        );
+        BoardView {
+            pieces: &self.pieces,
+            board: &self.board,
+            occ,
+            king_sq: [
+                Square(wk.trailing_zeros() as u8),
+                Square(bk.trailing_zeros() as u8),
+            ],
+        }
+    }
+}
 
 /// Per-ply threat accumulator with dirty incremental updates.
 ///
@@ -462,6 +648,8 @@ pub fn compute_full_threats(pos: &Position) -> Aligned<[[i16; L1_SIZE]; 2]> {
 pub struct ThreatAccumulator {
     /// Accumulated threat weight sums per perspective [white, black].
     pub values: Aligned<[[i16; L1_SIZE]; 2]>,
+    /// PSQT head sums over aux features (pawn pairs + threats): `[pov][bucket]`.
+    pub psqt: [[i32; OUTPUT_BUCKETS]; 2],
     /// King mirroring state when threats were computed.
     pub(super) mirrored: [bool; 2],
     /// Whether each perspective's threats are up-to-date.
@@ -472,15 +660,25 @@ impl ThreatAccumulator {
     pub fn new() -> Self {
         ThreatAccumulator {
             values: Aligned([[0i16; L1_SIZE]; 2]),
+            psqt: [[0i32; OUTPUT_BUCKETS]; 2],
             mirrored: [false; 2],
             accurate: [false; 2],
         }
     }
 
+    /// Take over the parent's threats unchanged: a null move leaves the board as it was.
+    pub fn copy_from(&mut self, parent: &ThreatAccumulator) {
+        self.values.0 = parent.values.0;
+        self.psqt = parent.psqt;
+        self.mirrored = parent.mirrored;
+        self.accurate = [true; 2];
+    }
+
     /// Full recompute from scratch (no parent available).
     pub fn update_full(&mut self, pos: &Position) {
-        let result = compute_full_threats(pos);
-        self.values = result;
+        let (values, psqt) = compute_full_threats(pos);
+        self.values = values;
+        self.psqt = psqt;
         let king_sq = [pos.king_sq(Color::White), pos.king_sq(Color::Black)];
         for pov in 0..2 {
             self.mirrored[pov] = king_sq[pov].file() >= 4;
@@ -497,9 +695,10 @@ impl ThreatAccumulator {
     /// Uses old_occ for ALL removals and new_occ for ALL additions (no sequential
     /// simulation). Co-removed/co-added piece interactions are handled separately
     /// to avoid double-counting.
-    pub fn update_incremental(
+    pub(super) fn update_incremental(
         &mut self,
-        pos: &Position,
+        new: &BoardView,
+        old: &BoardView,
         parent: &ThreatAccumulator,
         delta: &AccDelta,
     ) -> bool {
@@ -508,25 +707,31 @@ impl ThreatAccumulator {
             return false;
         }
 
-        let old_occ = delta.old_occ;
-        let new_occ = pos.occupied();
-        let king_sq = [pos.king_sq(Color::White), pos.king_sq(Color::Black)];
+        let old_occ = old.occ;
+        let new_occ = new.occ;
+        let king_sq = new.king_sq;
 
-        // Check both perspectives can do incremental
+        // Check both perspectives can do incremental. The pair is built in a local and
+        // stored in one write: two byte stores followed by a two-byte reload of the same
+        // field would defeat store-to-load forwarding, and that reload was the single
+        // hottest instruction of the whole update.
+        let mut mirrored = [false; 2];
         for pov in 0..2 {
-            let mirrored = king_sq[pov].file() >= 4;
-            if !parent.accurate[pov] || parent.mirrored[pov] != mirrored {
+            let m = king_sq[pov].file() >= 4;
+            if !parent.accurate[pov] || parent.mirrored[pov] != m {
                 return false;
             }
-            self.mirrored[pov] = mirrored;
+            mirrored[pov] = m;
         }
+        self.mirrored = mirrored;
 
-        // Reconstruct old piece bitboards and mailbox
-        let old_pieces = reconstruct_old_pieces(pos, delta);
-        let old_board = reconstruct_old_board(pos, delta);
+        let old_pieces: &[u64; 12] = old.pieces;
+        let old_board: &[Piece; 64] = old.board;
 
         // Determine piece changes
-        let ((removes, n_rem), (adds, n_add)) = piece_changes(delta);
+        let mut removes: PieceSet = [(Piece::NONE, Square::NONE); 4];
+        let mut adds: PieceSet = [(Piece::NONE, Square::NONE); 4];
+        let (n_rem, n_add) = piece_changes(delta, &mut removes, &mut adds);
 
         // Build bitmasks for exclusion and x-ray filtering
         let mut remove_bb = 0u64;
@@ -542,49 +747,71 @@ impl ThreatAccumulator {
         let params = network::params();
         let weights_base = params.ft_threat_weights.0.as_ptr();
 
-        for pov in 0..2 {
-            let mirrored = self.mirrored[pov];
-            let mut dirty = DirtyFeatures::new();
+        // One enumeration serves both perspectives: an attack is the same fact seen
+        // from either side, only its feature index depends on the side and on the
+        // mirroring of that side's king. Each (attacker, victim) pair found is
+        // therefore mapped twice rather than searched for twice.
+        let mut dirty = DirtyPair::new();
 
-            // === Phase 1: Collect old threats to remove (all with old_occ) ===
-            for i in 0..n_rem {
-                let (piece, sq) = removes[i];
-                let exclude = remove_bb & !(1u64 << sq.0);
-                collect_piece_threats(
-                    &mut dirty, pov, mirrored, piece, sq, old_occ,
-                    &old_pieces, &old_board, false, exclude,
-                );
-            }
-            for i in 0..n_rem {
-                for j in (i + 1)..n_rem {
-                    collect_pairwise_threat(
-                        &mut dirty, pov, mirrored, removes[i], removes[j], old_occ, false,
-                    );
-                }
-            }
-
-            // === Phase 2: Collect new threats to add (all with new_occ) ===
-            for i in 0..n_add {
-                let (piece, sq) = adds[i];
-                let exclude = add_bb & !(1u64 << sq.0);
-                collect_piece_threats(
-                    &mut dirty, pov, mirrored, piece, sq, new_occ,
-                    &pos.pieces, &pos.board, true, exclude,
-                );
-            }
-            for i in 0..n_add {
-                for j in (i + 1)..n_add {
-                    collect_pairwise_threat(
-                        &mut dirty, pov, mirrored, adds[i], adds[j], new_occ, true,
-                    );
-                }
-            }
-
-            // === Phase 3: X-ray slider changes ===
-            collect_xray_changes(
-                &mut dirty, pov, mirrored, old_occ, new_occ,
-                &pos.pieces, &old_board, &pos.board, changed_sq_bb,
+        // === Phase 1: old threats to remove (all with old_occ) ===
+        for i in 0..n_rem {
+            let (piece, sq) = removes[i];
+            let exclude = remove_bb & !(1u64 << sq.0);
+            collect_piece_threats(
+                &mut dirty, &mirrored, piece, sq, old_occ, old_pieces, old_board, false, exclude,
             );
+        }
+        for i in 0..n_rem {
+            for j in (i + 1)..n_rem {
+                collect_pairwise_threat(&mut dirty, &mirrored, removes[i], removes[j], old_occ, false);
+            }
+        }
+
+        // === Phase 2: new threats to add (all with new_occ) ===
+        for i in 0..n_add {
+            let (piece, sq) = adds[i];
+            let exclude = add_bb & !(1u64 << sq.0);
+            collect_piece_threats(
+                &mut dirty, &mirrored, piece, sq, new_occ, new.pieces, new.board, true, exclude,
+            );
+        }
+        for i in 0..n_add {
+            for j in (i + 1)..n_add {
+                collect_pairwise_threat(&mut dirty, &mirrored, adds[i], adds[j], new_occ, true);
+            }
+        }
+
+        // === Phase 3: X-ray slider changes ===
+        collect_xray_changes(
+            &mut dirty, &mirrored, old_occ, new_occ,
+            new.pieces, old_board, new.board, changed_sq_bb,
+        );
+
+        // === Pawn pairs: only the pairs touching a changed pawn ===
+        // The pairs among untouched pawns are common to the old and new sets;
+        // subtracting and re-adding them would move some forty weight rows for
+        // nothing, and those rows were most of what an update touched.
+        let old_wp = old_pieces[Piece::WHITE_PAWN.index()];
+        let old_bp = old_pieces[Piece::BLACK_PAWN.index()];
+        let new_wp = new.pieces[Piece::WHITE_PAWN.index()];
+        let new_bp = new.pieces[Piece::BLACK_PAWN.index()];
+        let pawns_changed = old_wp != new_wp || old_bp != new_bp;
+
+        for pov in 0..2 {
+            let d = &mut dirty.by_pov[pov];
+            if pawns_changed {
+                let mut pp_subs = [0u32; pawn_pairs::MAX_ACTIVE_PAIRS];
+                let mut pp_adds = [0u32; pawn_pairs::MAX_ACTIVE_PAIRS];
+                let (n_subs, n_adds) = pawn_pairs::collect_delta_for_pov(
+                    old_wp, old_bp, new_wp, new_bp, pov, mirrored[pov], &mut pp_subs, &mut pp_adds,
+                );
+                for &f in &pp_subs[..n_subs] {
+                    d.push_sub(f);
+                }
+                for &f in &pp_adds[..n_adds] {
+                    d.push_add(f);
+                }
+            }
 
             // === Apply all collected features with register batching ===
             unsafe {
@@ -592,28 +819,28 @@ impl ThreatAccumulator {
                     parent.values.0[pov].as_ptr(),
                     self.values.0[pov].as_mut_ptr(),
                     weights_base,
-                    &dirty.adds[..dirty.n_adds],
-                    &dirty.subs[..dirty.n_subs],
+                    d.adds(),
+                    d.subs(),
                 );
             }
 
-            self.accurate[pov] = true;
-        }
-
-        // Debug validation: verify incremental matches full recompute
-        #[cfg(debug_assertions)]
-        {
-            let full = compute_full_threats(pos);
-            for pov in 0..2 {
-                for i in 0..L1_SIZE {
-                    debug_assert_eq!(
-                        self.values.0[pov][i], full.0[pov][i],
-                        "Dirty incremental threat mismatch: pov={pov}, i={i}, \
-                         incremental={}, full={}",
-                        self.values.0[pov][i], full.0[pov][i]
-                    );
+            // PSQT head: same dirty features, scalar (8 i32 per feature)
+            let mut psqt = parent.psqt[pov];
+            for &a in d.adds() {
+                let w = &params.psqt_threat_weights.0[a as usize];
+                for b in 0..OUTPUT_BUCKETS {
+                    psqt[b] += w[b];
                 }
             }
+            for &s in d.subs() {
+                let w = &params.psqt_threat_weights.0[s as usize];
+                for b in 0..OUTPUT_BUCKETS {
+                    psqt[b] -= w[b];
+                }
+            }
+            self.psqt[pov] = psqt;
+
+            self.accurate[pov] = true;
         }
 
         true
@@ -632,9 +859,8 @@ impl ThreatAccumulator {
 /// old board and the new one in the same call.
 #[allow(clippy::too_many_arguments)]
 fn collect_piece_threats(
-    dirty: &mut DirtyFeatures,
-    pov: usize,
-    mirrored: bool,
+    dirty: &mut DirtyPair,
+    mirrored: &[bool; 2],
     piece: Piece,
     sq: Square,
     occ: u64,
@@ -654,13 +880,12 @@ fn collect_piece_threats(
         let target_sq = pop_lsb(&mut targets);
         let target = board[target_sq.index()];
         if target == Piece::NONE { continue; }
-        let feat = get_threat_feature(
-            pov, mirrored, piece_idx, threat_piece_idx(target),
-            sq_idx, target_sq.0 as usize,
+        dirty.push_threat(
+            threat_feature_pair(
+                mirrored, piece_idx, threat_piece_idx(target), sq_idx, target_sq.0 as usize,
+            ),
+            is_add,
         );
-        if feat < FEATURE_COUNT {
-            if is_add { dirty.push_add(feat as u32); } else { dirty.push_sub(feat as u32); }
-        }
     }
 
     // Threats TO piece@sq
@@ -669,21 +894,19 @@ fn collect_piece_threats(
         let att_sq = pop_lsb(&mut attackers);
         let att = board[att_sq.index()];
         if att == Piece::NONE { continue; }
-        let feat = get_threat_feature(
-            pov, mirrored, threat_piece_idx(att), piece_idx,
-            att_sq.0 as usize, sq_idx,
+        dirty.push_threat(
+            threat_feature_pair(
+                mirrored, threat_piece_idx(att), piece_idx, att_sq.0 as usize, sq_idx,
+            ),
+            is_add,
         );
-        if feat < FEATURE_COUNT {
-            if is_add { dirty.push_add(feat as u32); } else { dirty.push_sub(feat as u32); }
-        }
     }
 }
 
 /// Collect pairwise threat between two co-removed or co-added pieces.
 fn collect_pairwise_threat(
-    dirty: &mut DirtyFeatures,
-    pov: usize,
-    mirrored: bool,
+    dirty: &mut DirtyPair,
+    mirrored: &[bool; 2],
     (piece_a, sq_a): (Piece, Square),
     (piece_b, sq_b): (Piece, Square),
     occ: u64,
@@ -693,25 +916,24 @@ fn collect_pairwise_threat(
     let idx_b = threat_piece_idx(piece_b);
 
     if piece_attacks_bb(piece_a, sq_a, occ) & (1u64 << sq_b.0) != 0 {
-        let feat = get_threat_feature(pov, mirrored, idx_a, idx_b, sq_a.0 as usize, sq_b.0 as usize);
-        if feat < FEATURE_COUNT {
-            if is_add { dirty.push_add(feat as u32); } else { dirty.push_sub(feat as u32); }
-        }
+        dirty.push_threat(
+            threat_feature_pair(mirrored, idx_a, idx_b, sq_a.0 as usize, sq_b.0 as usize),
+            is_add,
+        );
     }
     if piece_attacks_bb(piece_b, sq_b, occ) & (1u64 << sq_a.0) != 0 {
-        let feat = get_threat_feature(pov, mirrored, idx_b, idx_a, sq_b.0 as usize, sq_a.0 as usize);
-        if feat < FEATURE_COUNT {
-            if is_add { dirty.push_add(feat as u32); } else { dirty.push_sub(feat as u32); }
-        }
+        dirty.push_threat(
+            threat_feature_pair(mirrored, idx_b, idx_a, sq_b.0 as usize, sq_a.0 as usize),
+            is_add,
+        );
     }
 }
 
 /// Collect x-ray slider changes between old and new occupancy.
 #[allow(clippy::too_many_arguments)]
 fn collect_xray_changes(
-    dirty: &mut DirtyFeatures,
-    pov: usize,
-    mirrored: bool,
+    dirty: &mut DirtyPair,
+    mirrored: &[bool; 2],
     old_occ: u64,
     new_occ: u64,
     new_pieces: &[u64; 12],
@@ -760,11 +982,13 @@ fn collect_xray_changes(
             let target_sq = pop_lsb(&mut gained);
             let target = new_board[target_sq.index()];
             if target == Piece::NONE { continue; }
-            let feat = get_threat_feature(
-                pov, mirrored, slider_idx, threat_piece_idx(target),
-                s_sq.0 as usize, target_sq.0 as usize,
+            dirty.push_threat(
+                threat_feature_pair(
+                    mirrored, slider_idx, threat_piece_idx(target),
+                    s_sq.0 as usize, target_sq.0 as usize,
+                ),
+                true,
             );
-            if feat < FEATURE_COUNT { dirty.push_add(feat as u32); }
         }
 
         // Lost → sub
@@ -773,11 +997,13 @@ fn collect_xray_changes(
             let target_sq = pop_lsb(&mut lost);
             let target = old_board[target_sq.index()];
             if target == Piece::NONE { continue; }
-            let feat = get_threat_feature(
-                pov, mirrored, slider_idx, threat_piece_idx(target),
-                s_sq.0 as usize, target_sq.0 as usize,
+            dirty.push_threat(
+                threat_feature_pair(
+                    mirrored, slider_idx, threat_piece_idx(target),
+                    s_sq.0 as usize, target_sq.0 as usize,
+                ),
+                false,
             );
-            if feat < FEATURE_COUNT { dirty.push_sub(feat as u32); }
         }
     }
 }
@@ -786,6 +1012,7 @@ impl Clone for ThreatAccumulator {
     fn clone(&self) -> Self {
         ThreatAccumulator {
             values: Aligned(self.values.0),
+            psqt: self.psqt,
             mirrored: self.mirrored,
             accurate: self.accurate,
         }
@@ -796,14 +1023,14 @@ impl Clone for ThreatAccumulator {
 // Piece change helpers
 // ============================================================
 
-/// Determine which pieces were removed/added by a move.
-///
-/// Up to four pieces and how many of the four are real. Castling is the worst case:
-/// two squares vacated, two filled.
-type PieceSet = ([(Piece, Square); 4], usize);
+/// Up to four pieces a move takes off the board or puts on it, and how many of the
+/// four are real. Castling is the worst case: two squares vacated, two filled.
+type PieceSet = [(Piece, Square); 4];
 
-/// Returns (removed, added).
-fn piece_changes(delta: &AccDelta) -> (PieceSet, PieceSet) {
+/// Fill `removes` and `adds` with what the move took off and put on the board; returns
+/// how many of each. Written where the caller keeps them rather than returned by
+/// value: the copy of a return read the byte-stored entries back with wide loads.
+fn piece_changes(delta: &AccDelta, removes: &mut PieceSet, adds: &mut PieceSet) -> (usize, usize) {
     let mv = delta.mv;
     let mt = mv.move_type();
     let from = mv.from_sq();
@@ -811,8 +1038,6 @@ fn piece_changes(delta: &AccDelta) -> (PieceSet, PieceSet) {
     let moved = delta.moved_piece;
     let captured = delta.captured_piece;
 
-    let mut removes = [(Piece::NONE, Square::NONE); 4];
-    let mut adds = [(Piece::NONE, Square::NONE); 4];
     let mut n_rem = 0;
     let mut n_add = 0;
 
@@ -849,48 +1074,34 @@ fn piece_changes(delta: &AccDelta) -> (PieceSet, PieceSet) {
             n_add += 1;
         }
         MT_CASTLING => {
-            let us = moved.color();
-            let rook = Piece::new(PieceType::Rook, us);
-            let (rook_from, rook_to) = castle_rook_squares(us, from, to);
+            let rook = Piece::new(PieceType::Rook, moved.color());
+            let rook_from = to;
+            let king_to = mv.castle_king_to();
+            let rook_to = mv.castle_rook_to();
 
-            removes[n_rem] = (moved, from);
-            n_rem += 1;
-            removes[n_rem] = (rook, rook_from);
-            n_rem += 1;
-            adds[n_add] = (moved, to);
-            n_add += 1;
-            adds[n_add] = (rook, rook_to);
-            n_add += 1;
+            if from != king_to {
+                removes[n_rem] = (moved, from);
+                n_rem += 1;
+                adds[n_add] = (moved, king_to);
+                n_add += 1;
+            }
+            if rook_from != rook_to {
+                removes[n_rem] = (rook, rook_from);
+                n_rem += 1;
+                adds[n_add] = (rook, rook_to);
+                n_add += 1;
+            }
         }
         _ => {}
     }
 
-    ((removes, n_rem), (adds, n_add))
+    (n_rem, n_add)
 }
 
-/// Get rook from/to squares for a castling move.
-#[inline]
-fn castle_rook_squares(us: Color, king_from: Square, king_to: Square) -> (Square, Square) {
-    if king_to.file() > king_from.file() {
-        // Kingside
-        if us == Color::White {
-            (Square::H1, Square::F1)
-        } else {
-            (Square::H8, Square::F8)
-        }
-    } else {
-        // Queenside
-        if us == Color::White {
-            (Square::A1, Square::D1)
-        } else {
-            (Square::A8, Square::D8)
-        }
-    }
-}
 
-/// Reconstruct the pre-move piece bitboards from post-move state + AccDelta.
-fn reconstruct_old_pieces(pos: &Position, delta: &AccDelta) -> [u64; 12] {
-    let mut pieces = pos.pieces;
+
+/// Turn the post-move piece bitboards back into the pre-move ones, in place.
+fn undo_move_pieces(pieces: &mut [u64; 12], delta: &AccDelta) {
     let mv = delta.mv;
     let mt = mv.move_type();
     let from = mv.from_sq();
@@ -925,25 +1136,25 @@ fn reconstruct_old_pieces(pos: &Position, delta: &AccDelta) -> [u64; 12] {
             pieces[captured.index()] |= 1u64 << cap_sq.0;
         }
         MT_CASTLING => {
-            // Undo: move king and rook back
-            let us = moved.color();
-            let rook = Piece::new(PieceType::Rook, us);
-            let (rook_from, rook_to) = castle_rook_squares(us, from, to);
-
-            pieces[moved.index()] |= 1u64 << from.0;
-            pieces[moved.index()] &= !(1u64 << to.0);
-            pieces[rook.index()] |= 1u64 << rook_from.0;
-            pieces[rook.index()] &= !(1u64 << rook_to.0);
+            let rook = Piece::new(PieceType::Rook, moved.color());
+            let king_to = mv.castle_king_to();
+            let rook_from = to;
+            let rook_to = mv.castle_rook_to();
+            if from != king_to {
+                pieces[moved.index()] |= 1u64 << from.0;
+                pieces[moved.index()] &= !(1u64 << king_to.0);
+            }
+            if rook_from != rook_to {
+                pieces[rook.index()] |= 1u64 << rook_from.0;
+                pieces[rook.index()] &= !(1u64 << rook_to.0);
+            }
         }
         _ => {}
     }
-
-    pieces
 }
 
-/// Reconstruct the pre-move mailbox from post-move state + AccDelta.
-fn reconstruct_old_board(pos: &Position, delta: &AccDelta) -> [Piece; 64] {
-    let mut board = pos.board;
+/// Turn the post-move mailbox back into the pre-move one, in place.
+fn undo_move_board(board: &mut [Piece; 64], delta: &AccDelta) {
     let mv = delta.mv;
     let mt = mv.move_type();
     let from = mv.from_sq();
@@ -967,19 +1178,17 @@ fn reconstruct_old_board(pos: &Position, delta: &AccDelta) -> [Piece; 64] {
             board[cap_sq.index()] = captured;
         }
         MT_CASTLING => {
-            let us = moved.color();
-            let rook = Piece::new(PieceType::Rook, us);
-            let (rook_from, rook_to) = castle_rook_squares(us, from, to);
-
-            board[from.index()] = moved;
-            board[to.index()] = Piece::NONE;
-            board[rook_from.index()] = rook;
+            let rook = Piece::new(PieceType::Rook, moved.color());
+            let king_to = mv.castle_king_to();
+            let rook_from = to;
+            let rook_to = mv.castle_rook_to();
+            board[king_to.index()] = Piece::NONE;
             board[rook_to.index()] = Piece::NONE;
+            board[from.index()] = moved;
+            board[rook_from.index()] = rook;
         }
         _ => {}
     }
-
-    board
 }
 
 // ============================================================
@@ -992,38 +1201,33 @@ mod tests {
     use crate::position::Position;
     use super::super::L1_SIZE;
 
-    /// GaiaNet-T1 slot table invariants:
-    /// for each attacker, enemy+own slots are disjoint and cover 0..count.
+    /// Interaction-map invariants: slots per attacker are unique, cover 0..types,
+    /// and PIECE_TARGET_COUNT = 2 × (non -1 entries).
     #[test]
     fn test_slot_maps_invariants() {
         for att in 0..6usize {
-            let count = PIECE_TARGET_COUNT[att];
+            let types = PIECE_TARGET_COUNT[att] / 2;
             let mut seen = [false; 8];
+            let mut n_mapped = 0usize;
             for def in 0..6usize {
-                for &slot in &[ENEMY_SLOT_MAP[att][def], OWN_SLOT_MAP[att][def]] {
-                    if slot >= 0 {
-                        let s = slot as usize;
-                        assert!(s < count, "att={att} def={def} slot={s} >= count={count}");
-                        assert!(!seen[s] || slot_shared_ok(att, def, s),
-                            "att={att} slot {s} collision");
-                        seen[s] = true;
-                    }
+                let slot = PIECE_INTERACTION_MAP[att][def];
+                if slot >= 0 {
+                    let s = slot as usize;
+                    assert!(s < types, "att={att} def={def} slot={s} >= types={types}");
+                    assert!(!seen[s], "att={att} slot {s} collision");
+                    seen[s] = true;
+                    n_mapped += 1;
                 }
             }
-            assert!(seen[..count].iter().all(|&s| s), "att={att}: slots not contiguous");
+            assert_eq!(n_mapped, types, "att={att}: mapped types {n_mapped} != {types}");
+            assert!(seen[..types].iter().all(|&s| s), "att={att}: slots not contiguous");
         }
     }
 
-    /// Can slots be shared between different def_types of the same map? No:
-    /// each slot must be unique across the union of both maps. (No legitimate sharing.)
-    fn slot_shared_ok(_att: usize, _def: usize, _slot: usize) -> bool {
-        false
-    }
-
-    /// The total feature count must be exactly THREAT_INPUT_SIZE (41,272).
-    /// (init_tables checks this with a debug_assert; this test also enforces it in release.)
+    /// The total feature count must be exactly 59,808.
+    /// (build_tables asserts this at compile time; this test also spells it out.)
     #[test]
-    fn test_feature_count_41272() {
+    fn test_feature_count_59808() {
         let mut cumulative_piece_offset = [[0i32; 2]; 6];
         for att_type in 0..6usize {
             for att_color in 0..2usize {
@@ -1040,35 +1244,36 @@ mod tests {
             (0..2).map(|c| cnt * cumulative_piece_offset[t][c]).sum::<i32>()
         }).sum();
         assert_eq!(total as usize, FEATURE_COUNT);
-        assert_eq!(FEATURE_COUNT, 41_272);
+        assert_eq!(FEATURE_COUNT, 59_808);
     }
 
-    /// All indices produced by a full enumeration are within bounds,
-    /// and the filter keeps its promises: defenses without a pawn → excluded,
-    /// enemy threats present in the map → included.
+    /// Interaction-map semantics: pawn-pawn and kings out, N/R/B/Q in.
     #[test]
     fn test_filter_semantics() {
         let tables = get_tables();
         let _ = tables;
 
-        // White knight defends white rook: excluded (no pawn involved)
-        // N=type1, R=type3, white (color 0). b1 (1) attacks d2 (11): b1→d2 ✓
+        // White knight defends white rook: included (same-colour N→R is in the map)
         let feat = get_threat_feature(0, false, 1, 3, 1, 11);
-        assert_eq!(feat, FEATURE_COUNT, "N defends R must be excluded");
+        assert!(feat < FEATURE_COUNT, "N defends R must be included");
 
         // White knight attacks black rook: included
         let feat = get_threat_feature(0, false, 1, 3 | 8, 1, 11);
         assert!(feat < FEATURE_COUNT, "N attacks enemy R must be included");
 
-        // White knight defends white pawn: included (pawn defense)
+        // White knight defends white pawn: included
         let feat = get_threat_feature(0, false, 1, 0, 1, 11);
         assert!(feat < FEATURE_COUNT, "N defends P must be included");
 
-        // White pawn defends white knight: included (defense by pawn). e2(12) → d3(19)
+        // White pawn defends white knight: included. e2(12) → d3(19)
         let feat = get_threat_feature(0, false, 0, 1, 12, 19);
         assert!(feat < FEATURE_COUNT, "P defends N must be included");
 
-        // White pawn defends white queen: excluded (not in P → {P,N,R})
+        // White pawn attacks black pawn: excluded (pawn-pawn lives in pawn_pairs)
+        let feat = get_threat_feature(0, false, 0, 0 | 8, 12, 19);
+        assert_eq!(feat, FEATURE_COUNT, "P attacks p must be excluded");
+
+        // White pawn defends white queen: excluded (not in P → {N,R})
         let feat = get_threat_feature(0, false, 0, 4, 12, 19);
         assert_eq!(feat, FEATURE_COUNT, "P defends Q must be excluded");
 
@@ -1079,6 +1284,10 @@ mod tests {
         // King is never a target
         let feat = get_threat_feature(0, false, 3, 5 | 8, 0, 8);
         assert_eq!(feat, FEATURE_COUNT, "K never a target");
+
+        // King never attacks
+        let feat = get_threat_feature(0, false, 5, 1 | 8, 4, 12);
+        assert_eq!(feat, FEATURE_COUNT, "K never an attacker");
     }
 
     /// Perspective symmetry: the feature seen from White pov for a pair (att, def)
@@ -1135,7 +1344,7 @@ mod tests {
     /// PST i16 bounded ±300 (avoids i16 overflow in debug), threats full-range i8.
     fn load_random_network() {
         use std::io::Write;
-        let path = "/tmp/gaianet_t1_random_test.bin";
+        let path = "/tmp/gaianet_t2_random_test.bin";
         let mut state = 0x9E3779B97F4A7C15u64;
         let mut next = move || {
             state ^= state << 13;
@@ -1150,14 +1359,21 @@ mod tests {
             let v = (next() % 601) as i64 - 300;
             buf.extend_from_slice(&(v as i16).to_le_bytes());
         }
-        // ft_threat_weights: full-range i8
-        for _ in 0..(FEATURE_COUNT * L1_SIZE) {
+        // ft_threat_weights: full-range i8 (pawn pairs + threats)
+        for _ in 0..(super::super::THREAT_INPUT_SIZE * L1_SIZE) {
             buf.push((next() & 0xFF) as u8);
         }
         // ft_biases: i16 within ±100
         for _ in 0..L1_SIZE {
             let v = (next() % 201) as i64 - 100;
             buf.extend_from_slice(&(v as i16).to_le_bytes());
+        }
+        // psqt head (PST + aux): i32 within ±20000 (bounded so per-pov sums stay in i32)
+        let psqt_entries =
+            (super::super::FT_SIZE + super::super::THREAT_INPUT_SIZE) * OUTPUT_BUCKETS;
+        for _ in 0..psqt_entries {
+            let v = (next() % 40_001) as i64 - 20_000;
+            buf.extend_from_slice(&(v as i32).to_le_bytes());
         }
         // L1 layers (i8) then f32: small valid values
         let l1_bytes = super::super::OUTPUT_BUCKETS * (L1_SIZE / 4) * (super::super::L2_SIZE * 4);
@@ -1195,7 +1411,7 @@ mod tests {
         net.refresh(&pos);
 
         let moves = [
-            Move::new_with_type(Square::E1, Square::G1, MT_CASTLING), // O-O
+            Move::new_with_type(Square::E1, Square::H1, MT_CASTLING), // O-O
             Move::new(Square::B6, Square::D5),                        // Nxd5 capture
             Move::new(Square::C3, Square::D5),                        // Nxd5 recapture
             Move::new(Square::E7, Square::D8),                        // Qd8 (queen moves)
@@ -1208,7 +1424,7 @@ mod tests {
             net.ensure_updated(&pos);
             net.ensure_threats_updated_for_test(&pos);
 
-            let full = compute_full_threats(&pos);
+            let (full, full_psqt) = compute_full_threats(&pos);
             let inc = net.threat_values_for_test();
             for pov in 0..2 {
                 for j in 0..L1_SIZE {
@@ -1218,6 +1434,15 @@ mod tests {
                     );
                 }
             }
+            assert_eq!(net.threat_psqt_for_test(), &full_psqt,
+                "move {} ({:?}): threat psqt", i + 1, mv);
+
+            // PST psqt: incremental (update_from / finny) vs fresh refresh
+            let mut acc_ref = super::super::accumulator::Accumulator::new();
+            acc_ref.refresh(&pos, Color::White);
+            acc_ref.refresh(&pos, Color::Black);
+            assert_eq!(net.pst_psqt_for_test(), acc_ref.psqt,
+                "move {} ({:?}): pst psqt", i + 1, mv);
         }
 
         // Promotion + EP from a dedicated position
@@ -1229,13 +1454,14 @@ mod tests {
         pos.make_move(mv);
         net.ensure_updated(&pos);
         net.ensure_threats_updated_for_test(&pos);
-        let full = compute_full_threats(&pos);
+        let (full, full_psqt) = compute_full_threats(&pos);
         let inc = net.threat_values_for_test();
         for pov in 0..2 {
             for j in 0..L1_SIZE {
                 assert_eq!(inc.0[pov][j], full.0[pov][j], "promo-capture pov={pov} idx={j}");
             }
         }
+        assert_eq!(net.threat_psqt_for_test(), &full_psqt, "promo-capture threat psqt");
 
         let mut pos = Position::from_fen(
             "rnbqkbnr/ppp1pppp/8/3pP3/8/8/PPPP1PPP/RNBQKBNR w KQkq d6 0 3",
@@ -1247,12 +1473,13 @@ mod tests {
         pos.make_move(mv);
         net.ensure_updated(&pos);
         net.ensure_threats_updated_for_test(&pos);
-        let full = compute_full_threats(&pos);
+        let (full, full_psqt) = compute_full_threats(&pos);
         let inc = net.threat_values_for_test();
         for pov in 0..2 {
             for j in 0..L1_SIZE {
                 assert_eq!(inc.0[pov][j], full.0[pov][j], "en passant pov={pov} idx={j}");
             }
         }
+        assert_eq!(net.threat_psqt_for_test(), &full_psqt, "en passant threat psqt");
     }
 }

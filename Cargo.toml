@@ -7,7 +7,7 @@ default-members = ["."]
 
 [package]
 name = "gaiachess"
-version = "4.2.6"
+version = "4.3.0"
 edition = "2024"
 authors = ["Jean-François Romang"]
 license = "GPL-3.0-or-later"
@@ -71,6 +71,13 @@ rodio = { version = "0.22.2", optional = true, default-features = false, feature
 # dependencies on any desktop platform; the browser build asks the page instead, so this
 # hangs off `gui` rather than `gui-core`. Haiku reads LC_MESSAGES/LANG itself.
 sys-locale = { version = "0.3", optional = true }
+
+# Sharing the NNUE weights between engine processes (src/shm.rs): memfd, its seals,
+# mmap at a chosen address, madvise, and passing a file descriptor over a Unix socket.
+# Only the calls std does not expose; the sockets themselves stay std. Already in the
+# lock file as a dependency of ctrlc, so this costs no new crate.
+[target.'cfg(target_os = "linux")'.dependencies]
+nix = { version = "0.31", features = ["fs", "mman", "socket", "uio"] }
 
 # On Haiku the PNG codec that macroquad carries everywhere else: the embedded sheets
 # still have to be decoded, and the headless captures written out.

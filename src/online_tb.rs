@@ -229,7 +229,12 @@ pub fn start_prefetch(pos: Position, best_move: Move, ponder_move: Option<Move>,
         if Some(*m) == ponder_move {
             -1000
         } else {
-            let captured = opp_pos.board[m.to_sq().index()];
+            // Castling is encoded as king-captures-own-rook: not a capture.
+            let captured = if m.move_type() == MT_CASTLING {
+                Piece::NONE
+            } else {
+                opp_pos.board[m.to_sq().index()]
+            };
             if captured != Piece::NONE {
                 -PIECE_VALUE[captured.piece_type() as usize]
             } else if m.move_type() == MT_EN_PASSANT {

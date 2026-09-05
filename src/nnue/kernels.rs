@@ -14,29 +14,15 @@
 //!
 //! Two kernels are *not* macro-generated:
 //! - `find_nnz` (in `forward.rs`): three genuinely different algorithms per ISA.
-//! - `threat512::threat_batch`: a hand-scheduled 20-ZMM AVX-512 form with no
+//! - `threat512::threat_batch`: a hand-scheduled tiled AVX-512 form with no
 //!   narrower equivalent; the macro instances carry the generic row-loop form.
 //!
 //! Which instance runs is selected at compile time (`pub use ... as k`),
 //! mirroring the historical `#[cfg(target_feature)]` cascade.
 
-use super::L1_SIZE;
-
 /// Number of SIMD registers held in flight by the Finny batch apply.
 /// Must divide L1_SIZE / I16_LANES for all SIMD widths — asserted per instance.
 pub(crate) const FINNY_REGISTERS: usize = 4;
-
-/// Prefetch the first cache line of a weight row to trigger hardware streaming.
-#[inline(always)]
-#[cfg(target_arch = "x86_64")]
-unsafe fn prefetch_weight_row(weights_base: *const [i8; L1_SIZE], feat: usize) {
-    let ptr = (*weights_base.add(feat)).as_ptr();
-    std::arch::x86_64::_mm_prefetch(ptr, std::arch::x86_64::_MM_HINT_T1);
-}
-
-#[inline(always)]
-#[cfg(not(target_arch = "x86_64"))]
-unsafe fn prefetch_weight_row(_weights_base: *const [i8; L1_SIZE], _feat: usize) {}
 
 macro_rules! nnue_kernels {
     ($backend:path $(, #[$tf:meta])?) => {
@@ -58,14 +44,14 @@ macro_rules! nnue_kernels {
         ///
         /// For each perspective (STM and NSTM), combines PST accumulator with
         /// threat buffer, then computes the pairwise product of
-        /// `combined[0..320]` × `combined[320..640]`.
+        /// `combined[0..L1/2]` × `combined[L1/2..L1]`.
         ///
         /// Clamping is asymmetric:
         /// - First half (left): `clamp(x, 0, FT_QUANT)` — standard CReLU
         /// - Second half (right): `min(x, FT_QUANT)` — no lower-bound clamp
         ///
         /// Product: `u8( mulhi(left << 7, right) )` via unsigned packus saturation.
-        /// Output: `[stm_pairwise[320] | ntm_pairwise[320]]` = u8[640].
+        /// Output: `[stm_pairwise[L1/2] | ntm_pairwise[L1/2]]` = u8[L1].
         ///
         /// The two forms below are selected by a const-folded lane-count branch:
         /// the packus path needs real vector registers, the element loop does not.
@@ -152,7 +138,7 @@ macro_rules! nnue_kernels {
 
         /// L1 sparse inference: process only non-zero input groups.
         ///
-        /// Sparse u8[640] × i8 weights → i32[L2_SIZE], dequantize, add bias.
+        /// Sparse u8[L1] × i8 weights → i32[L2_SIZE], dequantize, add bias.
         /// Activation: CReLU+squared = `[clamp(x, 0, 1) ; clamp(x, 0, 1)²]` → f32[2×L2_SIZE].
         ///
         /// The two halves feed L2 (full 32 values) and provide the L3 skip connection.
@@ -579,8 +565,7 @@ macro_rules! nnue_kernels {
         /// `input_acc`: source accumulator (null = zero-init for full recompute).
         /// `output_acc`: destination accumulator.
         ///
-        /// The AVX-512 tiers use `threat512::threat_batch` instead, which holds
-        /// the whole accumulator in 20 ZMM registers across the batch.
+        /// The AVX-512 tiers use `threat512::threat_batch` instead (tiled 16-ZMM).
         $(#[$tf])?
         #[inline]
         pub unsafe fn threat_batch(
@@ -595,24 +580,12 @@ macro_rules! nnue_kernels {
             } else {
                 std::ptr::write_bytes(output_acc, 0, L1_SIZE);
             }
-            const PF: usize = 4;
-            for d in 0..PF.min(subs.len()) {
-                crate::nnue::kernels::prefetch_weight_row(weights_base, subs[d] as usize);
+            // No software prefetch, as in `threat512::threat_batch`.
+            for &s in subs {
+                subtract_i8_row((*weights_base.add(s as usize)).as_ptr(), output_acc);
             }
-            for i in 0..subs.len() {
-                if i + PF < subs.len() {
-                    crate::nnue::kernels::prefetch_weight_row(weights_base, subs[i + PF] as usize);
-                }
-                subtract_i8_row((*weights_base.add(subs[i] as usize)).as_ptr(), output_acc);
-            }
-            for d in 0..PF.min(adds.len()) {
-                crate::nnue::kernels::prefetch_weight_row(weights_base, adds[d] as usize);
-            }
-            for i in 0..adds.len() {
-                if i + PF < adds.len() {
-                    crate::nnue::kernels::prefetch_weight_row(weights_base, adds[i + PF] as usize);
-                }
-                accumulate_i8_row((*weights_base.add(adds[i] as usize)).as_ptr(), output_acc);
+            for &a in adds {
+                accumulate_i8_row((*weights_base.add(a as usize)).as_ptr(), output_acc);
             }
         }
     };
@@ -645,57 +618,43 @@ pub mod threat512 {
         subs: &[u32],
     ) {
         use std::arch::x86_64::*;
-        const N: usize = L1_SIZE / 32; // 20 ZMM registers for 640 i16
+        // 16 ZMMs = 512 i16 per tile. L1=1024 → 2 tiles. Keeps headroom in the
+        // 32-register file (the 20-register whole-acc form does not fit 1024).
+        const TILE: usize = 16;
+        const TILE_ELEMS: usize = TILE * 32;
+        const _: () = assert!(L1_SIZE % TILE_ELEMS == 0);
 
-        // Load accumulator into ZMM registers (or zero-init)
-        let mut regs: [__m512i; N] = [_mm512_setzero_si512(); N];
-        if !input_acc.is_null() {
-            for i in 0..N {
-                regs[i] = _mm512_loadu_si512(input_acc.add(i * 32) as *const __m512i);
+        // No software prefetch: the rows a search touches stay resident in the
+        // last-level cache, the hardware prefetcher streams each row once its first
+        // line is asked for, and the look-ahead branches that used to sit in these
+        // loops mispredicted at every transition — measured slower than nothing.
+        for tile in 0..(L1_SIZE / TILE_ELEMS) {
+            let base = tile * TILE_ELEMS;
+            let mut regs: [__m512i; TILE] = [_mm512_setzero_si512(); TILE];
+            if !input_acc.is_null() {
+                for i in 0..TILE {
+                    regs[i] = _mm512_loadu_si512(input_acc.add(base + i * 32) as *const __m512i);
+                }
             }
-        }
 
-        const PF: usize = 4;
+            for &s in subs {
+                let w_ptr = (*weights_base.add(s as usize)).as_ptr().add(base);
+                for j in 0..TILE {
+                    let w = simd::load_i8_as_i16(w_ptr.add(j * 32));
+                    regs[j] = simd::sub_i16(regs[j], w);
+                }
+            }
+            for &a in adds {
+                let w_ptr = (*weights_base.add(a as usize)).as_ptr().add(base);
+                for j in 0..TILE {
+                    let w = simd::load_i8_as_i16(w_ptr.add(j * 32));
+                    regs[j] = simd::add_i16(regs[j], w);
+                }
+            }
 
-        // Prefetch initial subs
-        for d in 0..PF.min(subs.len()) {
-            super::prefetch_weight_row(weights_base, subs[d] as usize);
-        }
-        // Apply subtractions
-        for i in 0..subs.len() {
-            let pf_idx = i + PF;
-            if pf_idx < subs.len() {
-                super::prefetch_weight_row(weights_base, subs[pf_idx] as usize);
-            } else if pf_idx - subs.len() < adds.len() {
-                super::prefetch_weight_row(weights_base, adds[pf_idx - subs.len()] as usize);
+            for i in 0..TILE {
+                _mm512_storeu_si512(output_acc.add(base + i * 32) as *mut __m512i, regs[i]);
             }
-            let w_ptr = (*weights_base.add(subs[i] as usize)).as_ptr();
-            for j in 0..N {
-                let w = simd::load_i8_as_i16(w_ptr.add(j * 32));
-                regs[j] = simd::sub_i16(regs[j], w);
-            }
-        }
-
-        // Prefetch remaining initial adds
-        let pf_done = if subs.len() >= PF { PF } else { PF - subs.len() };
-        for d in pf_done..PF.min(adds.len()) {
-            super::prefetch_weight_row(weights_base, adds[d] as usize);
-        }
-        // Apply additions
-        for i in 0..adds.len() {
-            if i + PF < adds.len() {
-                super::prefetch_weight_row(weights_base, adds[i + PF] as usize);
-            }
-            let w_ptr = (*weights_base.add(adds[i] as usize)).as_ptr();
-            for j in 0..N {
-                let w = simd::load_i8_as_i16(w_ptr.add(j * 32));
-                regs[j] = simd::add_i16(regs[j], w);
-            }
-        }
-
-        // Store registers to output accumulator
-        for i in 0..N {
-            _mm512_storeu_si512(output_acc.add(i * 32) as *mut __m512i, regs[i]);
         }
     }
 }

@@ -45,6 +45,10 @@ enum Cmd {
         /// Show per-position NPS and CV% breakdown
         #[bpaf(short, long)]
         verbose: bool,
+        /// Search each position with a pool of N threads (default 1).
+        /// Above 1 the node count stops being reproducible; the measure is the NPS.
+        #[bpaf(short('T'), long)]
+        threads: Option<usize>,
     },
 
     /// Generate NNUE training data
@@ -63,6 +67,15 @@ enum Cmd {
         /// Soft node budget per move (0 = fixed depth); hard cap = 100x
         #[bpaf(short('N'), long, fallback(0u64), display_fallback)]
         nodes: u64,
+        /// Percentage of games started from a random DFRC position (0-100)
+        #[bpaf(long, fallback(0u32), display_fallback)]
+        dfrc: u32,
+        /// RNG seed (default: from the clock); re-running with it replays the run
+        #[bpaf(long)]
+        seed: Option<u64>,
+        /// Append to existing output without asking (for unattended runs)
+        #[bpaf(short('y'), long)]
+        yes: bool,
         /// Output base filename
         #[bpaf(short, long, fallback("data/gen0".to_string()), display_fallback)]
         output: String,
@@ -385,15 +398,15 @@ fn real_main(cmd: Cmd, stdin: ProbedStdin) {
             };
             perft::divide(&mut pos, depth);
         }
-        Cmd::Bench { depth, stats, runs, verbose } => {
+        Cmd::Bench { depth, stats, runs, verbose, threads } => {
             if stats {
                 bench::run_stats(depth, runs, verbose);
             } else {
-                bench::run(depth);
+                bench::run(depth, threads);
             }
         }
         #[cfg(feature = "datagen")]
-        Cmd::Datagen { threads, positions, depth, nodes, output, book, syzygy } => {
+        Cmd::Datagen { threads, positions, depth, nodes, dfrc, seed, yes, output, book, syzygy } => {
             #[cfg(feature = "syzygy")]
             if let Some(ref path) = syzygy
                 && !tb::init(path)
@@ -404,7 +417,10 @@ fn real_main(cmd: Cmd, stdin: ProbedStdin) {
             if syzygy.is_some() {
                 eprintln!("WARNING: --syzygy requires --features syzygy (ignored)");
             }
-            datagen::run(threads, positions, depth, nodes, &output, book.as_deref());
+            datagen::run(
+                threads, positions, depth, nodes, dfrc, seed, yes,
+                &output, book.as_deref(),
+            );
         }
         #[cfg(any(feature = "stats", feature = "tree"))]
         Cmd::Dump {
@@ -459,6 +475,7 @@ fn real_main(cmd: Cmd, stdin: ProbedStdin) {
                     "Arch hash:   {:#010x}",
                     gaiachess::nnue::integrity::ARCH_HASH
                 );
+                println!("Shared net:  {}", gaiachess::shm::describe());
             }
             // On x86-64 the SIMD paths are resolved from CPUID at startup; the
             // report shows what this machine actually runs, not what the build

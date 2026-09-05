@@ -99,7 +99,7 @@ mod desktop {
     use crate::position::Position;
     use crate::search;
     use crate::skill;
-    use crate::threads::{COUNT_NODES, PONDER, STOP, SharedState, ThreadData};
+    use crate::threads::{PONDER, STOP, SharedState, ThreadData, close_node_meter, open_node_meter};
     use crate::timeman::SearchLimits;
     use crate::types::Move;
 
@@ -162,9 +162,11 @@ mod desktop {
                 .spawn(move || run_worker(&commands, &answers))
                 .expect("failed to spawn the engine thread");
             // Somebody is watching the rate for as long as there is a board on the
-            // screen, so the counter is turned on once here rather than around every
-            // search: it costs one atomic every 512 nodes and nothing else.
-            COUNT_NODES.store(true, Ordering::Relaxed);
+            // screen, so the meter is opened once here rather than around every search:
+            // it costs one atomic every 512 nodes and nothing else. Closed again when
+            // this engine is dropped, and counted rather than flagged so that an engine
+            // outliving another does not lose the counter with it.
+            open_node_meter();
             Engine {
                 tx,
                 rx,
@@ -333,7 +335,7 @@ mod desktop {
                 // promptly even from the middle of a deep search.
                 let _ = worker.join();
             }
-            COUNT_NODES.store(false, Ordering::Relaxed);
+            close_node_meter();
         }
     }
 
@@ -346,7 +348,7 @@ mod desktop {
         // change their answers depending on which test ran first.
         #[cfg(all(feature = "gaiatb", gaiatb_embedded, not(test)))]
         crate::dtm::init();
-        let mut shared = SharedState::new(TT_MB);
+        let mut shared = SharedState::new(TT_MB, 1);
         // Thread 0, muted. The interface wants everything thread 0 does — the real time
         // budget, the root reporting, the tablebase lookups — and none of what it says.
         // Taking a helper's id instead would buy the silence at the price of the rest.
@@ -357,7 +359,7 @@ mod desktop {
             match command {
                 Command::Quit => return,
                 Command::NewGame => {
-                    shared = SharedState::new(TT_MB);
+                    shared = SharedState::new(TT_MB, 1);
                     td = ThreadData::new(0);
                     td.silent = true;
                 }
@@ -729,16 +731,37 @@ mod ponder_tests {
     }
 
     /// Loops until `ready` or gives up, ticking the meter as a drawn frame would.
-    /// Budgeted (20s) like `collect`, for suites running on starved virtual CPUs.
+    ///
+    /// Budgeted in wall time, not in turns of the loop. A suite runs two dozen tests at
+    /// once, and under that a 5 ms sleep is not 5 ms: a budget counted in turns is
+    /// whatever the scheduler decides to make it, which is how this loop could once
+    /// outlive the very search it was watching.
+    ///
+    /// What it reports on giving up is the point: elapsed time, turns taken, and how far
+    /// the node counter moved while it waited. A meter that stayed quiet because nothing
+    /// was searched is a different fault from one that stayed quiet while the counter
+    /// climbed, and the message says which.
     fn watch(engine: &mut Engine, what: &str, ready: impl Fn(&Engine) -> bool) {
-        for _ in 0..4_000 {
+        use crate::threads::NODES_SEARCHED;
+        use std::sync::atomic::Ordering;
+
+        let budget = std::time::Duration::from_secs(30);
+        let start = std::time::Instant::now();
+        let nodes_at_start = NODES_SEARCHED.load(Ordering::Relaxed);
+        let mut turns = 0u32;
+        while start.elapsed() < budget {
             engine.tick();
+            turns += 1;
             if ready(engine) {
                 return;
             }
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
-        panic!("{what}");
+        let searched = NODES_SEARCHED.load(Ordering::Relaxed).saturating_sub(nodes_at_start);
+        panic!(
+            "{what} (waited {:.1}s over {turns} turns; the node counter moved by {searched})",
+            start.elapsed().as_secs_f32()
+        );
     }
 
     #[test]
@@ -747,9 +770,12 @@ mod ponder_tests {
         let mut engine = Engine::spawn();
         assert!(engine.nps().is_none(), "an engine that has not started cannot have a rate");
 
-        // Long enough that the search is still running when a loaded machine finally
-        // gets around to reading the meter; aborted the moment the rate shows.
-        engine.think(&startpos(), &[], SearchLimits::MoveTime(30_000), MAX_LEVEL, 0);
+        // Searched without a clock, and aborted below the moment the rate shows. A timed
+        // search would be a second deadline racing the one in `watch`: on a loaded
+        // machine it can run out first, and then the meter is quiet for the honest
+        // reason that nothing is being searched — a failure that says nothing about the
+        // meter. Nothing here needs the search to end on its own.
+        engine.think(&startpos(), &[], SearchLimits::Infinite, MAX_LEVEL, 0);
         watch(&mut engine, "a running search never read as any rate", |e| e.nps().is_some());
         assert!(engine.nps().is_some_and(|nps| nps > 0));
 

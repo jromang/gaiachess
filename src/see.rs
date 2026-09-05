@@ -206,7 +206,7 @@ mod tests {
     #[test]
     fn test_see_castling_always_true() {
         let pos = Position::from_fen("r3k2r/pppppppp/8/8/8/8/PPPPPPPP/R3K2R w KQkq - 0 1").unwrap();
-        let m = Move::new_with_type(Square::from_string("e1").unwrap(), Square::from_string("g1").unwrap(), MT_CASTLING);
+        let m = Move::new_with_type(Square::from_string("e1").unwrap(), Square::from_string("h1").unwrap(), MT_CASTLING);
         assert!(see(&pos, m, 0));
     }
 

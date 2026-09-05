@@ -66,7 +66,7 @@ pub fn run(opts: &DumpOptions) {
         SearchLimits::Depth(opts.depth)
     };
 
-    let shared = SharedState::new(opts.tt_mb);
+    let shared = SharedState::new(opts.tt_mb, 1);
     // id=1 suppresses UCI info output (same pattern as bench.rs / datagen.rs)
     let mut td = ThreadData::new(1);
 
