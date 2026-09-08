@@ -9,7 +9,8 @@
 //! decided per instantiation in `nnue::kernels` (compile-time today, so the set of
 //! instantiated kernels still follows `#[cfg(target_feature)]`). Other
 //! architectures keep a single compile-time backend:
-//! - NEON (aarch64, always available — e.g. Raspberry Pi 5)
+//! - NEON (aarch64, always available — e.g. Raspberry Pi 5), plus a Dot
+//!   Product (`sdot`) instance elected at runtime when the CPU has ASIMDDP
 //! - simd128 (wasm32, `-C target-feature=+simd128`)
 //! - Scalar fallback (no SIMD features)
 
@@ -22,6 +23,8 @@ pub mod avx512vnni;
 
 #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
 pub mod neon;
+#[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+pub mod neon_dotprod;
 
 #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
 pub mod wasm128;

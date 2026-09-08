@@ -15,9 +15,13 @@ use std::time::Duration;
 use gaiachess::*;
 
 #[derive(Debug, Clone, Bpaf)]
-#[bpaf(options("gaiachess"), version, footer(
-    "Examples:\n  gaiachess                          Play, or speak UCI if something asks\n  gaiachess --no-gui                 Speak UCI at once, never open the interface\n  gaiachess bench                    Single run, deterministic node count\n  gaiachess bench --stats             5 runs with median, CI, outliers\n  gaiachess bench --stats -n 10 -v   10 runs with per-position breakdown\n  gaiachess perft -d 7               Perft divide depth 7\n  gaiachess info                     Show build configuration"
-))]
+#[bpaf(
+    options("gaiachess"),
+    version,
+    footer(
+        "Examples:\n  gaiachess                          Play, or speak UCI if something asks\n  gaiachess --no-gui                 Speak UCI at once, never open the interface\n  gaiachess bench                    Single run, deterministic node count\n  gaiachess bench --stats             5 runs with median, CI, outliers\n  gaiachess bench --stats -n 10 -v   10 runs with per-position breakdown\n  gaiachess perft -d 7               Perft divide depth 7\n  gaiachess info                     Show build configuration"
+    )
+)]
 enum Cmd {
     /// Run perft divide
     #[bpaf(command)]
@@ -49,6 +53,27 @@ enum Cmd {
         /// Above 1 the node count stops being reproducible; the measure is the NPS.
         #[bpaf(short('T'), long)]
         threads: Option<usize>,
+    },
+
+    /// Re-score an existing corpus with this engine, keeping its positions and results
+    #[cfg(feature = "datagen")]
+    #[bpaf(command)]
+    Relabel {
+        /// Corpus to read (viriformat .vf)
+        #[bpaf(short('i'), long, argument("PATH"))]
+        input: std::path::PathBuf,
+        /// Text output: `<FEN> | <score> | <result>`, both white-relative
+        #[bpaf(short('o'), long, argument("PATH"))]
+        output: std::path::PathBuf,
+        /// Soft node budget per position; hard cap = 100x
+        #[bpaf(short('N'), long, fallback(5000u64), display_fallback)]
+        nodes: u64,
+        /// Worker threads (0 = all cores)
+        #[bpaf(short('t'), long, fallback(0usize), display_fallback)]
+        threads: usize,
+        /// Stop after this many positions (0 = the whole file)
+        #[bpaf(short('n'), long, fallback(0u64), display_fallback)]
+        max_positions: u64,
     },
 
     /// Generate NNUE training data
@@ -233,7 +258,11 @@ const PROBE_WINDOW: Duration = Duration::from_secs(2);
 /// failure, it panics, and a release build aborts on panic. The engine spends most of
 /// its life under match managers on machines reached over SSH, where the difference
 /// between "no window" and "no engine" is the whole match.
-#[cfg(all(feature = "gui", unix, not(any(target_os = "macos", target_os = "haiku"))))]
+#[cfg(all(
+    feature = "gui",
+    unix,
+    not(any(target_os = "macos", target_os = "haiku"))
+))]
 fn display_available() -> bool {
     // An empty DISPLAY is how a script says "no display", so emptiness counts as absence.
     let set = |v| std::env::var_os(v).is_some_and(|d: std::ffi::OsString| !d.is_empty());
@@ -291,8 +320,21 @@ fn main() {
     // below is spawned, and gives the engine a thread of its own instead.
     #[cfg(feature = "gui")]
     if let Cmd::Gui {
-        shot, shot_scene, shot_moves, shot_clicks, shot_hover, shot_drag, shot_drop, shot_fly,
-        shot_flip, shot_selfplay, level, shot_ticks, shot_scheme, shot_clock, shot_lang,
+        shot,
+        shot_scene,
+        shot_moves,
+        shot_clicks,
+        shot_hover,
+        shot_drag,
+        shot_drop,
+        shot_fly,
+        shot_flip,
+        shot_selfplay,
+        level,
+        shot_ticks,
+        shot_scheme,
+        shot_clock,
+        shot_lang,
     } = &cmd
     {
         init_cpu_dispatch();
@@ -337,39 +379,35 @@ fn main() {
             return;
         }
 
-        // A pipe settles the question the probe exists to ask: only a program — a
-        // chess GUI, a match manager — ever connects one, and some (Fritz 17 among
-        // them) take longer than any reasonable window to say their first word.
-        // Commit to the protocol and wait indefinitely, as an engine always has;
-        // only a console stdin leaves real ambiguity for the probe to resolve.
-        #[cfg(windows)]
-        let probe = !win_console::stdin_is_pipe();
-        #[cfg(not(windows))]
-        let probe = true;
-
-        if probe {
-            let rx = uci::spawn_stdin_reader();
-            match rx.recv_timeout(PROBE_WINDOW) {
-                // Someone is talking to us. The line is handed on, not dropped.
-                Ok(line) => {
-                    stdin.rx = Some(rx);
-                    stdin.first = Some(line);
-                }
-                // Nobody said anything — and a stdin that ended before a word was said
-                // can never say one. Both are the same silence, so both get the board;
-                // EOF just answers without the wait. This is how a desktop launch looks
-                // on Haiku and Linux: Tracker and the freedesktop launchers hand the
-                // program a stdin already at EOF, where taking the engine path meant
-                // exiting at once and a double-click that seemed to do nothing.
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
-                | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                    // Nothing will drain this channel again; dropping it lets the reader
-                    // fall out of its loop instead of piling lines up behind it.
-                    drop(rx);
-                    init_cpu_dispatch();
-                    gui::run(None);
-                    return;
-                }
+        // A TTY is the only ambiguous stdin: a player at a terminal, or someone
+        // typing UCI by hand. A live pipe is a GUI or a match manager — wait
+        // forever, as the protocol requires (Fritz 17 can take more than 2 s to
+        // speak). An already-closed stdin is a desktop launcher: open the board.
+        use std::io::IsTerminal;
+        let tty = std::io::stdin().is_terminal();
+        let rx = uci::spawn_stdin_reader();
+        let window = if tty {
+            PROBE_WINDOW
+        } else {
+            // Long enough for the reader to notice EOF; short enough that a live
+            // pipe with nothing on it yet is not mistaken for silence.
+            Duration::from_millis(20)
+        };
+        match rx.recv_timeout(window) {
+            Ok(line) => {
+                stdin.rx = Some(rx);
+                stdin.first = Some(line);
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) if !tty => {
+                // Live pipe, no data yet: UCI, wait indefinitely.
+                stdin.rx = Some(rx);
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                drop(rx);
+                init_cpu_dispatch();
+                gui::run(None);
+                return;
             }
         }
     }
@@ -398,7 +436,13 @@ fn real_main(cmd: Cmd, stdin: ProbedStdin) {
             };
             perft::divide(&mut pos, depth);
         }
-        Cmd::Bench { depth, stats, runs, verbose, threads } => {
+        Cmd::Bench {
+            depth,
+            stats,
+            runs,
+            verbose,
+            threads,
+        } => {
             if stats {
                 bench::run_stats(depth, runs, verbose);
             } else {
@@ -406,7 +450,28 @@ fn real_main(cmd: Cmd, stdin: ProbedStdin) {
             }
         }
         #[cfg(feature = "datagen")]
-        Cmd::Datagen { threads, positions, depth, nodes, dfrc, seed, yes, output, book, syzygy } => {
+        Cmd::Relabel {
+            input,
+            output,
+            nodes,
+            threads,
+            max_positions,
+        } => {
+            relabel::run(&input, &output, nodes, threads, max_positions);
+        }
+        #[cfg(feature = "datagen")]
+        Cmd::Datagen {
+            threads,
+            positions,
+            depth,
+            nodes,
+            dfrc,
+            seed,
+            yes,
+            output,
+            book,
+            syzygy,
+        } => {
             #[cfg(feature = "syzygy")]
             if let Some(ref path) = syzygy
                 && !tb::init(path)
@@ -418,14 +483,29 @@ fn real_main(cmd: Cmd, stdin: ProbedStdin) {
                 eprintln!("WARNING: --syzygy requires --features syzygy (ignored)");
             }
             datagen::run(
-                threads, positions, depth, nodes, dfrc, seed, yes,
-                &output, book.as_deref(),
+                threads,
+                positions,
+                depth,
+                nodes,
+                dfrc,
+                seed,
+                yes,
+                &output,
+                book.as_deref(),
             );
         }
         #[cfg(any(feature = "stats", feature = "tree"))]
         Cmd::Dump {
-            depth, nodes, tt_mb, stats, tree, min_record_depth,
-            qs_moves, max_mb, moves, fen,
+            depth,
+            nodes,
+            tt_mb,
+            stats,
+            tree,
+            min_record_depth,
+            qs_moves,
+            max_mb,
+            moves,
+            fen,
         } => {
             let opts = dump::DumpOptions {
                 fen,
@@ -450,7 +530,11 @@ fn real_main(cmd: Cmd, stdin: ProbedStdin) {
             println!();
             println!(
                 "Build:       {}",
-                if cfg!(debug_assertions) { "debug" } else { "release" }
+                if cfg!(debug_assertions) {
+                    "debug"
+                } else {
+                    "release"
+                }
             );
             println!(
                 "Compiler:    {}",
@@ -464,13 +548,14 @@ fn real_main(cmd: Cmd, stdin: ProbedStdin) {
                 "Date:        {}",
                 option_env!("BUILD_DATE").unwrap_or("unknown")
             );
-            let eval = if cfg!(feature = "nnue") { "NNUE" } else { "PeSTO" };
+            let eval = if cfg!(feature = "nnue") {
+                "NNUE"
+            } else {
+                "PeSTO"
+            };
             println!("Eval:        {eval}");
             if cfg!(feature = "nnue") {
-                println!(
-                    "Network:     {}",
-                    option_env!("MODEL").unwrap_or("unknown")
-                );
+                println!("Network:     {}", option_env!("MODEL").unwrap_or("unknown"));
                 println!(
                     "Arch hash:   {:#010x}",
                     gaiachess::nnue::integrity::ARCH_HASH
@@ -488,7 +573,11 @@ fn real_main(cmd: Cmd, stdin: ProbedStdin) {
                     Some(cap) => format!(" (GAIA_SIMD={} forced)", cap.name()),
                     None => String::new(),
                 };
-                let how = if cpu::statically_pinned() { "static" } else { "runtime" };
+                let how = if cpu::statically_pinned() {
+                    "static"
+                } else {
+                    "runtime"
+                };
                 println!(
                     "SIMD:        {} ({how}), nnz {}{forced}",
                     d.tier.name(),
@@ -500,15 +589,31 @@ fn real_main(cmd: Cmd, stdin: ProbedStdin) {
                 } else {
                     "per-piece loop"
                 };
-                let pext_note = if d.pext_forced { " (GAIA_PEXT forced)" } else { "" };
+                let pext_note = if d.pext_forced {
+                    " (GAIA_PEXT forced)"
+                } else {
+                    ""
+                };
                 let how = if cfg!(gaia_dist) { "runtime" } else { "static" };
-                println!("Movegen:     {} ({how}), setwise {setwise}{pext_note}", slider.name());
+                println!(
+                    "Movegen:     {} ({how}), setwise {setwise}{pext_note}",
+                    slider.name()
+                );
             }
-            #[cfg(not(target_arch = "x86_64"))]
+            #[cfg(target_arch = "aarch64")]
             {
-                let simd = if cfg!(all(target_arch = "aarch64", target_feature = "neon")) {
-                    "NEON"
-                } else if cfg!(all(target_arch = "wasm32", target_feature = "simd128")) {
+                let simd = gaiachess::nnue::simd_label();
+                let how = if cfg!(target_feature = "dotprod") {
+                    "static"
+                } else {
+                    "runtime"
+                };
+                println!("SIMD:        {simd} ({how})");
+                println!("Movegen:     magic, setwise per-piece loop");
+            }
+            #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+            {
+                let simd = if cfg!(all(target_arch = "wasm32", target_feature = "simd128")) {
                     "wasm simd128"
                 } else {
                     "scalar"
@@ -569,6 +674,7 @@ fn real_main(cmd: Cmd, stdin: ProbedStdin) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::assert_matches;
 
     /// The bare invocation is caught by a hidden variant that must consume nothing, or
     /// `gaiachess` on its own stops working. Adding the `--no-gui` switch to it is
@@ -577,10 +683,10 @@ mod tests {
     fn a_bare_launch_still_lands_on_the_uci_catch_all() {
         let none: &[&str] = &[];
         let parsed = cmd().run_inner(none).expect("a bare launch must parse");
-        assert!(matches!(parsed, Cmd::Uci(UciMode { no_gui: false })));
+        assert_matches!(parsed, Cmd::Uci(UciMode { no_gui: false }));
 
         let flag: &[&str] = &["--no-gui"];
         let parsed = cmd().run_inner(flag).expect("--no-gui must parse");
-        assert!(matches!(parsed, Cmd::Uci(UciMode { no_gui: true })));
+        assert_matches!(parsed, Cmd::Uci(UciMode { no_gui: true }));
     }
 }

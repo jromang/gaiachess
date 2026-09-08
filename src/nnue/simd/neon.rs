@@ -58,12 +58,13 @@ pub unsafe fn shift_left_i16<const SHIFT: i32>(a: int16x8_t) -> int16x8_t {
 
 /// Multiply high: (a * b) >> 16 for each i16 lane.
 ///
-/// NEON has no direct `mulhi_i16`. Emulate via widening multiply on each half,
-/// shift right by 16, then narrow and recombine.
+/// NEON has no direct `mulhi_i16`. Widening multiply on each half, shift right
+/// by 16, then narrow and recombine. `vmull_high_s16` reads the top half
+/// without a separate extract.
 #[inline(always)]
 pub unsafe fn mul_high_i16(a: int16x8_t, b: int16x8_t) -> int16x8_t {
     let lo = vmull_s16(vget_low_s16(a), vget_low_s16(b));
-    let hi = vmull_s16(vget_high_s16(a), vget_high_s16(b));
+    let hi = vmull_high_s16(a, b);
     let lo_hi = vshrn_n_s32::<16>(lo);
     let hi_hi = vshrn_n_s32::<16>(hi);
     vcombine_s16(lo_hi, hi_hi)
@@ -131,33 +132,25 @@ pub unsafe fn add_i32(a: int32x4_t, b: int32x4_t) -> int32x4_t {
     vaddq_s32(a, b)
 }
 
-/// Dot product of unsigned bytes × signed bytes, accumulated into i32.
+/// Dot product of four-byte groups, accumulated into i32.
 ///
-/// Emulates x86 VNNI `dpbusd`: for each group of 4 bytes in u8s × i8s,
-/// computes u8[0]*i8[0] + u8[1]*i8[1] + u8[2]*i8[2] + u8[3]*i8[3] and
-/// accumulates into the corresponding i32 lane.
-///
-/// NEON implementation: widen to i16, pairwise multiply, pairwise add to i32.
+/// Emulates x86 VNNI `dpbusd`. The feature-transformer pairwise product is in
+/// `0..=127` (`FT_QUANT=255`, `FT_SHIFT=9`), so a signed×signed 4-byte dot
+/// product is bit-identical to mixed-sign u8×i8. Widening `s8` multiply plus
+/// pairwise add; the Dot Product backend replaces this with a single `sdot`.
 #[inline(always)]
 pub unsafe fn dpbusd(acc: int32x4_t, u8s: int32x4_t, i8s: int8x16_t) -> int32x4_t {
-    let u8s = vreinterpretq_u8_s32(u8s);
-
-    let products_lo = vmulq_s16(
-        vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(u8s))),
-        vmovl_s8(vget_low_s8(i8s)),
-    );
-    let products_hi = vmulq_s16(
-        vreinterpretq_s16_u16(vmovl_u8(vget_high_u8(u8s))),
-        vmovl_s8(vget_high_s8(i8s)),
-    );
-
-    let sums_lo = vpaddlq_s16(products_lo);
-    let sums_hi = vpaddlq_s16(products_hi);
-
-    vaddq_s32(acc, vpaddq_s32(sums_lo, sums_hi))
+    let a = vreinterpretq_s8_s32(u8s);
+    let product0 = vmull_s8(vget_low_s8(a), vget_low_s8(i8s));
+    let product1 = vmull_high_s8(a, i8s);
+    let sum = vpaddq_s16(product0, product1);
+    vpadalq_s16(acc, sum)
 }
 
 /// Double dpbusd: process two (u8, i8) pairs in one call.
+///
+/// The two widening products are added in i16 before the long accumulate, so
+/// the intermediate 127×127×2 still fits in i16.
 #[inline(always)]
 pub unsafe fn double_dpbusd(
     acc: int32x4_t,
@@ -166,41 +159,22 @@ pub unsafe fn double_dpbusd(
     u8s2: int32x4_t,
     i8s2: int8x16_t,
 ) -> int32x4_t {
-    let u8s1 = vreinterpretq_u8_s32(u8s1);
-    let u8s2 = vreinterpretq_u8_s32(u8s2);
-
-    let p1_lo = vmulq_s16(
-        vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(u8s1))),
-        vmovl_s8(vget_low_s8(i8s1)),
-    );
-    let p1_hi = vmulq_s16(
-        vreinterpretq_s16_u16(vmovl_u8(vget_high_u8(u8s1))),
-        vmovl_s8(vget_high_s8(i8s1)),
-    );
-    let p2_lo = vmulq_s16(
-        vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(u8s2))),
-        vmovl_s8(vget_low_s8(i8s2)),
-    );
-    let p2_hi = vmulq_s16(
-        vreinterpretq_s16_u16(vmovl_u8(vget_high_u8(u8s2))),
-        vmovl_s8(vget_high_s8(i8s2)),
-    );
-
-    let sums_lo = vpaddlq_s16(vaddq_s16(p1_lo, p2_lo));
-    let sums_hi = vpaddlq_s16(vaddq_s16(p1_hi, p2_hi));
-
-    vaddq_s32(acc, vpaddq_s32(sums_lo, sums_hi))
+    let a1 = vreinterpretq_s8_s32(u8s1);
+    let a2 = vreinterpretq_s8_s32(u8s2);
+    let p1_lo = vmull_s8(vget_low_s8(a1), vget_low_s8(i8s1));
+    let p1_hi = vmull_high_s8(a1, i8s1);
+    let p2_lo = vmull_s8(vget_low_s8(a2), vget_low_s8(i8s2));
+    let p2_hi = vmull_high_s8(a2, i8s2);
+    let sum = vpaddq_s16(vaddq_s16(p1_lo, p2_lo), vaddq_s16(p1_hi, p2_hi));
+    vpadalq_s16(acc, sum)
 }
 
 /// Extract bitmask of non-zero i32 lanes (4 bits, one per lane).
 #[inline(always)]
 pub unsafe fn nnz_bitmask(x: int32x4_t) -> u16 {
     let cmp = vcgtq_s32(x, vdupq_n_s32(0));
-    let mask0 = (vgetq_lane_u32::<0>(cmp) >> 31) & 1;
-    let mask1 = ((vgetq_lane_u32::<1>(cmp) >> 31) & 1) << 1;
-    let mask2 = ((vgetq_lane_u32::<2>(cmp) >> 31) & 1) << 2;
-    let mask3 = ((vgetq_lane_u32::<3>(cmp) >> 31) & 1) << 3;
-    (mask0 | mask1 | mask2 | mask3) as u16
+    let bits = vandq_u32(cmp, vld1q_u32([1u32, 2, 4, 8].as_ptr()));
+    vaddvq_u32(bits) as u16
 }
 
 // ============================================================
@@ -256,3 +230,69 @@ pub unsafe fn horizontal_sum(x: [float32x4_t; 4]) -> f32 {
 
 /// Number of float32x4_t vectors needed for horizontal_sum input.
 pub const HSUM_VECS: usize = 4;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Scalar u8×i8 dpbusd over four 4-byte groups. Matches the production
+    /// range: activations in 0..=127.
+    fn dpbusd_ref(acc: [i32; 4], u8s: [u8; 16], i8s: [i8; 16]) -> [i32; 4] {
+        let mut out = acc;
+        for lane in 0..4 {
+            let mut s = out[lane];
+            for k in 0..4 {
+                let i = lane * 4 + k;
+                s += u8s[i] as i32 * i8s[i] as i32;
+            }
+            out[lane] = s;
+        }
+        out
+    }
+
+    fn to_i32x4(x: [i32; 4]) -> int32x4_t {
+        unsafe { vld1q_s32(x.as_ptr()) }
+    }
+
+    fn from_i32x4(x: int32x4_t) -> [i32; 4] {
+        let mut out = [0i32; 4];
+        unsafe { vst1q_s32(out.as_mut_ptr(), x) };
+        out
+    }
+
+    #[test]
+    fn dpbusd_matches_scalar_on_the_ft_output_range() {
+        let acc = [1i32, -2, 3, 0];
+        let mut u8s = [0u8; 16];
+        let mut i8s = [0i8; 16];
+        for i in 0..16 {
+            u8s[i] = ((i * 13) % 128) as u8;
+            i8s[i] = (i as i8).wrapping_mul(17).wrapping_sub(64);
+        }
+        // Include the pairwise product ceiling.
+        u8s[0] = 127;
+        u8s[15] = 0;
+        i8s[0] = 127;
+        i8s[4] = -128;
+        let want = dpbusd_ref(acc, u8s, i8s);
+        let got = unsafe {
+            from_i32x4(dpbusd(
+                to_i32x4(acc),
+                vreinterpretq_s32_u8(vld1q_u8(u8s.as_ptr())),
+                vld1q_s8(i8s.as_ptr()),
+            ))
+        };
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn nnz_bitmask_reports_strictly_positive_lanes() {
+        unsafe {
+            assert_eq!(nnz_bitmask(to_i32x4([0, 0, 0, 0])), 0);
+            assert_eq!(nnz_bitmask(to_i32x4([1, 0, 0, 0])), 0b0001);
+            assert_eq!(nnz_bitmask(to_i32x4([0, 1, 0, 1])), 0b1010);
+            assert_eq!(nnz_bitmask(to_i32x4([-1, 0, 2, -3])), 0b0100);
+            assert_eq!(nnz_bitmask(to_i32x4([1, 1, 1, 1])), 0b1111);
+        }
+    }
+}

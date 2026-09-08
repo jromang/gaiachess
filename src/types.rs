@@ -473,8 +473,7 @@ impl<T: Copy, const N: usize> ArrayBuf<T, N> {
     /// Create a new uninitialized buffer.
     #[inline(always)]
     pub const fn new() -> Self {
-        // SAFETY: [MaybeUninit<T>; N] is valid when uninitialized.
-        Self { data: unsafe { std::mem::MaybeUninit::uninit().assume_init() } }
+        Self { data: [const { std::mem::MaybeUninit::uninit() }; N] }
     }
 
     #[inline(always)]

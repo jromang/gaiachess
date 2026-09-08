@@ -99,7 +99,9 @@ mod desktop {
     use crate::position::Position;
     use crate::search;
     use crate::skill;
-    use crate::threads::{PONDER, STOP, SharedState, ThreadData, close_node_meter, open_node_meter};
+    use crate::threads::{
+        PONDER, STOP, SharedState, ThreadData, close_node_meter, open_node_meter,
+    };
     use crate::timeman::SearchLimits;
     use crate::types::Move;
 
@@ -227,7 +229,11 @@ mod desktop {
         ) {
             self.abort();
             self.generation += 1;
-            self.busy = if ponder { Busy::Pondering } else { Busy::Searching };
+            self.busy = if ponder {
+                Busy::Pondering
+            } else {
+                Busy::Searching
+            };
             // Raised here, and only here, rather than on the thread that runs the
             // search. `prepare_search` reads it to decide whether this search answers to
             // its clock at all, and sending the command is what orders the two: a flag
@@ -408,7 +414,10 @@ mod desktop {
         if best.pv_len < 2 {
             return None;
         }
-        debug_assert_eq!(best.pv[0], td.best_move, "the PV does not start with the move played");
+        debug_assert_eq!(
+            best.pv[0], td.best_move,
+            "the PV does not start with the move played"
+        );
         let reply = best.pv[1];
         reply.is_ok().then_some(reply)
     }
@@ -557,7 +566,9 @@ mod web {
                 // Checked against the interface's own position rather than trusted: a
                 // host that has fallen out of step is caught here, instead of an
                 // illegal move reaching the board.
-                let Some(pos) = self.asked_about.as_deref() else { continue };
+                let Some(pos) = self.asked_about.as_deref() else {
+                    continue;
+                };
                 let Some(mv) = crate::uci::parse_uci_move(pos, uci) else {
                     debug_assert!(false, "worker answered with an illegal move: {uci}");
                     continue;
@@ -565,7 +576,10 @@ mod web {
                 self.searching = false;
                 // No expected reply: finding one would mean parsing every `info` line
                 // for its principal variation, and this side does not ponder anyway.
-                return Some(Thought { best: mv, ponder: None });
+                return Some(Thought {
+                    best: mv,
+                    ponder: None,
+                });
             }
         }
 
@@ -602,19 +616,34 @@ mod web {
     }
 
     fn go_line(limits: SearchLimits) -> String {
-        match limits {
-            SearchLimits::Depth(d) => format!("go depth {d}"),
-            SearchLimits::Nodes(n) => format!("go nodes {n}"),
-            SearchLimits::SoftNodes { soft, .. } => format!("go softnodes {soft}"),
-            SearchLimits::MoveTime(ms) => format!("go movetime {ms}"),
-            // Both sides are given the same numbers. The engine only ever reads the clock
-            // of the side to move, so one pair would do; naming both keeps the line valid
-            // whoever is on the move.
-            SearchLimits::Clock { time, inc, .. } => {
-                format!("go wtime {time} winc {inc} btime {time} binc {inc}")
-            }
-            SearchLimits::Infinite => String::from("go infinite"),
+        let mut parts = vec![String::from("go")];
+        if limits.infinite {
+            parts.push(String::from("infinite"));
         }
+        if let Some(d) = limits.depth {
+            parts.push(format!("depth {d}"));
+        }
+        if let Some(n) = limits.nodes {
+            parts.push(format!("nodes {n}"));
+        }
+        if let Some(s) = limits.soft_nodes {
+            parts.push(format!("softnodes {s}"));
+        }
+        if let Some(ms) = limits.movetime {
+            parts.push(format!("movetime {ms}"));
+        }
+        // Both sides are given the same numbers. The engine only ever reads the clock
+        // of the side to move, so one pair would do; naming both keeps the line valid
+        // whoever is on the move.
+        if let Some(time) = limits.time {
+            let inc = limits.inc;
+            parts.push(format!("wtime {time} winc {inc} btime {time} binc {inc}"));
+        }
+        if let Some(n) = limits.mate {
+            parts.push(format!("mate {n}"));
+        }
+        debug_assert!(!parts.is_empty());
+        parts.join(" ")
     }
 }
 
@@ -638,17 +667,13 @@ pub const DEFAULT_LEVEL: u8 = 6;
 pub fn level_limits(level: u8, clock: Option<(u64, u64)>) -> SearchLimits {
     debug_assert!((1..=MAX_LEVEL).contains(&level));
     if level < MAX_LEVEL {
-        return SearchLimits::Depth(skill::depth_for(level as i32));
+        return SearchLimits::depth(skill::depth_for(level as i32));
     }
     match clock {
-        Some((time, inc)) => SearchLimits::Clock {
-            time,
-            inc,
-            movestogo: None,
-        },
+        Some((time, inc)) => SearchLimits::clock(time, inc, None),
         // Never Infinite: with no clock to answer to, the search would never hand a
         // move back.
-        None => SearchLimits::MoveTime(2000),
+        None => SearchLimits::movetime(2000),
     }
 }
 
@@ -690,12 +715,14 @@ mod ponder_tests {
         let _guard = skill::lock_level();
         let pos = startpos();
         let mut engine = Engine::spawn();
-        engine.think(&pos, &[], SearchLimits::Depth(8), MAX_LEVEL, 0);
+        engine.think(&pos, &[], SearchLimits::depth(8), MAX_LEVEL, 0);
         let thought = collect(&mut engine);
 
         // Pondering is nothing without this: the second move of the line the search
         // settled on is the whole of what the engine bets the player will play.
-        let reply = thought.ponder.expect("a search this deep has a line behind it");
+        let reply = thought
+            .ponder
+            .expect("a search this deep has a line behind it");
         let played = after(&pos, &[&thought.best.to_uci()]);
         assert!(
             super::super::game::is_legal(&played, reply),
@@ -713,18 +740,30 @@ mod ponder_tests {
         let played = after(&start, &["e2e4", "c7c5"]);
 
         let mut engine = Engine::spawn();
-        engine.ponder(&guessed, &[], SearchLimits::Depth(10), MAX_LEVEL, 0);
+        engine.ponder(&guessed, &[], SearchLimits::depth(10), MAX_LEVEL, 0);
         assert!(engine.is_pondering());
 
         // Whatever it finds while it waits is an answer to a question nobody has asked:
         // it must not come back as a move to play.
         std::thread::sleep(std::time::Duration::from_millis(50));
-        assert!(engine.poll().is_none(), "a ponder was handed back as a move");
+        assert!(
+            engine.poll().is_none(),
+            "a ponder was handed back as a move"
+        );
 
-        assert!(!engine.ponderhit(&played), "the wrong position claimed the thinking");
-        assert!(engine.is_pondering(), "a miss should leave the search where it was");
+        assert!(
+            !engine.ponderhit(&played),
+            "the wrong position claimed the thinking"
+        );
+        assert!(
+            engine.is_pondering(),
+            "a miss should leave the search where it was"
+        );
 
-        assert!(engine.ponderhit(&guessed), "the position it was set on did not claim it");
+        assert!(
+            engine.ponderhit(&guessed),
+            "the position it was set on did not claim it"
+        );
         assert!(!engine.is_pondering());
         // And once claimed it answers on the engine's own time, as any search would.
         assert!(collect(&mut engine).best.is_ok());
@@ -757,7 +796,9 @@ mod ponder_tests {
             }
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
-        let searched = NODES_SEARCHED.load(Ordering::Relaxed).saturating_sub(nodes_at_start);
+        let searched = NODES_SEARCHED
+            .load(Ordering::Relaxed)
+            .saturating_sub(nodes_at_start);
         panic!(
             "{what} (waited {:.1}s over {turns} turns; the node counter moved by {searched})",
             start.elapsed().as_secs_f32()
@@ -768,22 +809,31 @@ mod ponder_tests {
     fn the_rate_says_what_the_search_is_doing_and_stops_when_it_does() {
         let _guard = skill::lock_level();
         let mut engine = Engine::spawn();
-        assert!(engine.nps().is_none(), "an engine that has not started cannot have a rate");
+        assert!(
+            engine.nps().is_none(),
+            "an engine that has not started cannot have a rate"
+        );
 
         // Searched without a clock, and aborted below the moment the rate shows. A timed
         // search would be a second deadline racing the one in `watch`: on a loaded
         // machine it can run out first, and then the meter is quiet for the honest
         // reason that nothing is being searched — a failure that says nothing about the
         // meter. Nothing here needs the search to end on its own.
-        engine.think(&startpos(), &[], SearchLimits::Infinite, MAX_LEVEL, 0);
-        watch(&mut engine, "a running search never read as any rate", |e| e.nps().is_some());
+        engine.think(&startpos(), &[], SearchLimits::infinite(), MAX_LEVEL, 0);
+        watch(
+            &mut engine,
+            "a running search never read as any rate",
+            |e| e.nps().is_some(),
+        );
         assert!(engine.nps().is_some_and(|nps| nps > 0));
 
         engine.abort();
         // And nothing once it stops: the figure is what is happening, not what happened.
-        watch(&mut engine, "the rate went on reading after the search stopped", |e| {
-            e.nps().is_none()
-        });
+        watch(
+            &mut engine,
+            "the rate went on reading after the search stopped",
+            |e| e.nps().is_none(),
+        );
     }
 
     #[test]
@@ -794,8 +844,14 @@ mod ponder_tests {
         // Set going and given up on before the worker can so much as read it — the
         // shortest a ponder can be. What follows must be an ordinary timed search, not
         // one that inherited a raised flag and searches for ever.
-        engine.ponder(&after(&start, &["e2e4", "e7e5"]), &[], SearchLimits::Depth(20), MAX_LEVEL, 0);
-        engine.think(&start, &[], SearchLimits::MoveTime(50), MAX_LEVEL, 0);
+        engine.ponder(
+            &after(&start, &["e2e4", "e7e5"]),
+            &[],
+            SearchLimits::depth(20),
+            MAX_LEVEL,
+            0,
+        );
+        engine.think(&start, &[], SearchLimits::movetime(50), MAX_LEVEL, 0);
         assert!(collect(&mut engine).best.is_ok());
     }
 }
@@ -807,22 +863,22 @@ mod tests {
     #[test]
     fn weak_levels_are_budgeted_in_depth_so_the_machine_cannot_matter() {
         for level in 1..MAX_LEVEL {
-            match level_limits(level, None) {
-                SearchLimits::Depth(d) => assert_eq!(d, skill::depth_for(level as i32)),
-                _ => panic!("level {level} must be budgeted in depth"),
-            }
+            let limits = level_limits(level, None);
+            assert_eq!(
+                limits.depth,
+                Some(skill::depth_for(level as i32)),
+                "level {level} must be budgeted in depth"
+            );
         }
     }
 
     #[test]
     fn the_top_level_uses_the_clock_when_there_is_one() {
-        assert!(matches!(
-            level_limits(MAX_LEVEL, Some((60_000, 1_000))),
-            SearchLimits::Clock { .. }
-        ));
-        assert!(matches!(
-            level_limits(MAX_LEVEL, None),
-            SearchLimits::MoveTime(_)
-        ));
+        assert!(
+            level_limits(MAX_LEVEL, Some((60_000, 1_000)))
+                .time
+                .is_some()
+        );
+        assert!(level_limits(MAX_LEVEL, None).movetime.is_some());
     }
 }

@@ -575,10 +575,13 @@ macro_rules! nnue_kernels {
             adds: &[u32],
             subs: &[u32],
         ) {
-            if !input_acc.is_null() {
-                std::ptr::copy_nonoverlapping(input_acc, output_acc, L1_SIZE);
-            } else {
+            if input_acc.is_null() {
                 std::ptr::write_bytes(output_acc, 0, L1_SIZE);
+            } else if input_acc != output_acc as *const i16 {
+                // In-place apply (pawn-pair rows stacked on an already-filled
+                // threat acc) passes the same pointer twice; a nonoverlapping
+                // copy would be UB there.
+                std::ptr::copy_nonoverlapping(input_acc, output_acc, L1_SIZE);
             }
             // No software prefetch, as in `threat512::threat_batch`.
             for &s in subs {
@@ -722,8 +725,21 @@ pub mod k_scalar {
 }
 
 #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
-pub mod k_native {
+#[allow(dead_code)]
+pub mod k_neon {
     nnue_kernels!(crate::nnue::simd::neon);
+}
+
+#[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+#[allow(dead_code)]
+pub mod k_dotprod {
+    nnue_kernels!(
+        crate::nnue::simd::neon_dotprod,
+        #[cfg_attr(
+            not(target_feature = "dotprod"),
+            target_feature(enable = "dotprod")
+        )]
+    );
 }
 
 #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
@@ -764,7 +780,15 @@ pub(crate) use k_avx512 as k;
 pub(crate) use k_avx2 as k;
 #[cfg(all(target_arch = "x86_64", not(target_feature = "avx2")))]
 pub(crate) use k_scalar as k;
-#[cfg(not(target_arch = "x86_64"))]
+#[cfg(all(target_arch = "aarch64", target_feature = "dotprod"))]
+pub(crate) use k_dotprod as k;
+#[cfg(all(
+    target_arch = "aarch64",
+    target_feature = "neon",
+    not(target_feature = "dotprod")
+))]
+pub(crate) use k_neon as k;
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 pub(crate) use k_native as k;
 
 /// Threat batch apply for the current build target: the hand-scheduled 20-ZMM
@@ -787,6 +811,134 @@ pub(crate) const STATIC_TOP: bool = cfg!(all(
     target_feature = "avx512bw",
     target_feature = "avx512vnni",
 ));
+#[cfg(target_arch = "aarch64")]
+pub(crate) const STATIC_TOP: bool = cfg!(target_feature = "dotprod");
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[allow(dead_code)]
+pub(crate) const STATIC_TOP: bool = false;
+
+// ============================================================
+// aarch64 runtime table — NEON vs NEON+DOTPROD
+// ============================================================
+
+/// Elects the NEON kernel instance from HWCAP (and `GAIA_SIMD=neon|dotprod`).
+///
+/// A build whose target already pins `dotprod` bypasses the table, matching
+/// `STATIC_TOP` on x86-64.
+#[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+pub mod arm {
+    use super::{k_dotprod, k_neon};
+    use crate::nnue::accumulator::Accumulator;
+    use crate::nnue::network::Aligned;
+    use crate::nnue::L1_SIZE;
+    use crate::types::Color;
+    use std::sync::OnceLock;
+
+    pub struct Table {
+        pub forward_dense:
+            unsafe fn(&Accumulator, &Aligned<[[i16; L1_SIZE]; 2]>, Color, usize) -> f32,
+        pub acc_add1_sub1: unsafe fn(*const i16, *mut i16, usize, usize),
+        pub acc_add1_sub2: unsafe fn(*const i16, *mut i16, usize, usize, usize),
+        pub acc_add2_sub2: unsafe fn(*const i16, *mut i16, usize, usize, usize, usize),
+        pub finny_apply: unsafe fn(*mut i16, &[usize], &[usize]),
+        pub threat_batch:
+            unsafe fn(*const i16, *mut i16, *const [i8; L1_SIZE], &[u32], &[u32]),
+        pub dotprod: bool,
+        #[allow(dead_code)]
+        pub forced: bool,
+    }
+
+    static TABLE: OnceLock<Table> = OnceLock::new();
+
+    fn read_cap() -> Option<bool> {
+        let v = std::env::var("GAIA_SIMD").ok()?;
+        match v.to_ascii_lowercase().as_str() {
+            "neon" => Some(false),
+            "dotprod" | "neon-dotprod" => Some(true),
+            other => {
+                eprintln!("info string GAIA_SIMD '{other}' ignored (neon|dotprod)");
+                None
+            }
+        }
+    }
+
+    fn resolve() -> Table {
+        let detected = cfg!(target_feature = "dotprod")
+            || std::arch::is_aarch64_feature_detected!("dotprod");
+        let cap = read_cap();
+        let (use_dot, forced) = if super::STATIC_TOP {
+            if cap.is_some() {
+                eprintln!(
+                    "info string GAIA_SIMD ignored: this build pins DOTPROD at compile time"
+                );
+            }
+            (true, false)
+        } else if let Some(want) = cap {
+            if want && !detected {
+                eprintln!("info string GAIA_SIMD=dotprod ignored: this CPU has no ASIMDDP");
+                (false, false)
+            } else {
+                (want, true)
+            }
+        } else {
+            (detected, false)
+        };
+
+        if use_dot {
+            Table {
+                forward_dense: k_dotprod::forward_dense,
+                acc_add1_sub1: k_dotprod::acc_add1_sub1,
+                acc_add1_sub2: k_dotprod::acc_add1_sub2,
+                acc_add2_sub2: k_dotprod::acc_add2_sub2,
+                finny_apply: k_dotprod::finny_apply,
+                threat_batch: k_dotprod::threat_batch,
+                dotprod: true,
+                forced,
+            }
+        } else {
+            Table {
+                forward_dense: k_neon::forward_dense,
+                acc_add1_sub1: k_neon::acc_add1_sub1,
+                acc_add1_sub2: k_neon::acc_add1_sub2,
+                acc_add2_sub2: k_neon::acc_add2_sub2,
+                finny_apply: k_neon::finny_apply,
+                threat_batch: k_neon::threat_batch,
+                dotprod: false,
+                forced,
+            }
+        }
+    }
+
+    pub fn get_or_init() -> &'static Table {
+        TABLE.get_or_init(resolve)
+    }
+
+    #[inline(always)]
+    pub fn get() -> &'static Table {
+        #[cfg(test)]
+        return TABLE.get_or_init(resolve);
+        #[cfg(not(test))]
+        unsafe {
+            debug_assert!(
+                TABLE.get().is_some(),
+                "arm dispatch read before init_cpu_dispatch"
+            );
+            TABLE.get().unwrap_unchecked()
+        }
+    }
+
+    pub fn init() {
+        let _ = get_or_init();
+    }
+
+    pub fn label() -> &'static str {
+        if get_or_init().dotprod {
+            "NEON+DOTPROD"
+        } else {
+            "NEON"
+        }
+    }
+}
 
 // ============================================================
 // Dispatch helpers — the one place that decides between the static
@@ -815,7 +967,15 @@ pub(crate) mod dispatch {
                 (crate::cpu::get().forward_dense)(pst_acc, combined, stm, bucket)
             }
         }
-        #[cfg(not(target_arch = "x86_64"))]
+        #[cfg(target_arch = "aarch64")]
+        {
+            if super::STATIC_TOP {
+                super::k::forward_dense(pst_acc, combined, stm, bucket)
+            } else {
+                (super::arm::get().forward_dense)(pst_acc, combined, stm, bucket)
+            }
+        }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
         {
             super::k::forward_dense(pst_acc, combined, stm, bucket)
         }
@@ -832,7 +992,15 @@ pub(crate) mod dispatch {
                 (crate::cpu::get().acc_add1_sub1)(prev, out, add1, sub1)
             }
         }
-        #[cfg(not(target_arch = "x86_64"))]
+        #[cfg(target_arch = "aarch64")]
+        {
+            if super::STATIC_TOP {
+                super::k::acc_add1_sub1(prev, out, add1, sub1)
+            } else {
+                (super::arm::get().acc_add1_sub1)(prev, out, add1, sub1)
+            }
+        }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
         {
             super::k::acc_add1_sub1(prev, out, add1, sub1)
         }
@@ -855,7 +1023,15 @@ pub(crate) mod dispatch {
                 (crate::cpu::get().acc_add1_sub2)(prev, out, add1, sub1, sub2)
             }
         }
-        #[cfg(not(target_arch = "x86_64"))]
+        #[cfg(target_arch = "aarch64")]
+        {
+            if super::STATIC_TOP {
+                super::k::acc_add1_sub2(prev, out, add1, sub1, sub2)
+            } else {
+                (super::arm::get().acc_add1_sub2)(prev, out, add1, sub1, sub2)
+            }
+        }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
         {
             super::k::acc_add1_sub2(prev, out, add1, sub1, sub2)
         }
@@ -879,7 +1055,15 @@ pub(crate) mod dispatch {
                 (crate::cpu::get().acc_add2_sub2)(prev, out, add1, add2, sub1, sub2)
             }
         }
-        #[cfg(not(target_arch = "x86_64"))]
+        #[cfg(target_arch = "aarch64")]
+        {
+            if super::STATIC_TOP {
+                super::k::acc_add2_sub2(prev, out, add1, add2, sub1, sub2)
+            } else {
+                (super::arm::get().acc_add2_sub2)(prev, out, add1, add2, sub1, sub2)
+            }
+        }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
         {
             super::k::acc_add2_sub2(prev, out, add1, add2, sub1, sub2)
         }
@@ -896,7 +1080,15 @@ pub(crate) mod dispatch {
                 (crate::cpu::get().finny_apply)(values, adds, subs)
             }
         }
-        #[cfg(not(target_arch = "x86_64"))]
+        #[cfg(target_arch = "aarch64")]
+        {
+            if super::STATIC_TOP {
+                super::k::finny_apply(values, adds, subs)
+            } else {
+                (super::arm::get().finny_apply)(values, adds, subs)
+            }
+        }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
         {
             super::k::finny_apply(values, adds, subs)
         }
@@ -919,7 +1111,15 @@ pub(crate) mod dispatch {
                 (crate::cpu::get().threat_batch)(input_acc, output_acc, weights_base, adds, subs)
             }
         }
-        #[cfg(not(target_arch = "x86_64"))]
+        #[cfg(target_arch = "aarch64")]
+        {
+            if super::STATIC_TOP {
+                super::threat_batch(input_acc, output_acc, weights_base, adds, subs)
+            } else {
+                (super::arm::get().threat_batch)(input_acc, output_acc, weights_base, adds, subs)
+            }
+        }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
         {
             super::threat_batch(input_acc, output_acc, weights_base, adds, subs)
         }
@@ -1114,5 +1314,110 @@ mod tests {
                 assert_eq!(got.0, want.0, "threat512 batch (from_null={from_null})");
             }
         }
+    }
+}
+
+#[cfg(all(test, target_arch = "aarch64", target_feature = "neon"))]
+mod tests_aarch64 {
+    use super::*;
+    use crate::nnue::accumulator::Accumulator;
+    use crate::nnue::network::Aligned;
+    use crate::nnue::{FT_QUANT, FT_SHIFT, L1_SIZE};
+    use crate::types::Color;
+
+    fn test_inputs() -> (Accumulator, Aligned<[[i16; L1_SIZE]; 2]>) {
+        let mut pst_acc = Accumulator::new();
+        let mut combined = Aligned([[0i16; L1_SIZE]; 2]);
+        for pov in 0..2 {
+            for i in 0..L1_SIZE {
+                pst_acc.values.0[pov][i] = (((i * 37 + pov * 11) % 811) as i32 - 400) as i16;
+                combined.0[pov][i] = (((i * 53 + pov * 7) % 509) as i32 - 250) as i16;
+            }
+        }
+        (pst_acc, combined)
+    }
+
+    fn activate_reference(
+        pst_acc: &Accumulator,
+        combined: &Aligned<[[i16; L1_SIZE]; 2]>,
+        stm: Color,
+    ) -> [u8; L1_SIZE] {
+        let mut output = [0u8; L1_SIZE];
+        let half = L1_SIZE / 2;
+        for flip in 0..2usize {
+            let pov = stm.index() ^ flip;
+            let pst_vals = &pst_acc.values.0[pov];
+            let comb_vals = &combined.0[pov];
+            for i in 0..half {
+                let left = (pst_vals[i] + comb_vals[i]).clamp(0, FT_QUANT);
+                let right = (pst_vals[i + half] + comb_vals[i + half]).min(FT_QUANT);
+                let product = ((left as i32 * right as i32) >> FT_SHIFT).clamp(0, 255) as u8;
+                output[i + flip * half] = product;
+            }
+        }
+        output
+    }
+
+    #[test]
+    fn neon_activation_lands_on_the_scalar_output() {
+        let (pst, comb) = test_inputs();
+        for stm in [Color::White, Color::Black] {
+            let want = activate_reference(&pst, &comb, stm);
+            let got = unsafe { k_neon::activate_ft(&pst, &comb, stm) };
+            if let Some(i) = (0..L1_SIZE).find(|&i| got.0[i] != want[i]) {
+                panic!(
+                    "neon activation disagrees at {i}: got {}, want {}",
+                    got.0[i], want[i]
+                );
+            }
+            if std::arch::is_aarch64_feature_detected!("dotprod") {
+                let got = unsafe { k_dotprod::activate_ft(&pst, &comb, stm) };
+                if let Some(i) = (0..L1_SIZE).find(|&i| got.0[i] != want[i]) {
+                    panic!(
+                        "dotprod activation disagrees at {i}: got {}, want {}",
+                        got.0[i], want[i]
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn neon_and_dotprod_threat_batch_agree() {
+        if !std::arch::is_aarch64_feature_detected!("dotprod") {
+            return;
+        }
+        const ROWS: usize = 8;
+        let mut weights = vec![[0i8; L1_SIZE]; ROWS];
+        for (r, row) in weights.iter_mut().enumerate() {
+            for (i, w) in row.iter_mut().enumerate() {
+                *w = (((r * 251 + i * 31) % 199) as i32 - 99) as i8;
+            }
+        }
+        let mut input = Aligned([0i16; L1_SIZE]);
+        for i in 0..L1_SIZE {
+            input.0[i] = ((i as i32 * 97) % 1601 - 800) as i16;
+        }
+        let adds: [u32; 3] = [0, 3, 6];
+        let subs: [u32; 2] = [1, 5];
+        let mut neon_out = Aligned([0i16; L1_SIZE]);
+        let mut dot_out = Aligned([0i16; L1_SIZE]);
+        unsafe {
+            k_neon::threat_batch(
+                input.0.as_ptr(),
+                neon_out.0.as_mut_ptr(),
+                weights.as_ptr(),
+                &adds,
+                &subs,
+            );
+            k_dotprod::threat_batch(
+                input.0.as_ptr(),
+                dot_out.0.as_mut_ptr(),
+                weights.as_ptr(),
+                &adds,
+                &subs,
+            );
+        }
+        assert_eq!(neon_out.0, dot_out.0);
     }
 }

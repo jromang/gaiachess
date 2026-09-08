@@ -27,11 +27,57 @@ macro_rules! outerr {
 
 #[cfg(not(target_arch = "wasm32"))]
 mod imp {
+    use std::fs::File;
+    use std::io::Write;
+    use std::sync::Mutex;
+
+    static LOG_FILE: Mutex<Option<File>> = Mutex::new(None);
+
+    /// `Debug Log File`: empty path closes the log. The option GUIs expect under
+    /// this name, so a GUI session (Fritz especially) can be dumped without a rebuild.
+    pub fn set_debug_log(path: &str) -> Result<(), String> {
+        let mut slot = LOG_FILE.lock().map_err(|e| e.to_string())?;
+        if path.is_empty() {
+            *slot = None;
+            return Ok(());
+        }
+        let f = File::create(path).map_err(|e| e.to_string())?;
+        *slot = Some(f);
+        Ok(())
+    }
+
+    fn log_line(prefix: &str, s: &str) {
+        if let Ok(mut slot) = LOG_FILE.lock()
+            && let Some(f) = slot.as_mut()
+        {
+            let _ = writeln!(f, "{prefix} {s}");
+            let _ = f.flush();
+        }
+    }
+
+    pub fn log_input(s: &str) {
+        log_line(">>", s);
+    }
+
+    /// Serialises protocol lines: `isready` is answered from the stdin reader
+    /// while the search thread prints `info`, and two `println!`s can interleave
+    /// characters inside one line.
+    static STDOUT: Mutex<()> = Mutex::new(());
+    static STDERR: Mutex<()> = Mutex::new(());
+
     pub fn line(s: String) {
+        log_line("<<", &s);
+        let _guard = STDOUT.lock().unwrap_or_else(|e| e.into_inner());
         println!("{s}");
+        // Windows pipes are block-buffered; a GUI reads UCI a line at a time and
+        // will sit on an unflushed `info` until the 8 KiB buffer fills.
+        let _ = std::io::stdout().flush();
     }
     pub fn diagnostic(s: String) {
+        log_line("<<", &s);
+        let _guard = STDERR.lock().unwrap_or_else(|e| e.into_inner());
         eprintln!("{s}");
+        let _ = std::io::stderr().flush();
     }
 }
 
@@ -42,6 +88,12 @@ mod imp {
     thread_local! {
         static BUFFER: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
     }
+
+    pub fn set_debug_log(_path: &str) -> Result<(), String> {
+        Err("Debug Log File is not available in the browser build".into())
+    }
+
+    pub fn log_input(_s: &str) {}
 
     pub fn line(s: String) {
         BUFFER.with(|b| b.borrow_mut().push(s));
@@ -63,7 +115,7 @@ mod imp {
     }
 }
 
-pub use imp::{diagnostic, line};
+pub use imp::{diagnostic, line, log_input, set_debug_log};
 
 #[cfg(target_arch = "wasm32")]
 pub use imp::drain;

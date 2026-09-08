@@ -10,8 +10,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use crate::history::{
     ButterflyHistory, CaptureHistory, ContCorrectionHistory, ContinuationHistory, Countermoves,
-    Killers, PawnHistory, PieceToCorrTable, SharedCorrectionHistory,
-    PieceToTable,
+    Killers, PawnHistory, PieceToCorrTable, PieceToTable, SharedCorrectionHistory,
 };
 use crate::nnue;
 
@@ -25,6 +24,17 @@ pub static STOP: AtomicBool = AtomicBool::new(false);
 /// Cleared by `ponderhit` (stdin reader thread) to signal the transition
 /// from ponder mode to normal search with real time limits.
 pub static PONDER: AtomicBool = AtomicBool::new(false);
+
+/// True while `start_search` is running. The stdin reader answers `isready`
+/// immediately in that window, without waiting for the search to finish.
+pub static SEARCHING: AtomicBool = AtomicBool::new(false);
+
+struct SearchingGuard;
+impl Drop for SearchingGuard {
+    fn drop(&mut self) {
+        SEARCHING.store(false, Ordering::Relaxed);
+    }
+}
 
 /// How many watchers are reading how fast the search goes. At zero — which is how every
 /// ordinary search runs — [`ThreadData::check_limits`] does not touch the counter below
@@ -310,6 +320,8 @@ pub struct ThreadData {
     /// Local cache of ponder state. Avoids atomic load every 2048 nodes.
     /// Set in `prepare_search()`, cleared on `ponderhit` detection.
     pub pondering: bool,
+    /// `go mate N`: stop iterative deepening once a mate in at most N moves is found.
+    pub mate_limit: Option<i32>,
     /// Root moves with per-move scoring for Multi-PV.
     pub root_moves: Vec<RootMove>,
     /// Number of PV lines to search (UCI MultiPV option, default 1).
@@ -370,16 +382,26 @@ pub struct ThreadData {
 /// left alone: there the main thread owns the budget and the helpers search beside it.
 fn split_node_limit(limits: &SearchLimits, threads: usize) -> Option<SearchLimits> {
     debug_assert!(threads > 0, "split_node_limit: zero threads");
-    let t = threads as u64;
-    match *limits {
-        SearchLimits::Nodes(n) => Some(SearchLimits::Nodes(n.div_ceil(t).max(1))),
-        // div_ceil is monotonic, so soft <= hard survives the division.
-        SearchLimits::SoftNodes { soft, hard } => Some(SearchLimits::SoftNodes {
-            soft: soft.div_ceil(t).max(1),
-            hard: hard.div_ceil(t).max(1),
-        }),
-        _ => None,
+    if limits.infinite {
+        return None;
     }
+    let t = threads as u64;
+    let mut share = limits.clone();
+    let mut split = false;
+    if let Some(n) = share.nodes {
+        share.nodes = Some(n.div_ceil(t).max(1));
+        split = true;
+    }
+    // div_ceil is monotonic, so soft <= hard survives the division.
+    if let Some(s) = share.soft_nodes {
+        share.soft_nodes = Some(s.div_ceil(t).max(1));
+        split = true;
+    }
+    if let Some(h) = share.hard_nodes {
+        share.hard_nodes = Some(h.div_ceil(t).max(1));
+        split = true;
+    }
+    split.then_some(share)
 }
 
 impl ThreadData {
@@ -412,7 +434,7 @@ impl ThreadData {
             root_delta: SCORE_INFINITE,
             stack,
             sentinel_conthist: sentinel,
-            tm: TimeManager::new(&SearchLimits::Infinite),
+            tm: TimeManager::new(&SearchLimits::infinite()),
             root_depth: 0,
             completed_depth: 0,
             best_move: Move::NONE,
@@ -423,6 +445,7 @@ impl ThreadData {
             stopped: false,
             seldepth: 0,
             pondering: false,
+            mate_limit: None,
             root_moves: Vec::new(),
             multi_pv: 1,
             reported_multi_pv: 1,
@@ -449,8 +472,13 @@ impl ThreadData {
     #[inline]
     pub fn ss(&self, ply: usize) -> &StackEntry {
         debug_assert!(ply < MAX_PLY, "ss: ply {} >= MAX_PLY", ply);
-        debug_assert!(ply + SS_OFFSET < self.stack.len(),
-            "ss: ply {} + SS_OFFSET {} >= stack len {}", ply, SS_OFFSET, self.stack.len());
+        debug_assert!(
+            ply + SS_OFFSET < self.stack.len(),
+            "ss: ply {} + SS_OFFSET {} >= stack len {}",
+            ply,
+            SS_OFFSET,
+            self.stack.len()
+        );
         &self.stack[ply + SS_OFFSET]
     }
 
@@ -458,8 +486,13 @@ impl ThreadData {
     #[inline]
     pub fn ss_mut(&mut self, ply: usize) -> &mut StackEntry {
         debug_assert!(ply < MAX_PLY, "ss_mut: ply {} >= MAX_PLY", ply);
-        debug_assert!(ply + SS_OFFSET < self.stack.len(),
-            "ss_mut: ply {} + SS_OFFSET {} >= stack len {}", ply, SS_OFFSET, self.stack.len());
+        debug_assert!(
+            ply + SS_OFFSET < self.stack.len(),
+            "ss_mut: ply {} + SS_OFFSET {} >= stack len {}",
+            ply,
+            SS_OFFSET,
+            self.stack.len()
+        );
         &mut self.stack[ply + SS_OFFSET]
     }
 
@@ -468,7 +501,12 @@ impl ThreadData {
     #[inline]
     pub fn conthist(&self, ply: usize, offset: usize, piece: Piece, to: Square) -> i32 {
         let base = ply + SS_OFFSET;
-        debug_assert!(base >= offset, "conthist: base {} < offset {}", base, offset);
+        debug_assert!(
+            base >= offset,
+            "conthist: base {} < offset {}",
+            base,
+            offset
+        );
         ContinuationHistory::get(
             self.stack[base - offset].conthist_ptr as *const _,
             piece,
@@ -508,8 +546,7 @@ impl ThreadData {
             // In datagen, and whenever a node budget was split across the pool, the
             // limit is this thread's alone: stop it like the deadline below — a thread
             // spending its own share must not kill its siblings through the global STOP.
-            if !self.pondering
-                && (self.tm.should_stop_hard() || self.nodes >= self.tm.max_nodes())
+            if !self.pondering && (self.tm.should_stop_hard() || self.nodes >= self.tm.max_nodes())
             {
                 if self.datagen_mode || self.per_thread_nodes {
                     self.stopped = true;
@@ -540,12 +577,24 @@ impl ThreadData {
     /// two-line `if`.
     pub fn apply_skill_ceiling(&mut self) {
         if self.skill.active {
-            self.tm.cap_depth(crate::skill::ceiling(&self.skill, self.pos.key));
+            self.tm
+                .cap_depth(crate::skill::ceiling(&self.skill, self.pos.key));
         }
     }
 
     /// Prepare this thread for a new search.
     pub fn prepare_search(&mut self, pos: &Position, limits: &SearchLimits) {
+        self.prepare_search_filtered(pos, limits, &[]);
+    }
+
+    /// Like [`prepare_search`], restricted to `search_moves` when that slice is not empty
+    /// (`go searchmoves` — ChessBase uses it to exclude moves from analysis).
+    pub fn prepare_search_filtered(
+        &mut self,
+        pos: &Position,
+        limits: &SearchLimits,
+        search_moves: &[Move],
+    ) {
         self.pos = pos.clone();
         self.nodes = 0;
         // Read the handicap once, here: the level is set before a search is asked for,
@@ -565,9 +614,14 @@ impl ThreadData {
         self.best_score = -SCORE_INFINITE;
         self.stopped = false;
         self.pondering = PONDER.load(Ordering::Relaxed);
+        self.mate_limit = limits.mate;
         self.bm_stability = 0;
         self.prev_best_move = Move::NONE;
         self.killers.clear();
+        // The first iteration has no running average yet, so the optimism block at the
+        // root is skipped and the eval would otherwise be blended with the value left
+        // by the *previous* search — a different position, possibly a different game.
+        self.optimism = [0; 2];
         self.pv_index = 0;
         self.tb_hits = 0;
         #[cfg(feature = "syzygy")]
@@ -586,11 +640,18 @@ impl ThreadData {
         self.root_moves.clear();
         self.root_moves.reserve(count);
         for i in 0..count {
+            if !search_moves.is_empty() && !search_moves.contains(&buf[i]) {
+                continue;
+            }
             self.root_moves.push(RootMove::new(buf[i]));
         }
         // Default best_move to first legal move so we always have a valid
         // response even if stopped before completing depth 1.
-        self.best_move = if count > 0 { buf[0] } else { Move::NONE };
+        self.best_move = if !self.root_moves.is_empty() {
+            self.root_moves[0].mv
+        } else {
+            Move::NONE
+        };
 
         // Time manager: real limits for the main thread, infinite for the helpers —
         // except for a node budget, which is divided evenly instead (see
@@ -602,7 +663,7 @@ impl ThreadData {
                 self.tm = TimeManager::new(&share);
             }
             None if self.id == 0 => self.tm = TimeManager::new(limits),
-            None => self.tm = TimeManager::new(&SearchLimits::Infinite),
+            None => self.tm = TimeManager::new(&SearchLimits::infinite()),
         }
         self.apply_skill_ceiling();
         // The upper rungs need to see more than one root move to have anything to choose
@@ -610,12 +671,13 @@ impl ThreadData {
         // the lines they asked for.
         self.reported_multi_pv = self.multi_pv;
         if self.skill.active {
-            self.multi_pv = self.multi_pv.max(self.skill.rung.variety_moves.max(1) as usize);
+            self.multi_pv = self
+                .multi_pv
+                .max(self.skill.rung.variety_moves.max(1) as usize);
         }
 
         // Reset search stack
-        let sentinel_ptr =
-            &*self.sentinel_conthist as *const PieceToTable as *mut PieceToTable;
+        let sentinel_ptr = &*self.sentinel_conthist as *const PieceToTable as *mut PieceToTable;
         for entry in &mut self.stack {
             entry.played_move = Move::NONE;
             entry.moved_piece = Piece::NONE;
@@ -704,7 +766,19 @@ impl ThreadPool {
     /// helper threads (id > 0) search with infinite limits until `stop`,
     /// main thread (id 0) searches with real time limits.
     pub fn start_search(&mut self, pos: &Position, limits: SearchLimits) -> (Move, Option<Move>) {
+        self.start_search_filtered(pos, limits, &[])
+    }
+
+    /// Like [`start_search`], with a `go searchmoves` filter applied at the root.
+    pub fn start_search_filtered(
+        &mut self,
+        pos: &Position,
+        limits: SearchLimits,
+        search_moves: &[Move],
+    ) -> (Move, Option<Move>) {
         STOP.store(false, Ordering::Relaxed);
+        SEARCHING.store(true, Ordering::Relaxed);
+        let _searching = SearchingGuard;
         self.shared.tt.new_search();
         // The info lines report the whole search, not the main thread's share: with
         // helpers running, every thread feeds the shared counter, zeroed here so a
@@ -714,15 +788,17 @@ impl ThreadPool {
         // Prepare all threads
         for td in &mut self.threads {
             td.multi_pv = self.multi_pv;
-            td.prepare_search(pos, &limits);
+            td.prepare_search_filtered(pos, &limits, search_moves);
         }
 
         // A weakened engine opens out of the book rather than searching, which is what
         // keeps a given level from playing the same game every time. Full strength
         // never gets here — `book::choice` answers `None` before it looks at anything.
         let analysing = self.multi_pv > 1
-            || matches!(limits, SearchLimits::Infinite)
-            || PONDER.load(Ordering::Relaxed);
+            || limits.infinite
+            || PONDER.load(Ordering::Relaxed)
+            || !search_moves.is_empty()
+            || crate::uci::analyse_mode();
         if let Some(mv) = crate::book::choice(pos, analysing) {
             return (mv, None);
         }
@@ -792,7 +868,9 @@ impl ThreadPool {
         }
 
         // Find min score across all threads that completed at least one iteration
-        let min_score = self.threads.iter()
+        let min_score = self
+            .threads
+            .iter()
             .filter(|t| t.completed_depth > 0 && !t.root_moves.is_empty())
             .map(|t| t.root_moves[0].score)
             .min()
@@ -800,14 +878,15 @@ impl ThreadPool {
 
         // Vote weight: score advantage (with +10 offset) × depth
         let vote_value = |t: &ThreadData| -> i64 {
-            (t.root_moves[0].score as i64 - min_score as i64 + 10)
-                * t.completed_depth as i64
+            (t.root_moves[0].score as i64 - min_score as i64 + 10) * t.completed_depth as i64
         };
 
         // Aggregate votes per move via small Vec (max entries = thread count)
         let mut votes: Vec<(Move, i64)> = Vec::with_capacity(self.threads.len());
         for t in &self.threads {
-            if t.completed_depth == 0 || t.root_moves.is_empty() { continue; }
+            if t.completed_depth == 0 || t.root_moves.is_empty() {
+                continue;
+            }
             let mv = t.root_moves[0].mv;
             if let Some(entry) = votes.iter_mut().find(|(m, _)| *m == mv) {
                 entry.1 += vote_value(t);
@@ -816,9 +895,8 @@ impl ThreadPool {
             }
         }
 
-        let get_votes = |mv: Move| -> i64 {
-            votes.iter().find(|(m, _)| *m == mv).map_or(0, |e| e.1)
-        };
+        let get_votes =
+            |mv: Move| -> i64 { votes.iter().find(|(m, _)| *m == mv).map_or(0, |e| e.1) };
 
         let is_win = |s: i32| s >= SCORE_TB_WIN_IN_MAX;
         let is_loss = |s: i32| s != -SCORE_INFINITE && s <= -SCORE_TB_WIN_IN_MAX;
@@ -826,7 +904,9 @@ impl ThreadPool {
         let mut best = 0usize;
         for i in 1..self.threads.len() {
             let ti = &self.threads[i];
-            if ti.completed_depth == 0 || ti.root_moves.is_empty() { continue; }
+            if ti.completed_depth == 0 || ti.root_moves.is_empty() {
+                continue;
+            }
 
             let best_td = &self.threads[best];
             let best_score = best_td.root_moves[0].score;
@@ -834,10 +914,14 @@ impl ThreadPool {
 
             if is_win(best_score) {
                 // Current best is winning: prefer shorter mate (higher score)
-                if this_score > best_score { best = i; }
+                if this_score > best_score {
+                    best = i;
+                }
             } else if is_loss(best_score) {
                 // Current best is losing: prefer longer defense (lower score)
-                if is_loss(this_score) && this_score < best_score { best = i; }
+                if is_loss(this_score) && this_score < best_score {
+                    best = i;
+                }
             } else if is_win(this_score) || is_loss(this_score) {
                 // This thread found a decisive result, take it
                 best = i;
@@ -846,9 +930,8 @@ impl ThreadPool {
                 let best_mv_votes = get_votes(best_td.root_moves[0].mv);
                 let this_mv_votes = get_votes(ti.root_moves[0].mv);
 
-                let pv_filtered_value = |t: &ThreadData| -> i64 {
-                    vote_value(t) * (t.root_moves[0].pv_len > 2) as i64
-                };
+                let pv_filtered_value =
+                    |t: &ThreadData| -> i64 { vote_value(t) * (t.root_moves[0].pv_len > 2) as i64 };
 
                 if this_mv_votes > best_mv_votes
                     || (this_mv_votes == best_mv_votes
@@ -896,34 +979,34 @@ mod tests {
     #[test]
     fn a_node_budget_divides_evenly_and_nothing_else_does() {
         // A clock belongs to the main thread; only a node count is shared out.
-        assert!(matches!(
-            split_node_limit(&SearchLimits::Nodes(40_000), 4),
-            Some(SearchLimits::Nodes(10_000))
-        ));
-        assert!(matches!(
-            split_node_limit(&SearchLimits::SoftNodes { soft: 1_000, hard: 100_000 }, 8),
-            Some(SearchLimits::SoftNodes { soft: 125, hard: 12_500 })
-        ));
-        assert!(split_node_limit(&SearchLimits::Depth(12), 4).is_none());
-        assert!(split_node_limit(&SearchLimits::MoveTime(500), 4).is_none());
-        assert!(split_node_limit(&SearchLimits::Infinite, 4).is_none());
-        assert!(split_node_limit(&SearchLimits::Clock { time: 1000, inc: 10, movestogo: None }, 4)
-            .is_none());
+        assert_eq!(
+            split_node_limit(&SearchLimits::nodes(40_000), 4),
+            Some(SearchLimits::nodes(10_000))
+        );
+        assert_eq!(
+            split_node_limit(&SearchLimits::soft_nodes(1_000, 100_000), 8),
+            Some(SearchLimits::soft_nodes(125, 12_500))
+        );
+        assert!(split_node_limit(&SearchLimits::depth(12), 4).is_none());
+        assert!(split_node_limit(&SearchLimits::movetime(500), 4).is_none());
+        assert!(split_node_limit(&SearchLimits::infinite(), 4).is_none());
+        assert!(split_node_limit(&SearchLimits::clock(1000, 10, None), 4).is_none());
 
         // Rounded up, and never down to nothing: a thread with a budget of zero would
         // return before it had a move to offer.
-        assert!(matches!(
-            split_node_limit(&SearchLimits::Nodes(10), 4),
-            Some(SearchLimits::Nodes(3))
-        ));
-        assert!(matches!(
-            split_node_limit(&SearchLimits::Nodes(1), 24),
-            Some(SearchLimits::Nodes(1))
-        ));
+        assert_eq!(
+            split_node_limit(&SearchLimits::nodes(10), 4),
+            Some(SearchLimits::nodes(3))
+        );
+        assert_eq!(
+            split_node_limit(&SearchLimits::nodes(1), 24),
+            Some(SearchLimits::nodes(1))
+        );
 
         // The order the time manager asserts on survives the division.
-        let split = split_node_limit(&SearchLimits::SoftNodes { soft: 7, hard: 7 }, 3);
-        let Some(SearchLimits::SoftNodes { soft, hard }) = split else { panic!("not split") };
+        let split = split_node_limit(&SearchLimits::soft_nodes(7, 7), 3).expect("split");
+        let soft = split.soft_nodes.expect("soft");
+        let hard = split.hard_nodes.expect("hard");
         assert!(soft <= hard, "soft {soft} > hard {hard}");
     }
 
@@ -939,7 +1022,7 @@ mod tests {
         for td in pool.threads.iter_mut() {
             td.silent = true;
         }
-        let (best, _) = pool.start_search(&pos, SearchLimits::Nodes(BUDGET));
+        let (best, _) = pool.start_search(&pos, SearchLimits::nodes(BUDGET));
         assert!(best != Move::NONE, "search returned no move");
 
         let share = BUDGET / THREADS as u64;
@@ -949,10 +1032,16 @@ mod tests {
             assert!(
                 td.nodes >= share && td.nodes < share + 2048,
                 "thread {} searched {} nodes, expected about {}",
-                td.id, td.nodes, share
+                td.id,
+                td.nodes,
+                share
             );
             assert!(td.per_thread_nodes, "thread {} did not own a share", td.id);
-            assert!(td.stopped, "thread {} was not stopped by its own budget", td.id);
+            assert!(
+                td.stopped,
+                "thread {} was not stopped by its own budget",
+                td.id
+            );
         }
         // Ending on its own share must not raise the flag that ends everyone else's.
         assert!(!should_stop(), "a spent budget raised the global stop flag");
@@ -972,13 +1061,30 @@ mod tests {
         let pos = Position::from_fen(MIDGAME).unwrap();
         let mut pool = ThreadPool::new(1, 4);
         pool.threads[0].silent = true;
-        pool.start_search(&pos, SearchLimits::Nodes(40_000));
+        pool.start_search(&pos, SearchLimits::nodes(40_000));
         let td = &pool.threads[0];
-        assert!(!td.per_thread_nodes, "a lone thread must not think it owns a share");
+        assert!(
+            !td.per_thread_nodes,
+            "a lone thread must not think it owns a share"
+        );
         assert!(
             td.nodes >= 40_000 && td.nodes < 42_048,
             "lone thread searched {} nodes for a budget of 40000",
             td.nodes
         );
+    }
+
+    #[test]
+    fn searchmoves_keeps_only_the_named_root_moves() {
+        let pos = Position::from_fen(STARTPOS).unwrap();
+        let e2e4 = Move::new(crate::types::Square::E2, crate::types::Square::E4);
+        let d2d4 = Move::new(crate::types::Square::D2, crate::types::Square::D4);
+        let mut td = ThreadData::new(0);
+        td.thread_count = 1;
+        td.prepare_search_filtered(&pos, &SearchLimits::depth(1), &[e2e4, d2d4]);
+        assert_eq!(td.root_moves.len(), 2);
+        let names: Vec<String> = td.root_moves.iter().map(|rm| rm.mv.to_uci()).collect();
+        assert!(names.contains(&"e2e4".to_string()));
+        assert!(names.contains(&"d2d4".to_string()));
     }
 }

@@ -7,8 +7,9 @@ default-members = ["."]
 
 [package]
 name = "gaiachess"
-version = "4.3.0"
+version = "4.3.1"
 edition = "2024"
+rust-version = "1.98"
 authors = ["Jean-François Romang"]
 license = "GPL-3.0-or-later"
 repository = "https://github.com/jromang/gaiachess"

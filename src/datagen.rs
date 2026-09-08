@@ -329,12 +329,12 @@ fn play_game(
     {
         let limits = if config.soft_nodes > 0 {
             let soft = config.soft_nodes * 10; // 10x budget for verification
-            SearchLimits::SoftNodes {
+            SearchLimits::soft_nodes(
                 soft,
-                hard: soft.saturating_mul(crate::timeman::SOFT_NODES_HARD_FACTOR),
-            }
+                soft.saturating_mul(crate::timeman::SOFT_NODES_HARD_FACTOR),
+            )
         } else {
-            SearchLimits::Depth(config.depth + 2)
+            SearchLimits::depth(config.depth + 2)
         };
         let td = if pos.side_to_move == Color::White { &mut *td_white } else { &mut *td_black };
         let shared = if pos.side_to_move == Color::White { shared_white } else { shared_black };
@@ -413,14 +413,14 @@ fn play_game(
 
         // Search for best move
         let limits = if config.soft_nodes > 0 {
-            SearchLimits::SoftNodes {
-                soft: config.soft_nodes,
-                hard: config
+            SearchLimits::soft_nodes(
+                config.soft_nodes,
+                config
                     .soft_nodes
                     .saturating_mul(crate::timeman::SOFT_NODES_HARD_FACTOR),
-            }
+            )
         } else {
-            SearchLimits::Depth(config.depth)
+            SearchLimits::depth(config.depth)
         };
 
         let (td, shared) = if pos.side_to_move == Color::White {

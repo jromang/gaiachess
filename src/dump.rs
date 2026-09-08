@@ -61,9 +61,9 @@ pub fn run(opts: &DumpOptions) {
     // Node cap takes precedence over depth (a nodes-limited search still
     // iterates depths; a depth-limited one has no node bound).
     let limits = if opts.nodes > 0 {
-        SearchLimits::Nodes(opts.nodes)
+        SearchLimits::nodes(opts.nodes)
     } else {
-        SearchLimits::Depth(opts.depth)
+        SearchLimits::depth(opts.depth)
     };
 
     let shared = SharedState::new(opts.tt_mb, 1);

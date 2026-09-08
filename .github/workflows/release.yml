@@ -27,6 +27,42 @@ jobs:
           gh release create "$TAG" \
             --title "GaiaChess $VERSION" \
             --notes "$(cat <<'NOTES'
+          ## What's new in 4.3.1
+
+          **Scores now read like every other engine.** A pawn up used to print `+458` — the
+          raw unit the network searches in — and prints `+1.96` now. The conversion is
+          display only: the search is untouched and plays exactly the same moves. The new
+          `UCI_ShowWDL` option adds win/draw/loss estimates in per mille, and
+          `NormalizeScore` turns the conversion off for anyone who wants the raw unit back.
+
+          **Fail-high lines showed the wrong move.** While the search was re-searching a
+          move that beat beta, every `lowerbound` line carried the *previous* iteration's
+          principal variation together with the *new* score — a move from one line and a
+          score from another. They now show the line that actually beat beta.
+
+          **UCI conformance.** `debug` and `isready` are answered while a search is running,
+          `go mate` works, every limit of a single `go` applies instead of just the first,
+          unknown tokens are ignored rather than dropping the whole command, and a position
+          with no legal move returns `bestmove 0000`.
+
+          **ChessBase GUIs (Fritz) keep their variations.** A position sent with a
+          four-field EPD FEN, or with castling rights that disagree with the board, was
+          refused outright: the engine silently stayed on the starting position and returned
+          a principal variation that was not legal on the board being shown.
+
+          **ARM is 14% faster** on Raspberry Pi 5 and other `asimddp` cores — the network's
+          dot products now dispatch to `sdot` at startup.
+
+          **A position no longer depends on what was searched before it.** One evaluation
+          term survived from one search to the next, across `ucinewgame` included, so the
+          same position could return a different move depending on its predecessor.
+          Analysis and test suites are reproducible again.
+
+          New default network: `gaianet-t2b-e017`.
+
+          Thanks to **David Rabel**, back on the team, for the UCI conformance testing and
+          for catching the fail-high display bug.
+
           ## Download
 
           One binary per platform. **Windows** binaries end in `.exe`, **Linux** and **macOS** have no extension.

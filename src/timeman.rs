@@ -6,32 +6,124 @@
 
 use crate::time::Instant;
 
-
 /// Search limits parsed from a UCI `go` command.
-pub enum SearchLimits {
-    /// `go infinite` — search until `stop`.
-    Infinite,
-    /// `go depth N` — search to a fixed depth.
-    Depth(i32),
-    /// `go nodes N` — search a fixed number of nodes.
-    Nodes(u64),
-    /// `go softnodes N` — node budget checked at iteration boundaries: the
-    /// iteration in flight is allowed to finish and overshoot. `hard` is the
-    /// in-tree ceiling that catches search explosions.
-    SoftNodes { soft: u64, hard: u64 },
-    /// `go movetime N` — search for exactly N milliseconds.
-    MoveTime(u64),
-    /// `go wtime/btime/winc/binc` — Fischer clock.
-    Clock {
-        time: u64,
-        inc: u64,
-        movestogo: Option<u64>,
-    },
+///
+/// Every field that is `Some` constrains the search; fields left empty do not.
+/// That is the protocol: `go depth 20 movetime 1000` stops at whichever fires
+/// first. `infinite` suppresses time and node stops (`stop` only), but a depth
+/// or mate limit still caps iterative deepening.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchLimits {
+    /// `go infinite` — do not stop on time or nodes.
+    pub infinite: bool,
+    /// `go depth N`.
+    pub depth: Option<i32>,
+    /// `go nodes N` (hard node ceiling).
+    pub nodes: Option<u64>,
+    /// `go softnodes N` — checked at iteration boundaries.
+    pub soft_nodes: Option<u64>,
+    /// Hard ceiling paired with [`Self::soft_nodes`].
+    pub hard_nodes: Option<u64>,
+    /// `go movetime N`.
+    pub movetime: Option<u64>,
+    /// Clock of the side to move, milliseconds (`wtime`/`btime`).
+    pub time: Option<u64>,
+    /// Increment of the side to move (`winc`/`binc`).
+    pub inc: u64,
+    /// Moves to the next time control.
+    pub movestogo: Option<u64>,
+    /// `go mate N` — stop once a mate in at most N moves is found.
+    pub mate: Option<i32>,
+}
+
+impl Default for SearchLimits {
+    fn default() -> Self {
+        Self {
+            infinite: false,
+            depth: None,
+            nodes: None,
+            soft_nodes: None,
+            hard_nodes: None,
+            movetime: None,
+            time: None,
+            inc: 0,
+            movestogo: None,
+            mate: None,
+        }
+    }
+}
+
+impl SearchLimits {
+    pub fn infinite() -> Self {
+        Self {
+            infinite: true,
+            ..Self::default()
+        }
+    }
+
+    pub fn depth(d: i32) -> Self {
+        debug_assert!(d > 0, "depth limit {d} must be positive");
+        Self {
+            depth: Some(d),
+            ..Self::default()
+        }
+    }
+
+    pub fn nodes(n: u64) -> Self {
+        Self {
+            nodes: Some(n),
+            ..Self::default()
+        }
+    }
+
+    pub fn soft_nodes(soft: u64, hard: u64) -> Self {
+        debug_assert!(soft <= hard, "soft nodes {soft} > hard {hard}");
+        Self {
+            soft_nodes: Some(soft),
+            hard_nodes: Some(hard),
+            ..Self::default()
+        }
+    }
+
+    pub fn movetime(ms: u64) -> Self {
+        Self {
+            movetime: Some(ms),
+            ..Self::default()
+        }
+    }
+
+    pub fn clock(time: u64, inc: u64, movestogo: Option<u64>) -> Self {
+        Self {
+            time: Some(time),
+            inc,
+            movestogo,
+            ..Self::default()
+        }
+    }
 }
 
 /// Hard node ceiling = soft budget x this factor, for the limits that derive
 /// one from the other (`go softnodes`, `UseSoftNodes`, datagen).
 pub const SOFT_NODES_HARD_FACTOR: u64 = 100;
+
+fn clock_bounds(time: u64, inc: u64, movestogo: Option<u64>) -> (u64, u64) {
+    let overhead = crate::tune::MOVE_OVERHEAD() as u64;
+    let moves = movestogo.unwrap_or(24);
+    // Absolute ceiling: 60% of clock minus overhead.
+    let max = (time * 60 / 100).saturating_sub(overhead);
+    // Hard: 46% of clock, capped by max.
+    let hard = (time * 46 / 100).min(max);
+    // Soft: (clock/moves + inc*94%) - overhead, scaled to 73%.
+    // Capped by hard.
+    let computed = if movestogo.is_some() {
+        let divisor = moves.clamp(2, 24);
+        time / divisor
+    } else {
+        time / moves + inc * 94 / 100 - overhead
+    };
+    let soft = (computed.min(max) * 73 / 100).min(hard);
+    (soft, hard)
+}
 
 /// Manages time for a single search.
 pub struct TimeManager {
@@ -47,44 +139,51 @@ pub struct TimeManager {
 impl TimeManager {
     /// Create a time manager from search limits.
     pub fn new(limits: &SearchLimits) -> TimeManager {
+        let max_depth = limits.depth.unwrap_or(i32::MAX);
+
+        let mut max_nodes = u64::MAX;
         let mut soft_nodes = u64::MAX;
-        let (soft, hard, depth, nodes) = match *limits {
-            SearchLimits::Infinite => (u64::MAX, u64::MAX, i32::MAX, u64::MAX),
-            SearchLimits::Depth(d) => (u64::MAX, u64::MAX, d, u64::MAX),
-            SearchLimits::Nodes(n) => (u64::MAX, u64::MAX, i32::MAX, n),
-            SearchLimits::SoftNodes { soft, hard } => {
-                debug_assert!(soft <= hard);
-                soft_nodes = soft;
-                (u64::MAX, u64::MAX, i32::MAX, hard)
+        if let Some(n) = limits.nodes {
+            max_nodes = n;
+        }
+        if let Some(s) = limits.soft_nodes {
+            debug_assert!(
+                limits.hard_nodes.is_none_or(|h| s <= h),
+                "soft nodes {s} > hard {:?}",
+                limits.hard_nodes
+            );
+            soft_nodes = s;
+            if let Some(h) = limits.hard_nodes {
+                max_nodes = max_nodes.min(h);
             }
-            SearchLimits::MoveTime(ms) => (ms, ms, i32::MAX, u64::MAX),
-            SearchLimits::Clock { time, inc, movestogo } => {
-                let overhead = crate::tune::MOVE_OVERHEAD() as u64;
-                let moves = movestogo.unwrap_or(24);
-                // Absolute ceiling: 60% of clock minus overhead.
-                let max = (time * 60 / 100).saturating_sub(overhead);
-                // Hard: 46% of clock, capped by max.
-                let hard = (time * 46 / 100).min(max);
-                // Soft: (clock/moves + inc*94%) - overhead, scaled to 73%.
-                // Capped by hard.
-                let computed = if movestogo.is_some() {
-                    let divisor = moves.clamp(2, 24);
-                    time / divisor
-                } else {
-                    time / moves + inc * 94 / 100 - overhead
-                };
-                let soft = (computed.min(max) * 73 / 100).min(hard);
-                (soft, hard, i32::MAX, u64::MAX)
+        }
+
+        let mut soft = u64::MAX;
+        let mut hard = u64::MAX;
+        // `go infinite` must not exit without `stop`; time and node budgets are
+        // then ignored. A depth or mate cap still bounds iterative deepening.
+        if !limits.infinite {
+            if let Some(ms) = limits.movetime {
+                soft = soft.min(ms);
+                hard = hard.min(ms);
             }
-        };
+            if let Some(time) = limits.time {
+                let (clock_soft, clock_hard) = clock_bounds(time, limits.inc, limits.movestogo);
+                soft = soft.min(clock_soft);
+                hard = hard.min(clock_hard);
+            }
+        } else {
+            max_nodes = u64::MAX;
+            soft_nodes = u64::MAX;
+        }
 
         TimeManager {
             start: Instant::now(),
-            max_depth: depth,
+            max_depth,
             base_soft_limit: soft,
             soft_limit: soft,
             hard_limit: hard,
-            max_nodes: nodes,
+            max_nodes,
             soft_nodes,
         }
     }

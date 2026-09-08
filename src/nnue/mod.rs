@@ -38,6 +38,15 @@ pub mod pawn_pairs;
 pub mod simd;
 pub mod threats;
 
+/// SIMD backend actually running, for the UCI `info` line.
+///
+/// On aarch64 this is the runtime election (NEON vs NEON+DOTPROD). Other
+/// architectures report their compile-time backend from `main`.
+#[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+pub fn simd_label() -> &'static str {
+    kernels::arm::label()
+}
+
 use std::mem::MaybeUninit;
 
 use crate::position::Position;

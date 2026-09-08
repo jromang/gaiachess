@@ -11,6 +11,7 @@
 //! one, and this module attaches to it and repairs only the streams that would
 //! otherwise lead nowhere.
 
+use std::debug_assert_matches;
 use std::ffi::{CStr, c_void};
 use std::ptr;
 
@@ -115,7 +116,7 @@ pub fn attach_parent_console() {
 /// `CONIN$` name the console we are attached to, so the fallback is a fresh handle to it
 /// rather than a copy of anything inherited.
 fn restore_or_bind(std_handle: u32, inherited: Handle, device: &CStr, access: u32) {
-    debug_assert!(matches!(std_handle, STD_INPUT_HANDLE | STD_OUTPUT_HANDLE | STD_ERROR_HANDLE));
+    debug_assert_matches!(std_handle, STD_INPUT_HANDLE | STD_OUTPUT_HANDLE | STD_ERROR_HANDLE);
     debug_assert!(access == GENERIC_READ || access == GENERIC_WRITE);
 
     if usable(inherited) {

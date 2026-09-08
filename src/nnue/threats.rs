@@ -1344,7 +1344,13 @@ mod tests {
     /// PST i16 bounded ±300 (avoids i16 overflow in debug), threats full-range i8.
     fn load_random_network() {
         use std::io::Write;
-        let path = "/tmp/gaianet_t2_random_test.bin";
+        // Named after this process, not after the machine: two working trees of the same
+        // repository run `cargo test` at the same time — one being the autonomous agent
+        // validating a network — and a shared name means each truncates the other's file
+        // mid-read.
+        let path = std::env::temp_dir()
+            .join(format!("gaianet_t2_random_test-{}.bin", std::process::id()));
+        let path = path.to_str().expect("temp dir is not valid UTF-8");
         let mut state = 0x9E3779B97F4A7C15u64;
         let mut next = move || {
             state ^= state << 13;
@@ -1390,6 +1396,8 @@ mod tests {
         f.write_all(&buf).unwrap();
         drop(f);
         network::load_from_file(path).unwrap();
+        // The weights are in memory now; the file has done its job.
+        let _ = std::fs::remove_file(path);
     }
 
     /// Strong validation: with non-zero random weights, the incremental threat

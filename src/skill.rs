@@ -215,6 +215,28 @@ pub fn rating_for(level: i32) -> Rating {
     RATINGS[(level.clamp(MIN_LEVEL, FULL_STRENGTH) - 1) as usize]
 }
 
+/// Weakest `UCI_Elo` the ladder can play (rung 1).
+pub const MIN_ELO: i32 = 580;
+/// Strongest limited `UCI_Elo` (rung 19). Full strength is `UCI_LimitStrength` off.
+pub const MAX_LIMITED_ELO: i32 = 2640;
+
+/// Nearest rung for a requested Elo. Never returns full strength: that is
+/// `UCI_LimitStrength` false, not an Elo on the ladder.
+pub fn level_for_elo(elo: i32) -> i32 {
+    let elo = elo.clamp(MIN_ELO, MAX_LIMITED_ELO);
+    let mut best = MIN_LEVEL;
+    let mut best_dist = i32::MAX;
+    for level in MIN_LEVEL..FULL_STRENGTH {
+        let d = (rating_for(level).elo - elo).abs();
+        if d < best_dist {
+            best_dist = d;
+            best = level;
+        }
+    }
+    debug_assert!((MIN_LEVEL..FULL_STRENGTH).contains(&best));
+    best
+}
+
 static LEVEL: AtomicI32 = AtomicI32::new(FULL_STRENGTH);
 static SEED: AtomicU64 = AtomicU64::new(0);
 
@@ -381,7 +403,10 @@ pub fn variety_pick(snap: &Snapshot, key: u64, scores: &[i32]) -> usize {
     }
     debug_assert!(rung.variety_margin >= 0);
     let considered = scores.len().min(rung.variety_moves as usize);
-    let best = *scores[..considered].iter().max().expect("at least one score");
+    let best = *scores[..considered]
+        .iter()
+        .max()
+        .expect("at least one score");
     if best.abs() >= SCORE_TB_WIN_IN_MAX {
         return 0;
     }
@@ -390,7 +415,10 @@ pub fn variety_pick(snap: &Snapshot, key: u64, scores: &[i32]) -> usize {
     let acceptable: Vec<usize> = (0..considered)
         .filter(|&i| scores[i] >= floor && scores[i].abs() < SCORE_TB_WIN_IN_MAX)
         .collect();
-    debug_assert!(!acceptable.is_empty(), "the best move is always acceptable to itself");
+    debug_assert!(
+        !acceptable.is_empty(),
+        "the best move is always acceptable to itself"
+    );
 
     // Its own corner of the hash again: which move gets played must not be tied to how the
     // position was misjudged.
@@ -411,7 +439,9 @@ pub static LEVEL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// Takes the lock above, ignoring the poisoning left behind by an unrelated failure.
 #[cfg(test)]
 pub fn lock_level() -> std::sync::MutexGuard<'static, ()> {
-    LEVEL_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    LEVEL_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// The mixing step the Zobrist keys are built with. Two multiply-shift rounds, enough
@@ -427,6 +457,14 @@ pub const fn mix(seed: u64) -> u64 {
 mod tests {
     use super::*;
     use crate::types::SCORE_MATE;
+
+    #[test]
+    fn elo_maps_to_the_nearest_limited_rung() {
+        assert_eq!(level_for_elo(MIN_ELO), MIN_LEVEL);
+        assert_eq!(level_for_elo(MAX_LIMITED_ELO), FULL_STRENGTH - 1);
+        assert_eq!(level_for_elo(1180), 6);
+        assert!(level_for_elo(3000) < FULL_STRENGTH);
+    }
 
     fn snap_at(level: i32, seed: u64) -> Snapshot {
         let rung = rung_for(level);
@@ -448,20 +486,44 @@ mod tests {
 
         for pair in LADDER[..(FULL_STRENGTH - 1) as usize].windows(2) {
             let (low, high) = (pair[0], pair[1]);
-            assert!(reach(&high) > reach(&low), "{high:?} sees no further than {low:?}");
-            assert!(high.small_window < low.small_window, "{high:?} judges no better than {low:?}");
-            assert!(high.blunder_window < low.blunder_window, "{high:?} blunders as wide as {low:?}");
-            assert!(high.blunder_permille < low.blunder_permille, "{high:?} blunders as often as {low:?}");
-            assert!(high.vision >= low.vision, "{high:?} overlooks more than {low:?}");
-            assert!(high.eval_fidelity >= low.eval_fidelity, "{high:?} judges more crudely than {low:?}");
-            assert!(high.book_plies >= low.book_plies, "{high:?} knows less theory than {low:?}");
+            assert!(
+                reach(&high) > reach(&low),
+                "{high:?} sees no further than {low:?}"
+            );
+            assert!(
+                high.small_window < low.small_window,
+                "{high:?} judges no better than {low:?}"
+            );
+            assert!(
+                high.blunder_window < low.blunder_window,
+                "{high:?} blunders as wide as {low:?}"
+            );
+            assert!(
+                high.blunder_permille < low.blunder_permille,
+                "{high:?} blunders as often as {low:?}"
+            );
+            assert!(
+                high.vision >= low.vision,
+                "{high:?} overlooks more than {low:?}"
+            );
+            assert!(
+                high.eval_fidelity >= low.eval_fidelity,
+                "{high:?} judges more crudely than {low:?}"
+            );
+            assert!(
+                high.book_plies >= low.book_plies,
+                "{high:?} knows less theory than {low:?}"
+            );
         }
 
         // The top rung holds nothing back, and every mechanism reads its inert value.
         let top = rung_for(FULL_STRENGTH);
         assert_eq!(top.depth, MAX_PLY as i32);
         assert_eq!(top.deeper_permille, 0, "full strength needs no extra ply");
-        assert_eq!((top.small_window, top.blunder_window, top.blunder_permille), (0, 0, 0));
+        assert_eq!(
+            (top.small_window, top.blunder_window, top.blunder_permille),
+            (0, 0, 0)
+        );
         assert_eq!(top.vision, FULL_VISION);
         assert_eq!(top.eval_fidelity, FIDELITY_NNUE);
         assert_eq!(top.book_plies, 0, "full strength never consults the book");
@@ -469,20 +531,34 @@ mod tests {
         // Choosing between root moves is only ever switched on, and once on the margin
         // narrows like everything else. It cannot be monotone field by field — a rung
         // that does not do it at all reads zero — so it gets its own check.
-        assert_eq!(top.variety_moves, 0, "full strength plays the move it found");
+        assert_eq!(
+            top.variety_moves, 0,
+            "full strength plays the move it found"
+        );
         let mut previous = i32::MAX;
         let mut switched_on = false;
         for level in MIN_LEVEL..FULL_STRENGTH {
             let rung = rung_for(level);
             if rung.variety_moves == 0 {
-                assert!(!switched_on, "level {level} stops choosing after a rung that did");
-                assert_eq!(rung.variety_margin, 0, "level {level} has a margin it cannot use");
+                assert!(
+                    !switched_on,
+                    "level {level} stops choosing after a rung that did"
+                );
+                assert_eq!(
+                    rung.variety_margin, 0,
+                    "level {level} has a margin it cannot use"
+                );
                 continue;
             }
             switched_on = true;
-            assert!(rung.variety_moves > 1, "level {level} chooses between one move");
-            assert!(rung.variety_margin > 0 && rung.variety_margin < previous,
-                "level {level} is no fussier than the rung below");
+            assert!(
+                rung.variety_moves > 1,
+                "level {level} chooses between one move"
+            );
+            assert!(
+                rung.variety_margin > 0 && rung.variety_margin < previous,
+                "level {level} is no fussier than the rung below"
+            );
             previous = rung.variety_margin;
         }
         assert!(switched_on, "no rung chooses between its moves");
@@ -508,7 +584,11 @@ mod tests {
     fn one_position_is_always_misjudged_the_same_way() {
         let snap = snap_at(1, 0x1234);
         let error = noise(0, 0xdead_beef, &snap);
-        assert_eq!(error, noise(0, 0xdead_beef, &snap), "one position, one error");
+        assert_eq!(
+            error,
+            noise(0, 0xdead_beef, &snap),
+            "one position, one error"
+        );
         assert_ne!(
             noise(0, 0xdead_beef, &snap),
             noise(0, 0xfeed_face, &snap),
@@ -525,7 +605,10 @@ mod tests {
             let widest = snap.rung.small_window + snap.rung.blunder_window;
             for key in 0..20_000u64 {
                 let error = noise(0, mix(key), &snap);
-                assert!(error.abs() <= widest, "level {level}: error {error} beyond {widest}");
+                assert!(
+                    error.abs() <= widest,
+                    "level {level}: error {error} beyond {widest}"
+                );
             }
             assert_eq!(
                 noise(SCORE_MATE - 3, 0xdead_beef, &snap),
@@ -600,15 +683,22 @@ mod tests {
 
         // A move well outside the margin is never played, one just inside sometimes is.
         let scores = [100, 100 - margin / 2, 100 - margin, 100 - margin - 50];
-        let picked: std::collections::HashSet<usize> =
-            (0..500u64).map(|k| variety_pick(&snap, mix(k), &scores)).collect();
+        let picked: std::collections::HashSet<usize> = (0..500u64)
+            .map(|k| variety_pick(&snap, mix(k), &scores))
+            .collect();
         assert!(picked.contains(&0), "the best move must still get played");
-        assert!(picked.len() > 1, "a level that chooses must sometimes choose differently");
+        assert!(
+            picked.len() > 1,
+            "a level that chooses must sometimes choose differently"
+        );
         assert!(!picked.contains(&3), "a move beyond the margin was played");
 
         // Same position, same choice.
         let key = mix(0xdead_beef);
-        assert_eq!(variety_pick(&snap, key, &scores), variety_pick(&snap, key, &scores));
+        assert_eq!(
+            variety_pick(&snap, key, &scores),
+            variety_pick(&snap, key, &scores)
+        );
 
         // Never past the rung's move count, whatever the scores say.
         let flat = vec![50; 32];
@@ -619,7 +709,11 @@ mod tests {
         // A won position is played out, not gambled with.
         let decided = [SCORE_MATE - 5, SCORE_MATE - 7, 100, 90];
         for k in 0..200u64 {
-            assert_eq!(variety_pick(&snap, mix(k), &decided), 0, "variety in a won position");
+            assert_eq!(
+                variety_pick(&snap, mix(k), &decided),
+                0,
+                "variety in a won position"
+            );
         }
 
         // Rungs that do not choose always answer with the move the search found.
@@ -636,8 +730,9 @@ mod tests {
         let seen = sees_move(&snap, 0xdead_beef, Move(1234), 2, false);
         assert_eq!(seen, sees_move(&snap, 0xdead_beef, Move(1234), 2, false));
         // Neighbouring moves must not share a fate: the move is mixed, not xored raw.
-        let fates: Vec<bool> =
-            (100..164).map(|m| sees_move(&snap, 0xdead_beef, Move(m), 2, false)).collect();
+        let fates: Vec<bool> = (100..164)
+            .map(|m| sees_move(&snap, 0xdead_beef, Move(m), 2, false))
+            .collect();
         assert!(fates.iter().any(|&f| f) && fates.iter().any(|&f| !f));
     }
 
@@ -652,11 +747,17 @@ mod tests {
             plain += sees_move(&snap, k, Move(777), 3, false) as u32;
             easy += sees_move(&snap, k, Move(777), 3, true) as u32;
         }
-        assert!(easy > plain, "easy moves ({easy}) should beat plain ones ({plain})");
+        assert!(
+            easy > plain,
+            "easy moves ({easy}) should beat plain ones ({plain})"
+        );
         // p_easy = 2p - p^2, so with p near a half the gap is wide and worth checking.
         let p = plain as f64 / 4000.0;
         let expected = 4000.0 * (2.0 * p - p * p);
-        assert!((easy as f64 - expected).abs() < 200.0, "{easy} against an expected {expected}");
+        assert!(
+            (easy as f64 - expected).abs() < 200.0,
+            "{easy} against an expected {expected}"
+        );
     }
 
     /// Vision fades with depth but never to nothing.
@@ -664,11 +765,20 @@ mod tests {
     fn sight_shortens_with_distance_and_then_holds() {
         let snap = snap_at(1, 0x5eed);
         let seen_at = |ply: usize| {
-            (0..4000u64).filter(|&k| sees_move(&snap, mix(k), Move(777), ply, false)).count()
+            (0..4000u64)
+                .filter(|&k| sees_move(&snap, mix(k), Move(777), ply, false))
+                .count()
         };
         let (near, far) = (seen_at(0), seen_at(8));
-        assert!(near > far, "sight should fade: {near} at the root, {far} eight plies out");
-        assert_eq!(seen_at(40), seen_at(60), "below the floor nothing changes further");
+        assert!(
+            near > far,
+            "sight should fade: {near} at the root, {far} eight plies out"
+        );
+        assert_eq!(
+            seen_at(40),
+            seen_at(60),
+            "below the floor nothing changes further"
+        );
     }
 
     #[test]

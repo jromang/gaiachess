@@ -82,7 +82,7 @@ pub fn run(depth_override: Option<i32>, threads: Option<usize>) {
 
     for (i, fen) in POSITIONS.iter().enumerate() {
         let pos = Position::from_fen(fen).expect("invalid bench FEN");
-        let limits = SearchLimits::Depth(depth);
+        let limits = SearchLimits::depth(depth);
 
         STOP.store(false, Ordering::Relaxed);
         NODES_SEARCHED.store(0, Ordering::Relaxed);
@@ -174,7 +174,7 @@ fn run_threaded(depth: i32, threads: usize) {
         let pos = Position::from_fen(fen).expect("invalid bench FEN");
 
         let start = Instant::now();
-        pool.start_search(&pos, SearchLimits::Depth(depth));
+        pool.start_search(&pos, SearchLimits::depth(depth));
         let elapsed_ms = start.elapsed().as_millis() as u64;
 
         total_nodes += pool.threads.iter().map(|td| td.nodes).sum::<u64>();
@@ -250,7 +250,7 @@ pub fn run_stats(depth_override: Option<i32>, num_runs: u32, verbose: bool) {
 
         for (pos_idx, fen) in POSITIONS.iter().enumerate() {
             let pos = Position::from_fen(fen).expect("invalid bench FEN");
-            let limits = SearchLimits::Depth(depth);
+            let limits = SearchLimits::depth(depth);
 
             STOP.store(false, Ordering::Relaxed);
             NODES_SEARCHED.store(0, Ordering::Relaxed);

@@ -31,6 +31,7 @@ pub mod skill;
 pub mod book;
 pub mod tune;
 pub mod cuckoo;
+pub mod wdl;
 pub mod search;
 pub mod stats;
 // The module is always compiled, because it is where the recording macros live and
@@ -47,6 +48,8 @@ pub mod bench;
 pub mod bench_stats;
 #[cfg(feature = "datagen")]
 pub mod datagen;
+#[cfg(feature = "datagen")]
+pub mod relabel;
 pub mod tb;
 #[cfg(feature = "gaiatb")]
 pub mod dtm;
@@ -64,10 +67,13 @@ pub mod uci;
 ///
 /// On x86-64 this resolves the runtime dispatch (NNUE kernel tier, attack kind,
 /// weight permutation) from CPUID once and builds whatever tables the elected
-/// paths need. Other architectures have a single compile-time backend.
+/// paths need. On aarch64 it elects NEON vs NEON+DOTPROD from HWCAP. Other
+/// architectures have a single compile-time backend.
 pub fn init_cpu_dispatch() {
     #[cfg(target_arch = "x86_64")]
     cpu::init();
+    #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+    nnue::kernels::arm::init();
 
     // Table data for the AVX2 per-piece attack path, the compile-time floor of
     // AVX2-baseline builds (the runtime election only ever moves PEXT on top).

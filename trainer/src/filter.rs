@@ -35,16 +35,7 @@ const DESIRED_DISTRIBUTION: [f64; 33] = [
     0.022727271053, 0.020641545085, 0.018411966423,
 ];
 
-static PIECE_COUNT_STATS: [AtomicU64; 33] = {
-    let mut arr: [std::mem::MaybeUninit<AtomicU64>; 33] =
-        [const { std::mem::MaybeUninit::uninit() }; 33];
-    let mut i = 0;
-    while i < 33 {
-        arr[i] = std::mem::MaybeUninit::new(AtomicU64::new(0));
-        i += 1;
-    }
-    unsafe { std::mem::transmute::<_, [AtomicU64; 33]>(arr) }
-};
+static PIECE_COUNT_STATS: [AtomicU64; 33] = [const { AtomicU64::new(0) }; 33];
 static PIECE_COUNT_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 /// Reset piece count statistics (call between phases).

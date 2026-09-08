@@ -17,11 +17,16 @@ use crate::zobrist::ZOBRIST;
 // FEN parse errors
 // ============================================================
 
+/// Rejected before tokenising. Generous enough for an EPD with opcodes; short
+/// enough to bounce garbage. The six chess fields themselves are well under 100.
+const MAX_FEN_LEN: usize = 1024;
+
 /// Errors that can occur when parsing a
 /// [FEN](https://www.chessprogramming.org/Forsyth-Edwards_Notation) string.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FenParseError {
-    /// FEN must have exactly 6 space-separated fields.
+    /// FEN must have at least 4 space-separated fields (placement, stm, castling, ep).
+    /// Clocks (fields 5–6) are optional; extra EPD opcodes are ignored.
     WrongFieldCount { found: usize },
     /// Piece placement must have exactly 8 ranks separated by '/'.
     WrongRankCount { found: usize },
@@ -33,15 +38,9 @@ pub enum FenParseError {
     InvalidSideToMove { found: String },
     /// Unrecognized character in castling rights field.
     InvalidCastlingChar { ch: char },
-    /// En passant square is not a valid square name.
-    InvalidEpSquare { found: String },
-    /// Halfmove clock is not a valid u8.
-    InvalidHalfmoveClock { found: String },
-    /// Fullmove number is not a valid u16.
-    InvalidFullmoveNumber { found: String },
 
     // --- Pre-filter ---
-    /// FEN string is too long (max 100 chars).
+    /// FEN string is too long (max [`MAX_FEN_LEN`] chars).
     TooLong { len: usize },
     /// FEN contains non-ASCII or non-printable characters.
     InvalidChars,
@@ -49,10 +48,6 @@ pub enum FenParseError {
     // --- Syntactic (phase 1) ---
     /// Adjacent digits in piece placement (e.g. "35" instead of "8").
     AdjacentDigits { rank: usize },
-    /// En passant square must be on rank 3 or 6 matching side to move.
-    InvalidEpRank { found: String, expected_rank: u8 },
-    /// Fullmove number must be >= 1.
-    FullmoveNumberZero,
 
     // --- Semantic (phase 2) ---
     /// Each side must have exactly one king.
@@ -68,16 +63,16 @@ pub enum FenParseError {
     /// Extra pieces beyond starting material exceed missing pawns.
     TooManyPromotions { color: &'static str, extra: u32, missing_pawns: u32 },
     /// Castling rights require the king and rook on their starting squares.
+    /// Still produced by the coherence check; the FEN parser itself drops a
+    /// right that cannot apply rather than failing the whole string.
     CastlingRightsIncoherent { detail: &'static str },
-    /// En passant square set but no enemy pawn behind it.
-    EpSquareNoPawn { ep: String },
 }
 
 impl std::fmt::Display for FenParseError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::WrongFieldCount { found } =>
-                write!(f, "expected 6 FEN fields, found {found}"),
+                write!(f, "expected at least 4 FEN fields, found {found}"),
             Self::WrongRankCount { found } =>
                 write!(f, "expected 8 ranks in placement, found {found}"),
             Self::RankLengthMismatch { rank, count } =>
@@ -88,22 +83,12 @@ impl std::fmt::Display for FenParseError {
                 write!(f, "invalid side to move '{found}', expected 'w' or 'b'"),
             Self::InvalidCastlingChar { ch } =>
                 write!(f, "invalid castling character '{ch}'"),
-            Self::InvalidEpSquare { found } =>
-                write!(f, "invalid en passant square '{found}'"),
-            Self::InvalidHalfmoveClock { found } =>
-                write!(f, "invalid halfmove clock '{found}'"),
-            Self::InvalidFullmoveNumber { found } =>
-                write!(f, "invalid fullmove number '{found}'"),
             Self::TooLong { len } =>
-                write!(f, "FEN string too long ({len} chars, max 100)"),
+                write!(f, "FEN string too long ({len} chars, max {MAX_FEN_LEN})"),
             Self::InvalidChars =>
                 write!(f, "FEN contains non-ASCII or non-printable characters"),
             Self::AdjacentDigits { rank } =>
                 write!(f, "adjacent digits in rank {rank} (invalid FEN)"),
-            Self::InvalidEpRank { found, expected_rank } =>
-                write!(f, "en passant square '{found}' must be on rank {expected_rank}"),
-            Self::FullmoveNumberZero =>
-                write!(f, "fullmove number must be >= 1"),
             Self::InvalidKingCount { color, count } =>
                 write!(f, "{color} has {count} king(s), expected exactly 1"),
             Self::OpponentKingInCheck =>
@@ -118,8 +103,6 @@ impl std::fmt::Display for FenParseError {
                 write!(f, "{color} has {extra} extra piece(s) but only {missing_pawns} missing pawn(s)"),
             Self::CastlingRightsIncoherent { detail } =>
                 write!(f, "castling rights incoherent: {detail}"),
-            Self::EpSquareNoPawn { ep } =>
-                write!(f, "en passant square {ep} but no enemy pawn behind it"),
         }
     }
 }
@@ -294,61 +277,48 @@ impl Position {
 
     fn set_castling_from_token(
         &mut self, us: Color, kingside: bool, rook_file: Option<u8>,
-    ) -> Result<(), FenParseError> {
+    ) {
+        // Drop a right that cannot apply rather than rejecting the FEN: ChessBase
+        // position-setup often leaves KQkq ticked after the king or rook has moved.
         let king_bb = self.pieces[Piece::new(PieceType::King, us).index()];
         if king_bb == 0 {
-            let color = if us == Color::White { "white" } else { "black" };
-            return Err(FenParseError::InvalidKingCount { color, count: 0 });
+            return;
         }
         let king = self.king_sq(us);
         let rank = Self::back_rank(us);
         if king.rank() != rank {
-            return Err(FenParseError::CastlingRightsIncoherent {
-                detail: "castling king is not on its back rank",
-            });
+            return;
         }
         let rook_sq = if let Some(file) = rook_file {
             Square::new(file, rank)
         } else {
             match self.outermost_rook(us, kingside, king) {
                 Some(sq) => sq,
-                None => {
-                    return Err(FenParseError::CastlingRightsIncoherent {
-                        detail: "castling right with no rook on the back rank",
-                    });
-                }
+                None => return,
             }
         };
         let rook = Piece::new(PieceType::Rook, us);
         if self.board[rook_sq.index()] != rook {
-            return Err(FenParseError::CastlingRightsIncoherent {
-                detail: "castling file does not hold a friendly rook",
-            });
+            return;
         }
         if rook_file.is_some() && rook_sq.file() == king.file() {
-            return Err(FenParseError::CastlingRightsIncoherent {
-                detail: "castling rook file overlaps the king",
-            });
+            return;
         }
         self.set_castling_right(us, rook_sq);
-        Ok(())
     }
 
-    fn set_castling_from_file(&mut self, us: Color, file: u8) -> Result<(), FenParseError> {
+    fn set_castling_from_file(&mut self, us: Color, file: u8) {
         debug_assert!(file < 8);
         let king_bb = self.pieces[Piece::new(PieceType::King, us).index()];
         if king_bb == 0 {
-            let color = if us == Color::White { "white" } else { "black" };
-            return Err(FenParseError::InvalidKingCount { color, count: 0 });
+            return;
         }
         let king = self.king_sq(us);
         if file == king.file() {
-            return Err(FenParseError::CastlingRightsIncoherent {
-                detail: "castling rook file overlaps the king",
-            });
+            return;
         }
         let kingside = file > king.file();
-        self.set_castling_from_token(us, kingside, Some(file))
+        self.set_castling_from_token(us, kingside, Some(file));
     }
 
     fn outermost_rook(&self, us: Color, kingside: bool, king: Square) -> Option<Square> {
@@ -744,7 +714,7 @@ impl Position {
     /// Like [`from_fen`], and records whether UCI/FEN should use Chess960 encoding.
     pub fn from_fen_ex(fen: &str, chess960: bool) -> Result<Position, FenParseError> {
         // Pre-filter: reject excessively long or non-ASCII input
-        if fen.len() > 100 {
+        if fen.len() > MAX_FEN_LEN {
             return Err(FenParseError::TooLong { len: fen.len() });
         }
         if fen.bytes().any(|b| !b.is_ascii_graphic() && b != b' ') {
@@ -782,7 +752,9 @@ impl Position {
         };
 
         let parts: Vec<&str> = fen.split_whitespace().collect();
-        if parts.len() != 6 {
+        // Placement, stm, castling, ep are required. Clocks are optional (EPD);
+        // anything after them is an EPD opcode and is ignored.
+        if parts.len() < 4 {
             return Err(FenParseError::WrongFieldCount { found: parts.len() });
         }
 
@@ -833,54 +805,65 @@ impl Position {
             _ => return Err(FenParseError::InvalidSideToMove { found: parts[1].to_string() }),
         };
 
-        // 3. Castling rights (KQkq = outermost rook, A-H/a-h = Shredder file)
+        // 3. Castling rights (KQkq = outermost rook, A-H/a-h = Shredder file).
+        // `0` is an old-software synonym for `-`. A right that cannot apply is
+        // dropped rather than failing the whole FEN (ChessBase setup dialog).
         pos.chess960 = chess960;
-        if parts[2] != "-" {
+        if parts[2] != "-" && parts[2] != "0" {
             if parts[2].len() > 4 {
                 return Err(FenParseError::InvalidCastlingChar { ch: parts[2].chars().next().unwrap_or('?') });
             }
             for ch in parts[2].chars() {
                 match ch {
-                    'K' => pos.set_castling_from_token(Color::White, true, None)?,
-                    'Q' => pos.set_castling_from_token(Color::White, false, None)?,
-                    'k' => pos.set_castling_from_token(Color::Black, true, None)?,
-                    'q' => pos.set_castling_from_token(Color::Black, false, None)?,
+                    'K' => pos.set_castling_from_token(Color::White, true, None),
+                    'Q' => pos.set_castling_from_token(Color::White, false, None),
+                    'k' => pos.set_castling_from_token(Color::Black, true, None),
+                    'q' => pos.set_castling_from_token(Color::Black, false, None),
                     'A'..='H' => {
                         let file = ch as u8 - b'A';
-                        pos.set_castling_from_file(Color::White, file)?;
+                        pos.set_castling_from_file(Color::White, file);
                     }
                     'a'..='h' => {
                         let file = ch as u8 - b'a';
-                        pos.set_castling_from_file(Color::Black, file)?;
+                        pos.set_castling_from_file(Color::Black, file);
                     }
                     _ => return Err(FenParseError::InvalidCastlingChar { ch }),
                 }
             }
         }
 
-        // 4. En passant square
+        // 4. En passant square. Garbage, the wrong rank, or a square no pawn
+        // can take on: drop it. GUIs send leftover EPD squares; rejecting the
+        // FEN would leave the engine searching the previous position.
         if parts[3] != "-" {
-            pos.ep_square = Square::from_string(parts[3])
-                .ok_or_else(|| FenParseError::InvalidEpSquare { found: parts[3].to_string() })?;
-            // EP must be on rank 6 (white to move) or rank 3 (black to move)
-            let expected_rank = if pos.side_to_move == Color::White { 5u8 } else { 2u8 };
-            if pos.ep_square.rank() != expected_rank {
-                return Err(FenParseError::InvalidEpRank {
-                    found: parts[3].to_string(),
-                    expected_rank: expected_rank + 1, // 1-indexed for display
-                });
+            if let Some(sq) = Square::from_string(parts[3]) {
+                pos.ep_square = sq;
             }
         }
 
-        // 5. Halfmove clock
-        pos.halfmove_clock = parts[4].parse::<u8>()
-            .map_err(|_| FenParseError::InvalidHalfmoveClock { found: parts[4].to_string() })?;
+        // 5–6. Halfmove clock and fullmove number. Optional, and skipped when
+        // the token is an EPD opcode (`bm`, `id`, …) rather than a number.
+        pos.halfmove_clock = parts.get(4)
+            .and_then(|s| s.parse::<u32>().ok())
+            .map(|n| n.min(u8::MAX as u32) as u8)
+            .unwrap_or(0);
+        pos.fullmove_number = parts.get(5)
+            .and_then(|s| s.parse::<u32>().ok())
+            .map(|n| n.clamp(1, u16::MAX as u32) as u16)
+            .unwrap_or(1);
 
-        // 6. Fullmove number
-        pos.fullmove_number = parts[5].parse::<u16>()
-            .map_err(|_| FenParseError::InvalidFullmoveNumber { found: parts[5].to_string() })?;
-        if pos.fullmove_number == 0 {
-            return Err(FenParseError::FullmoveNumberZero);
+        // Drop an EP square that isn't a legal capture target.
+        if pos.ep_square != Square::NONE {
+            let us = pos.side_to_move;
+            let expected_rank = if us == Color::White { 5u8 } else { 2u8 };
+            if pos.ep_square.rank() != expected_rank {
+                pos.ep_square = Square::NONE;
+            } else {
+                let cap_sq = Square((pos.ep_square.0 as i8 - pawn_push(us)) as u8);
+                if pos.board[cap_sq.index()] != Piece::new(PieceType::Pawn, !us) {
+                    pos.ep_square = Square::NONE;
+                }
+            }
         }
 
         // 7. Validate position legality (release-mode checks)
@@ -1637,16 +1620,6 @@ impl Position {
         self.check_castling_coherence(BLACK_OO, Color::Black, Piece::BLACK_KING, Piece::BLACK_ROOK)?;
         self.check_castling_coherence(BLACK_OOO, Color::Black, Piece::BLACK_KING, Piece::BLACK_ROOK)?;
 
-        // 8. En passant square requires an enemy pawn behind it
-        if self.ep_square != Square::NONE {
-            let cap_sq = Square((self.ep_square.0 as i8 - pawn_push(us)) as u8);
-            if self.board[cap_sq.index()] != Piece::new(PieceType::Pawn, them) {
-                return Err(FenParseError::EpSquareNoPawn {
-                    ep: self.ep_square.to_string(),
-                });
-            }
-        }
-
         Ok(())
     }
 
@@ -2043,11 +2016,10 @@ mod tests {
     }
 
     #[test]
-    fn test_fen_castling_file_overlaps_king() {
-        assert!(matches!(
-            Position::from_fen("4k3/8/8/8/8/8/8/4K3 w E - 0 1"),
-            Err(FenParseError::CastlingRightsIncoherent { .. })
-        ));
+    fn test_fen_castling_file_overlaps_king_drops_the_right() {
+        let pos = Position::from_fen("4k3/8/8/8/8/8/8/4K3 w E - 0 1")
+            .expect("castling file on the king is dropped");
+        assert_eq!(pos.castling_rights, 0);
     }
 
     #[test]
@@ -2168,27 +2140,19 @@ mod tests {
     }
 
     #[test]
-    fn test_fen_invalid_ep_square() {
-        assert!(matches!(
-            Position::from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq z9 0 1"),
-            Err(FenParseError::InvalidEpSquare { .. })
-        ));
+    fn test_fen_invalid_ep_square_is_dropped() {
+        let pos = Position::from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq z9 0 1")
+            .expect("garbage EP is dropped, not fatal");
+        assert_eq!(pos.ep_square, Square::NONE);
     }
 
     #[test]
-    fn test_fen_invalid_halfmove() {
-        assert!(matches!(
-            Position::from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - abc 1"),
-            Err(FenParseError::InvalidHalfmoveClock { .. })
-        ));
-    }
-
-    #[test]
-    fn test_fen_invalid_fullmove() {
-        assert!(matches!(
-            Position::from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 xyz"),
-            Err(FenParseError::InvalidFullmoveNumber { .. })
-        ));
+    fn test_fen_epd_opcodes_are_not_clocks() {
+        // Non-numeric tokens after the EP square are EPD opcodes, not parse errors.
+        let pos = Position::from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - bm e2e4;")
+            .expect("EPD opcodes ignored");
+        assert_eq!(pos.halfmove_clock, 0);
+        assert_eq!(pos.fullmove_number, 1);
     }
 
     // ============================================================
@@ -2380,7 +2344,7 @@ mod tests {
 
     #[test]
     fn test_fen_too_long() {
-        let long = format!("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1{}", " ".repeat(80));
+        let long = format!("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1{}", "x".repeat(MAX_FEN_LEN));
         assert!(matches!(Position::from_fen(&long), Err(FenParseError::TooLong { .. })));
     }
 
@@ -2414,21 +2378,13 @@ mod tests {
     }
 
     #[test]
-    fn test_fen_ep_wrong_rank_white() {
-        // White to move → EP must be on rank 6, not rank 4
-        assert!(matches!(
-            Position::from_fen("rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR w KQkq e4 0 1"),
-            Err(FenParseError::InvalidEpRank { .. })
-        ));
-    }
-
-    #[test]
-    fn test_fen_ep_wrong_rank_black() {
-        // Black to move → EP must be on rank 3, not rank 6
-        assert!(matches!(
-            Position::from_fen("rnbqkbnr/ppp1pppp/8/3pP3/8/8/PPPP1PPP/RNBQKBNR b KQkq e6 0 1"),
-            Err(FenParseError::InvalidEpRank { .. })
-        ));
+    fn test_fen_ep_wrong_rank_is_dropped() {
+        let pos = Position::from_fen("rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR w KQkq e4 0 1")
+            .expect("wrong-rank EP is dropped");
+        assert_eq!(pos.ep_square, Square::NONE);
+        let pos = Position::from_fen("rnbqkbnr/ppp1pppp/8/3pP3/8/8/PPPP1PPP/RNBQKBNR b KQkq e6 0 1")
+            .expect("wrong-rank EP is dropped");
+        assert_eq!(pos.ep_square, Square::NONE);
     }
 
     #[test]
@@ -2440,11 +2396,20 @@ mod tests {
     }
 
     #[test]
-    fn test_fen_fullmove_zero() {
-        assert!(matches!(
-            Position::from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 0"),
-            Err(FenParseError::FullmoveNumberZero)
-        ));
+    fn test_fen_fullmove_zero_becomes_one() {
+        let pos = Position::from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 0")
+            .expect("fullmove 0 is a common FEN mistake");
+        assert_eq!(pos.fullmove_number, 1);
+    }
+
+    #[test]
+    fn test_fen_four_fields() {
+        let pos = Position::from_fen(
+            "rnbqkb1r/pppp1ppp/5n2/4p3/4P3/5N2/PPPP1PPP/RNBQKB1R b KQkq -",
+        ).expect("4-field FEN (EPD) is what GUIs send");
+        assert_eq!(pos.side_to_move, Color::Black);
+        assert_eq!(pos.halfmove_clock, 0);
+        assert_eq!(pos.fullmove_number, 1);
     }
 
     // ============================================================
@@ -2536,12 +2501,12 @@ mod tests {
     }
 
     #[test]
-    fn test_fen_castling_no_rook() {
-        // White O-O but no rook on h1
-        assert!(matches!(
-            Position::from_fen("r3k2r/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBN1 w Kkq - 0 1"),
-            Err(FenParseError::CastlingRightsIncoherent { .. })
-        ));
+    fn test_fen_castling_no_rook_drops_the_right() {
+        // White O-O claimed but no rook on h1: keep the position, drop K.
+        let pos = Position::from_fen("r3k2r/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBN1 w Kkq - 0 1")
+            .expect("incoherent K is dropped");
+        assert_eq!(pos.castling_rights & WHITE_OO, 0);
+        assert_ne!(pos.castling_rights & BLACK_OO, 0);
     }
 
     #[test]
@@ -2554,12 +2519,10 @@ mod tests {
     }
 
     #[test]
-    fn test_fen_ep_no_pawn() {
-        // EP on e3 but no white pawn on e4
-        assert!(matches!(
-            Position::from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR b KQkq e3 0 1"),
-            Err(FenParseError::EpSquareNoPawn { .. })
-        ));
+    fn test_fen_ep_no_pawn_is_dropped() {
+        let pos = Position::from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR b KQkq e3 0 1")
+            .expect("EP without a pawn behind it is dropped");
+        assert_eq!(pos.ep_square, Square::NONE);
     }
 
     // ============================================================

@@ -7,17 +7,17 @@
 //! NNUE evaluation with correction history. Lazy SMP parallel search.
 
 use crate::eval;
-use crate::nnue;
 use crate::history::{
-    ContCorrectionHistory, ContinuationHistory, CorrKind, PieceToTable, stat_bonus, stat_malus,
-    CORRHIST_LIMIT,
+    CORRHIST_LIMIT, ContCorrectionHistory, ContinuationHistory, CorrKind, PieceToTable, stat_bonus,
+    stat_malus,
 };
 use crate::movegen;
 use crate::movepick::{MovePicker, child_key, get_captured_pt};
+use crate::nnue;
 use crate::position::Position;
 use crate::skill;
 use crate::stats::st;
-use crate::threads::{SharedState, ThreadData, SS_OFFSET, PONDER};
+use crate::threads::{PONDER, SS_OFFSET, SharedState, ThreadData};
 use crate::tree::{tr, tree_ret};
 use crate::tt::Bound;
 use crate::tune;
@@ -68,9 +68,8 @@ const CORR_DIVISOR: i64 = 65536;
 /// which was a non-monotone sawtooth within each power-of-two bracket.
 /// Index 0 is unused (LMR requires move_count >= 2 and depth >= 2).
 const LMR_LN: [i32; 64] = [
-    0, 0, 13, 22, 27, 32, 36, 39, 41, 44, 46, 48, 50, 51, 53, 54,
-    55, 57, 58, 59, 60, 61, 62, 63, 63, 64, 65, 66, 67, 67, 68, 69,
-    69, 70, 70, 71, 72, 72, 73, 73, 74, 74, 75, 75, 76, 76, 77, 77,
+    0, 0, 13, 22, 27, 32, 36, 39, 41, 44, 46, 48, 50, 51, 53, 54, 55, 57, 58, 59, 60, 61, 62, 63,
+    63, 64, 65, 66, 67, 67, 68, 69, 69, 70, 70, 71, 72, 72, 73, 73, 74, 74, 75, 75, 76, 76, 77, 77,
     77, 78, 78, 79, 79, 79, 80, 80, 81, 81, 81, 82, 82, 82, 83, 83,
 ];
 
@@ -177,12 +176,20 @@ fn handicapped_eval(td: &mut ThreadData) -> i32 {
     let judgement = if fidelity <= skill::FIDELITY_MATERIAL {
         eval::material_eval(&td.pos)
     } else if fidelity < skill::FIDELITY_PESTO {
-        blend(eval::material_eval(&td.pos), td.pos.lazy_eval(), fidelity - skill::FIDELITY_MATERIAL)
+        blend(
+            eval::material_eval(&td.pos),
+            td.pos.lazy_eval(),
+            fidelity - skill::FIDELITY_MATERIAL,
+        )
     } else if fidelity == skill::FIDELITY_PESTO || !nnue::network::has_network() {
         td.pos.lazy_eval()
     } else {
         let pesto = td.pos.lazy_eval();
-        blend(pesto, td.nnue.evaluate(&td.pos), fidelity - skill::FIDELITY_PESTO)
+        blend(
+            pesto,
+            td.nnue.evaluate(&td.pos),
+            fidelity - skill::FIDELITY_PESTO,
+        )
     };
 
     // Correction history is trained against a clean network eval, so a handicapped
@@ -220,22 +227,44 @@ fn update_continuation_histories(
     }
 }
 
+/// Mate in N moves (not plies), engine's point of view. Negative if we are getting mated.
+fn mate_in_moves(score: i32) -> Option<i32> {
+    if !is_mate_score(score) {
+        return None;
+    }
+    Some(if score > 0 {
+        (SCORE_MATE - score + 1) / 2
+    } else {
+        -(SCORE_MATE + score + 1) / 2
+    })
+}
+
 /// Format a score as UCI string ("cp N", "mate N", or clamped TB score).
-fn format_score(score: i32) -> String {
-    if is_mate_score(score) {
-        let mate_ply = if score > 0 {
-            (SCORE_MATE - score + 1) / 2
-        } else {
-            -(SCORE_MATE + score + 1) / 2
-        };
+///
+/// With `normalize`, an ordinary score is converted to the pawn-anchored display scale,
+/// where +100 means the side to move expects to win half its games. Mate and tablebase
+/// scores are on no scale at all and pass through either way.
+fn format_score(score: i32, pos: &Position, normalize: bool) -> String {
+    if let Some(mate_ply) = mate_in_moves(score) {
         format!("mate {mate_ply}")
     } else if is_tb_score(score) {
         // TB win/loss: display as large cp value (UCI convention)
         let tb_cp = if score > 0 { 20000 } else { -20000 };
         format!("cp {tb_cp}")
+    } else if normalize {
+        format!("cp {}", crate::wdl::to_cp(score, pos))
     } else {
         format!("cp {score}")
     }
+}
+
+/// The ` wdl W D L` suffix of an `info` line, or nothing when the option is off.
+fn wdl_suffix(score: i32, pos: &Position, show: bool) -> String {
+    if !show {
+        return String::new();
+    }
+    let (w, d, l) = crate::wdl::wdl(score, pos);
+    format!(" wdl {w} {d} {l}")
 }
 
 /// Extend the PV of a decisive TB root move by successive DTZ probes.
@@ -255,13 +284,14 @@ fn syzygy_extend_pv(pos: &mut Position, rm: &mut crate::threads::RootMove) {
     // Step 1: validate existing PV moves (keep only TB-optimal ones)
     while ply < rm.pv_len {
         let pv_move = rm.pv[ply];
-        if let Some((ranked, _)) = crate::tb::rank_root_moves(pos) {
-            if let Some(&(_, best_rank, _)) = ranked.first() {
-                let pv_rank = ranked.iter().find(|(m, _, _)| *m == pv_move).map(|(_, r, _)| *r);
-                if pv_rank != Some(best_rank) {
-                    break;
-                }
-            } else {
+        if let Some((ranked, _)) = crate::tb::rank_root_moves(pos)
+            && let Some(&(_, best_rank, _)) = ranked.first()
+        {
+            let pv_rank = ranked
+                .iter()
+                .find(|(m, _, _)| *m == pv_move)
+                .map(|(_, r, _)| *r);
+            if pv_rank != Some(best_rank) {
                 break;
             }
         } else {
@@ -282,7 +312,9 @@ fn syzygy_extend_pv(pos: &mut Position, rm: &mut crate::threads::RootMove) {
         if pos.draw_by_fifty_move_rule() {
             break;
         }
-        let Some((ranked, _dtz)) = crate::tb::rank_root_moves(pos) else { break };
+        let Some((ranked, _dtz)) = crate::tb::rank_root_moves(pos) else {
+            break;
+        };
         if ranked.is_empty() {
             break;
         }
@@ -293,7 +325,8 @@ fn syzygy_extend_pv(pos: &mut Position, rm: &mut crate::threads::RootMove) {
 
         // Pick best move with tie-breaking by opponent mobility
         let best_rank = ranked[0].1;
-        let best_moves: Vec<_> = ranked.iter()
+        let best_moves: Vec<_> = ranked
+            .iter()
             .take_while(|(_, r, _)| *r == best_rank)
             .collect();
 
@@ -348,7 +381,9 @@ fn print_multi_pv_info(td: &ThreadData, shared: &SharedState, depth: i32, multi_
     let elapsed = td.tm.elapsed_ms().max(1);
     // With helpers running, the shared counter (to the nearest 512 per thread) is the
     // search's total; alone, the thread's own count is exact and never smaller.
-    let nodes = td.nodes.max(crate::threads::NODES_SEARCHED.load(std::sync::atomic::Ordering::Relaxed));
+    let nodes = td
+        .nodes
+        .max(crate::threads::NODES_SEARCHED.load(std::sync::atomic::Ordering::Relaxed));
     let nps = nodes * 1000 / elapsed;
     let hashfull = shared.tt.hashfull();
 
@@ -371,33 +406,111 @@ fn print_multi_pv_info(td: &ThreadData, shared: &SharedState, depth: i32, multi_
         let use_tb = false;
 
         let (score, d) = if let Some((s, d)) = search_score {
-            if use_tb && !is_mate_score(s) { (rm.tb_score, d) } else { (s, d) }
+            if use_tb && !is_mate_score(s) {
+                (rm.tb_score, d)
+            } else {
+                (s, d)
+            }
         } else if use_tb {
             (rm.tb_score, depth)
         } else {
             continue;
         };
 
-        let score_str = format_score(score);
-
-        let mut pv_str = String::new();
-        for j in 0..rm.pv_len {
-            if j > 0 { pv_str.push(' '); }
-            pv_str.push_str(&rm.pv[j].to_uci_960(td.pos.chess960));
-        }
-
-        // Only include "multipv N" when multi_pv > 1 (some GUIs don't expect it for single PV)
-        let multipv_str = if multi_pv > 1 {
-            format!(" multipv {}", i + 1)
-        } else {
-            String::new()
-        };
-
-        out!(
-            "info depth {d} seldepth {}{multipv_str} score {score_str} nodes {} nps {nps} time {elapsed} hashfull {hashfull} tbhits {} pv {pv_str}",
-            rm.sel_depth, nodes, td.tb_hits,
+        let score_str = format_score(score, &td.pos, crate::uci::normalize_score());
+        let wdl = wdl_suffix(score, &td.pos, crate::uci::show_wdl());
+        print_one_pv(
+            td,
+            &rm.pv[..rm.pv_len],
+            rm.sel_depth,
+            i + 1,
+            d,
+            &score_str,
+            "",
+            &wdl,
+            nodes,
+            nps,
+            hashfull,
+            elapsed,
         );
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn print_one_pv(
+    td: &ThreadData,
+    pv: &[Move],
+    sel_depth: i32,
+    multipv: usize,
+    depth: i32,
+    score_str: &str,
+    bound: &str,
+    wdl: &str,
+    nodes: u64,
+    nps: u64,
+    hashfull: usize,
+    elapsed: u64,
+) {
+    let mut pv_str = String::new();
+    for (j, mv) in pv.iter().enumerate() {
+        if j > 0 {
+            pv_str.push(' ');
+        }
+        pv_str.push_str(&mv.to_uci_960(td.pos.chess960));
+    }
+
+    // Always emit multipv: ChessBase indexes analysis lines by it, even at 1.
+    out!(
+        "info depth {depth} seldepth {sel_depth} multipv {multipv} score {score_str}{bound}{wdl} nodes {nodes} nps {nps} hashfull {hashfull} tbhits {} time {elapsed} pv {pv_str}",
+        td.tb_hits,
+    );
+}
+
+/// Print the partial line of an aspiration fail-high or fail-low.
+///
+/// A fail-high already has its move: the line that beat beta sits in `td.pv[0]`, and it
+/// is the one the interface must see. The move still at the front of `root_moves` is the
+/// previous iteration's winner — the very line the search is in the middle of refuting —
+/// so pairing it with the new score would show a move and a score that belong to two
+/// different variations, for as long as the re-search takes.
+///
+/// A fail-low has no new line to show: no move raised alpha, so the best move known is
+/// still the one at the front, and only its score has become an upper bound.
+fn print_bound_line(td: &ThreadData, shared: &SharedState, depth: i32, score: i32, fail_high: bool) {
+    if td.root_moves.is_empty() {
+        return;
+    }
+    let elapsed = td.tm.elapsed_ms().max(1);
+    let nodes = td
+        .nodes
+        .max(crate::threads::NODES_SEARCHED.load(std::sync::atomic::Ordering::Relaxed));
+    let nps = nodes * 1000 / elapsed;
+    let idx = td.pv_index.min(td.root_moves.len() - 1);
+    let use_search_pv = fail_high && td.pv_len[0] > 0;
+    debug_assert!(
+        !use_search_pv || td.root_moves.iter().any(|rm| rm.mv == td.pv[0][0]),
+        "bound line: pv[0][0] is not a root move"
+    );
+    let (pv, sel_depth) = if use_search_pv {
+        (&td.pv[0][..td.pv_len[0]], td.seldepth)
+    } else {
+        let rm = &td.root_moves[idx];
+        (&rm.pv[..rm.pv_len], rm.sel_depth)
+    };
+    print_one_pv(
+        td,
+        pv,
+        sel_depth,
+        idx + 1,
+        depth,
+        &format_score(score, &td.pos, crate::uci::normalize_score()),
+        if fail_high { " lowerbound" } else { " upperbound" },
+        &wdl_suffix(score, &td.pos, crate::uci::show_wdl()),
+        nodes,
+        nps,
+        shared.tt.hashfull(),
+        elapsed,
+    );
 }
 
 /// Run iterative deepening and return the best move found.
@@ -422,12 +535,15 @@ pub fn search(td: &mut ThreadData, shared: &SharedState) {
         td.best_score = if td.pos.checkers != 0 { -SCORE_MATE } else { 0 };
         td.completed_depth = 0;
         if reports {
-            let score = if td.pos.checkers != 0 { "mate 0" } else { "cp 0" };
+            let score = if td.pos.checkers != 0 {
+                "mate 0"
+            } else {
+                "cp 0"
+            };
             out!("info depth 0 score {score}");
         }
         return;
     }
-
 
     let max_depth = td.tm.max_depth().min(MAX_PLY as i32);
 
@@ -480,7 +596,9 @@ pub fn search(td: &mut ThreadData, shared: &SharedState) {
         #[cfg(feature = "syzygy")]
         let tb_group_end = if td.tb_config.root_in_tb && !td.root_moves.is_empty() {
             let best_sign = td.root_moves[0].tb_rank.signum();
-            td.root_moves.iter().position(|rm| rm.tb_rank.signum() != best_sign)
+            td.root_moves
+                .iter()
+                .position(|rm| rm.tb_rank.signum() != best_sign)
                 .unwrap_or(td.root_moves.len())
         } else {
             td.root_moves.len()
@@ -508,8 +626,8 @@ pub fn search(td: &mut ThreadData, shared: &SharedState) {
             // Optimism: bias eval toward root's running average
             if prev_avg != SCORE_NONE {
                 let stm = td.pos.side_to_move;
-                td.optimism[stm.index()] = tune::OPT_NUMERATOR() * prev_avg
-                    / (prev_avg.abs() + tune::OPT_OFFSET());
+                td.optimism[stm.index()] =
+                    tune::OPT_NUMERATOR() * prev_avg / (prev_avg.abs() + tune::OPT_OFFSET());
                 td.optimism[stm.flip().index()] = -td.optimism[stm.index()];
             }
 
@@ -520,7 +638,8 @@ pub fn search(td: &mut ThreadData, shared: &SharedState) {
                 // Reduce depth on repeated fail-highs
                 let adjusted_depth = (depth - failed_high_cnt).max(1);
                 td.root_delta = (beta - alpha).max(1);
-                let s = alpha_beta::<Root>(td, shared, alpha, beta, adjusted_depth, 0, false, false);
+                let s =
+                    alpha_beta::<Root>(td, shared, alpha, beta, adjusted_depth, 0, false, false);
 
                 if td.should_stop() {
                     score = s;
@@ -529,11 +648,17 @@ pub fn search(td: &mut ThreadData, shared: &SharedState) {
 
                 if s <= alpha {
                     st!(td, st_, st_.asp_fail_low += 1;);
+                    if reports {
+                        print_bound_line(td, shared, depth, s, false);
+                    }
                     beta = (alpha + beta) / 2;
                     alpha = (s - delta).max(-SCORE_INFINITE);
                     failed_high_cnt = 0;
                 } else if s >= beta {
                     st!(td, st_, st_.asp_fail_high += 1;);
+                    if reports {
+                        print_bound_line(td, shared, depth, s, true);
+                    }
                     beta = (s + delta).min(SCORE_INFINITE);
                     failed_high_cnt += 1;
                 } else {
@@ -561,7 +686,10 @@ pub fn search(td: &mut ThreadData, shared: &SharedState) {
             let pv_len = td.pv_len[0];
             if pv_len > 0 {
                 let best_mv = td.pv[0][0];
-                if let Some(rm) = td.root_moves[pv_idx..].iter_mut().find(|rm| rm.mv == best_mv) {
+                if let Some(rm) = td.root_moves[pv_idx..]
+                    .iter_mut()
+                    .find(|rm| rm.mv == best_mv)
+                {
                     rm.score = score;
                     rm.pv[..pv_len].copy_from_slice(&td.pv[0][..pv_len]);
                     rm.pv_len = pv_len;
@@ -586,7 +714,8 @@ pub fn search(td: &mut ThreadData, shared: &SharedState) {
             #[cfg(feature = "syzygy")]
             let sort_end = if td.tb_config.root_in_tb && pv_idx < td.root_moves.len() {
                 let rank = td.root_moves[pv_idx].tb_rank;
-                td.root_moves[pv_idx..tb_group_end].iter()
+                td.root_moves[pv_idx..tb_group_end]
+                    .iter()
                     .position(|rm| rm.tb_rank != rank)
                     .map_or(tb_group_end, |off| pv_idx + off)
             } else {
@@ -628,12 +757,11 @@ pub fn search(td: &mut ThreadData, shared: &SharedState) {
         td.prev_best_move = td.best_move;
 
         if is_main && !td.pondering {
-            let bm_mul = (tune::TM_BM_BASE() - td.bm_stability * tune::TM_BM_FACTOR()) as f64
-                / 1000.0;
+            let bm_mul =
+                (tune::TM_BM_BASE() - td.bm_stability * tune::TM_BM_FACTOR()) as f64 / 1000.0;
             let prev_score = td.root_moves[0].previous_score;
             let score_diff = if prev_score != SCORE_NONE && prev_score != -SCORE_INFINITE {
-                (prev_score - td.best_score)
-                    .clamp(tune::TM_SCORE_MIN(), tune::TM_SCORE_MAX())
+                (prev_score - td.best_score).clamp(tune::TM_SCORE_MIN(), tune::TM_SCORE_MAX())
             } else {
                 0
             };
@@ -648,19 +776,11 @@ pub fn search(td: &mut ThreadData, shared: &SharedState) {
             let nodes_mul = if depth > 7 && td.nodes > 0 {
                 let bm_nodes = td.root_moves[0].nodes_spent as f64;
                 let fraction = bm_nodes / td.nodes as f64;
-                (tune::TM_NODES_BASE() as f64
-                    - tune::TM_NODES_FACTOR() as f64 * fraction)
-                    / 1000.0
+                (tune::TM_NODES_BASE() as f64 - tune::TM_NODES_FACTOR() as f64 * fraction) / 1000.0
             } else {
                 1.0
             };
             td.tm.adjust_soft_limit(bm_mul * score_mul * nodes_mul);
-        }
-
-        // Save previous_score for next iteration's aspiration centering, then reset scores
-        for rm in td.root_moves.iter_mut() {
-            rm.previous_score = rm.score;
-            rm.score = -SCORE_INFINITE;
         }
 
         td.completed_depth = depth;
@@ -669,20 +789,27 @@ pub fn search(td: &mut ThreadData, shared: &SharedState) {
         // Positions along the PV are the most likely to be re-searched at deeper
         // depths in the next iteration and to occur in actual play.
         #[cfg(feature = "online-tb")]
-        if is_main && crate::online_tb::is_enabled()
+        if is_main
+            && crate::online_tb::is_enabled()
             && !td.root_moves.is_empty()
             && td.root_moves[0].pv_len > 0
         {
             crate::online_tb::submit_pv_positions(
-                &td.pos, &td.root_moves[0].pv, td.root_moves[0].pv_len,
+                &td.pos,
+                &td.root_moves[0].pv,
+                td.root_moves[0].pv_len,
             );
         }
 
-        // Print UCI info (reporting thread only)
+        // Print UCI info before resetting scores, otherwise the line falls back
+        // to previous_score and reports depth-1.
         if reports {
             // Only as many lines as were asked for: a weakened level searches extra ones
             // for its own use, and an interface that asked for one wants one.
-            let multi_pv = td.multi_pv.min(td.reported_multi_pv).min(td.root_moves.len());
+            let multi_pv = td
+                .multi_pv
+                .min(td.reported_multi_pv)
+                .min(td.root_moves.len());
 
             // Extend PV for decisive TB root moves via successive DTZ probes.
             // Builds the full path to mate by successive DTZ probes.
@@ -700,6 +827,24 @@ pub fn search(td: &mut ThreadData, shared: &SharedState) {
             print_multi_pv_info(td, shared, depth, multi_pv);
         }
 
+        let mate_found = td.mate_limit.is_some_and(|n| {
+            !td.pondering
+                && td
+                    .root_moves
+                    .first()
+                    .is_some_and(|rm| mate_in_moves(rm.score).is_some_and(|m| m > 0 && m <= n))
+        });
+
+        // Save previous_score for next iteration's aspiration centering, then reset scores
+        for rm in td.root_moves.iter_mut() {
+            rm.previous_score = rm.score;
+            rm.score = -SCORE_INFINITE;
+        }
+
+        if mate_found {
+            break;
+        }
+
         // Detect ponderhit transition between iterations
         if td.pondering && !PONDER.load(std::sync::atomic::Ordering::Relaxed) {
             td.pondering = false;
@@ -711,9 +856,7 @@ pub fn search(td: &mut ThreadData, shared: &SharedState) {
         // carries its own limits). The iteration that crossed the node budget
         // was allowed to finish; the hard cap in check_limits catches explosions.
         // Skip while pondering — search indefinitely until ponderhit or stop.
-        if !td.pondering
-            && (td.tm.should_stop_soft() || td.nodes >= td.tm.soft_nodes())
-        {
+        if !td.pondering && (td.tm.should_stop_soft() || td.nodes >= td.tm.soft_nodes()) {
             break;
         }
     }
@@ -732,13 +875,18 @@ fn apply_variety(td: &mut ThreadData) {
         return;
     }
     // Only the lines the multi-PV search actually resolved have a score to compare.
-    let scored = td.root_moves.iter()
+    let scored = td
+        .root_moves
+        .iter()
         .take_while(|rm| rm.previous_score != -SCORE_INFINITE && rm.previous_score != SCORE_NONE)
         .count();
     if scored <= 1 {
         return;
     }
-    let scores: Vec<i32> = td.root_moves[..scored].iter().map(|rm| rm.previous_score).collect();
+    let scores: Vec<i32> = td.root_moves[..scored]
+        .iter()
+        .map(|rm| rm.previous_score)
+        .collect();
     let chosen = skill::variety_pick(&td.skill, td.pos.key, &scores);
     debug_assert!(chosen < scored);
     if chosen == 0 {
@@ -775,15 +923,31 @@ fn alpha_beta<NT: NodeType>(
 ) -> i32 {
     // Fundamental search invariants
     debug_assert!(alpha < beta, "alpha_beta: alpha {} >= beta {}", alpha, beta);
-    debug_assert!(alpha >= -SCORE_INFINITE, "alpha_beta: alpha {} < -INF", alpha);
+    debug_assert!(
+        alpha >= -SCORE_INFINITE,
+        "alpha_beta: alpha {} < -INF",
+        alpha
+    );
     debug_assert!(beta <= SCORE_INFINITE, "alpha_beta: beta {} > INF", beta);
     debug_assert!(ply < MAX_PLY, "alpha_beta: ply {} >= MAX_PLY", ply);
-    debug_assert!(depth <= MAX_PLY as i32, "alpha_beta: depth {} too large", depth);
+    debug_assert!(
+        depth <= MAX_PLY as i32,
+        "alpha_beta: depth {} too large",
+        depth
+    );
     // Non-PV = null-window
-    debug_assert!(NT::PV || alpha == beta - 1,
-        "alpha_beta: non-PV with non-null window: [{}, {}]", alpha, beta);
+    debug_assert!(
+        NT::PV || alpha == beta - 1,
+        "alpha_beta: non-PV with non-null window: [{}, {}]",
+        alpha,
+        beta
+    );
     // PV and cut_node mutually exclusive
-    debug_assert!(!(NT::PV && cut_node), "alpha_beta: PV + cut_node at ply {}", ply);
+    debug_assert!(
+        !(NT::PV && cut_node),
+        "alpha_beta: PV + cut_node at ply {}",
+        ply
+    );
     // ROOT must correspond to ply == 0
     debug_assert!(!NT::ROOT || ply == 0, "alpha_beta: ROOT at ply {}", ply);
 
@@ -802,7 +966,11 @@ fn alpha_beta<NT: NodeType>(
 
     // Ply overflow guard
     if ply >= MAX_PLY - 1 {
-        return if td.pos.in_check() { 0 } else { evaluate_pos(td) };
+        return if td.pos.in_check() {
+            0
+        } else {
+            evaluate_pos(td)
+        };
     }
 
     // Leaf node: drop into quiescence
@@ -813,18 +981,34 @@ fn alpha_beta<NT: NodeType>(
     td.nodes += 1;
     td.seldepth = td.seldepth.max(ply as i32 + 1);
     st!(td, s, {
-        let nt = if NT::ROOT { 0 } else if NT::PV { 1 } else { 2 };
+        let nt = if NT::ROOT {
+            0
+        } else if NT::PV {
+            1
+        } else {
+            2
+        };
         s.ab_nodes[nt] += 1;
         s.nodes_by_depth[depth.clamp(0, 31) as usize] += 1;
     });
     tr!(td, t, {
         let flags = if t.recording() {
             let mut f = 0u8;
-            if td.pos.in_check() { f |= crate::tree::F_IN_CHECK; }
-            if NT::PV { f |= crate::tree::F_PV; }
-            if NT::ROOT { f |= crate::tree::F_ROOT; }
-            if cut_node { f |= crate::tree::F_CUT_NODE; }
-            if skip_null { f |= crate::tree::F_SKIP_NULL; }
+            if td.pos.in_check() {
+                f |= crate::tree::F_IN_CHECK;
+            }
+            if NT::PV {
+                f |= crate::tree::F_PV;
+            }
+            if NT::ROOT {
+                f |= crate::tree::F_ROOT;
+            }
+            if cut_node {
+                f |= crate::tree::F_CUT_NODE;
+            }
+            if skip_null {
+                f |= crate::tree::F_SKIP_NULL;
+            }
             if td.stack[ply + SS_OFFSET].excluded != Move::NONE {
                 f |= crate::tree::F_EXCLUDED;
             }
@@ -889,7 +1073,10 @@ fn alpha_beta<NT: NodeType>(
     let tt_hit;
     let excluded = td.ss(ply).excluded;
     st!(td, s, s.tt_probes += 1;);
-    if let Some(hit) = shared.tt.probe(td.pos.key, ply as i32, td.pos.halfmove_clock) {
+    if let Some(hit) = shared
+        .tt
+        .probe(td.pos.key, ply as i32, td.pos.halfmove_clock)
+    {
         tt_hit = true;
         tt_move = hit.mv;
         tt_pv |= hit.pv;
@@ -905,7 +1092,10 @@ fn alpha_beta<NT: NodeType>(
         });
         // TT cutoff: skip at PV nodes, skip during SE search,
         // skip at high halfmove_clock (Graph History Interaction fix)
-        if !NT::PV && !NT::ROOT && hit.depth >= depth && excluded == Move::NONE
+        if !NT::PV
+            && !NT::ROOT
+            && hit.depth >= depth
+            && excluded == Move::NONE
             && td.pos.halfmove_clock < 96
         {
             let cutoff = match hit.bound {
@@ -927,8 +1117,12 @@ fn alpha_beta<NT: NodeType>(
 
     // TT move validation
     if tt_move != Move::NONE {
-        debug_assert!(tt_move.from_sq().0 < 64 && tt_move.to_sq().0 < 64,
-            "alpha_beta: TT move squares OOB: {} -> {}", tt_move.from_sq().0, tt_move.to_sq().0);
+        debug_assert!(
+            tt_move.from_sq().0 < 64 && tt_move.to_sq().0 < 64,
+            "alpha_beta: TT move squares OOB: {} -> {}",
+            tt_move.from_sq().0,
+            tt_move.to_sq().0
+        );
     }
 
     // Online TB cache probe (prefetched DTM from Lichess API).
@@ -972,8 +1166,14 @@ fn alpha_beta<NT: NodeType>(
             Bound::Exact
         };
         shared.tt.store(
-            td.pos.key, (depth + 6).min(MAX_PLY as i32 - 1),
-            SCORE_NONE, score, bound, Move::NONE, ply as i32, tt_pv,
+            td.pos.key,
+            (depth + 6).min(MAX_PLY as i32 - 1),
+            SCORE_NONE,
+            score,
+            bound,
+            Move::NONE,
+            ply as i32,
+            tt_pv,
         );
         tree_ret!(td, ply, crate::tree::X_TB_ONLINE, depth, score);
     }
@@ -1001,8 +1201,14 @@ fn alpha_beta<NT: NodeType>(
             Bound::Exact
         };
         shared.tt.store(
-            td.pos.key, (depth + 6).min(MAX_PLY as i32 - 1),
-            SCORE_NONE, score, bound, Move::NONE, ply as i32, tt_pv,
+            td.pos.key,
+            (depth + 6).min(MAX_PLY as i32 - 1),
+            SCORE_NONE,
+            score,
+            bound,
+            Move::NONE,
+            ply as i32,
+            tt_pv,
         );
         tree_ret!(td, ply, crate::tree::X_TB_DTM, depth, score);
     }
@@ -1030,8 +1236,14 @@ fn alpha_beta<NT: NodeType>(
             Bound::Exact
         };
         shared.tt.store(
-            td.pos.key, (depth + 6).min(MAX_PLY as i32 - 1),
-            SCORE_NONE, score, bound, Move::NONE, ply as i32, tt_pv,
+            td.pos.key,
+            (depth + 6).min(MAX_PLY as i32 - 1),
+            SCORE_NONE,
+            score,
+            bound,
+            Move::NONE,
+            ply as i32,
+            tt_pv,
         );
         tree_ret!(td, ply, crate::tree::X_TB_NALIMOV, depth, score);
     }
@@ -1057,7 +1269,7 @@ fn alpha_beta<NT: NodeType>(
         td.tb_hits += 1;
 
         let (tb_score, bound) = match wdl {
-            crate::tb::Wdl::Win  => (tb_win_in(ply as i32), Bound::Lower),
+            crate::tb::Wdl::Win => (tb_win_in(ply as i32), Bound::Lower),
             crate::tb::Wdl::Loss => (tb_loss_in(ply as i32), Bound::Upper),
             crate::tb::Wdl::Draw => (0, Bound::Exact),
         };
@@ -1068,8 +1280,14 @@ fn alpha_beta<NT: NodeType>(
         {
             // Store in TT with depth bonus (depth + 6)
             shared.tt.store(
-                td.pos.key, (depth + 6).min(MAX_PLY as i32 - 1),
-                SCORE_NONE, tb_score, bound, Move::NONE, ply as i32, tt_pv,
+                td.pos.key,
+                (depth + 6).min(MAX_PLY as i32 - 1),
+                SCORE_NONE,
+                tb_score,
+                bound,
+                Move::NONE,
+                ply as i32,
+                tt_pv,
             );
             tree_ret!(td, ply, crate::tree::X_TB_WDL, depth, tb_score);
         }
@@ -1132,16 +1350,21 @@ fn alpha_beta<NT: NodeType>(
             let scaled_eval = raw_eval as i64
                 * (tune::FIFTY_MOVE_SCALE() - td.pos.halfmove_clock as i32) as i64
                 / tune::FIFTY_MOVE_SCALE() as i64;
-            static_eval = (scaled_eval as i32)
-                .clamp(-SCORE_MATE_IN_MAX + 1, SCORE_MATE_IN_MAX - 1);
+            static_eval = (scaled_eval as i32).clamp(-SCORE_MATE_IN_MAX + 1, SCORE_MATE_IN_MAX - 1);
         } else {
             // Pawn correction history (weighted sum / 65536)
             let stm = td.pos.side_to_move;
             let pawn_entry = shared.corr.get(CorrKind::Pawn, td.pos.pawn_key, stm) as i64;
             // Non-pawn correction: sum of both colors' non-pawn keys
             let non_pawn_entry =
-                shared.corr.get(CorrKind::NonPawnWhite, td.pos.non_pawn_key[0], stm) as i64
-                + shared.corr.get(CorrKind::NonPawnBlack, td.pos.non_pawn_key[1], stm) as i64;
+                shared
+                    .corr
+                    .get(CorrKind::NonPawnWhite, td.pos.non_pawn_key[0], stm)
+                    as i64
+                    + shared
+                        .corr
+                        .get(CorrKind::NonPawnBlack, td.pos.non_pawn_key[1], stm)
+                        as i64;
             // Minor piece correction: N+B+K combined key
             let minor_entry = shared.corr.get(CorrKind::Minor, td.pos.minor_key, stm) as i64;
             // Continuation correction history: subtable[ply-offset] indexed by move at ply-1
@@ -1166,7 +1389,8 @@ fn alpha_beta<NT: NodeType>(
             correction_value = (pawn_entry * tune::PAWN_CORR_FACTOR() as i64 / CORR_DIVISOR
                 + non_pawn_entry * tune::NON_PAWN_CORR_FACTOR() as i64 / CORR_DIVISOR
                 + minor_entry * tune::MINOR_CORR_FACTOR() as i64 / CORR_DIVISOR
-                + cont_corr * tune::CONT_CORR_FACTOR() as i64 / CORR_DIVISOR) as i32;
+                + cont_corr * tune::CONT_CORR_FACTOR() as i64 / CORR_DIVISOR)
+                as i32;
             // Optimism blending: material-weighted blend of raw eval + optimism
             let stm = td.pos.side_to_move;
             let material = td.pos.material() / 32;
@@ -1182,8 +1406,11 @@ fn alpha_beta<NT: NodeType>(
             static_eval = (scaled_eval as i32 + correction_value)
                 .clamp(-SCORE_MATE_IN_MAX + 1, SCORE_MATE_IN_MAX - 1);
         }
-        debug_assert!(static_eval.abs() < SCORE_MATE_IN_MAX,
-            "alpha_beta: static_eval {} looks like mate score", static_eval);
+        debug_assert!(
+            static_eval.abs() < SCORE_MATE_IN_MAX,
+            "alpha_beta: static_eval {} looks like mate score",
+            static_eval
+        );
     }
     td.ss_mut(ply).static_eval = static_eval;
     td.ss_mut(ply).correction_value = correction_value;
@@ -1200,12 +1427,29 @@ fn alpha_beta<NT: NodeType>(
     tr!(td, t, {
         if t.recording() {
             let mut f = 0u8;
-            if tt_hit { f |= crate::tree::EF_TT_HIT; }
+            if tt_hit {
+                f |= crate::tree::EF_TT_HIT;
+            }
             f |= crate::tree::bound_bits(tt_bound) << 1;
-            if tt_pv { f |= crate::tree::EF_TT_PV; }
-            if improving { f |= crate::tree::EF_IMPROVING; }
-            if in_check { f |= crate::tree::EF_IN_CHECK; }
-            t.eval(ply as u8, static_eval, raw_eval, tt_move.0, tt_score, tt_eval, tt_depth, f);
+            if tt_pv {
+                f |= crate::tree::EF_TT_PV;
+            }
+            if improving {
+                f |= crate::tree::EF_IMPROVING;
+            }
+            if in_check {
+                f |= crate::tree::EF_IN_CHECK;
+            }
+            t.eval(
+                ply as u8,
+                static_eval,
+                raw_eval,
+                tt_move.0,
+                tt_score,
+                tt_eval,
+                tt_depth,
+                f,
+            );
         }
     });
 
@@ -1226,9 +1470,15 @@ fn alpha_beta<NT: NodeType>(
         && td.ss(ply - 1).played_move != Move::NONE
         && td.ss(ply - 1).static_eval != SCORE_NONE
     {
-        let bonus = (tune::STATIC_HIST_FACTOR() * -(static_eval + td.ss(ply - 1).static_eval) / 128)
+        let bonus = (tune::STATIC_HIST_FACTOR() * -(static_eval + td.ss(ply - 1).static_eval)
+            / 128)
             .clamp(tune::STATIC_HIST_MIN(), tune::STATIC_HIST_MAX());
-        td.history.update(td.pos.side_to_move.flip(), td.ss(ply - 1).played_move, td.pos.prior_threats(), bonus);
+        td.history.update(
+            td.pos.side_to_move.flip(),
+            td.ss(ply - 1).played_move,
+            td.pos.prior_threats(),
+            bonus,
+        );
     }
 
     // Hindsight depth adjustment:
@@ -1272,8 +1522,7 @@ fn alpha_beta<NT: NodeType>(
     if !NT::PV
         && !in_check
         && depth <= tune::RFP_MAX_DEPTH()
-        && static_eval
-            - (rfp_mult * (depth - improving as i32)).max(tune::RFP_MIN())
+        && static_eval - (rfp_mult * (depth - improving as i32)).max(tune::RFP_MIN())
             + tune::RFP_OW_BONUS() * opponent_worsening as i32
             >= beta
     {
@@ -1301,8 +1550,13 @@ fn alpha_beta<NT: NodeType>(
     {
         debug_assert!(depth >= 1, "razoring: depth must be >= 1");
         st!(td, s, s.razor.cut[crate::stats::db(depth)] += 1;);
-        tree_ret!(td, ply, crate::tree::X_RAZOR_TO_QS, depth,
-            quiescence::<NT>(td, shared, alpha, beta, ply));
+        tree_ret!(
+            td,
+            ply,
+            crate::tree::X_RAZOR_TO_QS,
+            depth,
+            quiescence::<NT>(td, shared, alpha, beta, ply)
+        );
     }
 
     // Null move pruning (with verification search at high depths)
@@ -1322,23 +1576,31 @@ fn alpha_beta<NT: NodeType>(
         && depth >= tune::NMP_MIN_DEPTH()
         && static_eval >= beta
         && td.pos.has_non_pawn_material(td.pos.side_to_move)
-        && !(tt_bound == Bound::Lower
-            && tt_move != Move::NONE
-            && {
-                let cap = td.pos.board[tt_move.to_sq().index()];
-                tt_move.move_type() != MT_CASTLING
-                    && cap != Piece::NONE && (cap.piece_type() as u8) >= (PieceType::Rook as u8)
-            })
+        && !(tt_bound == Bound::Lower && tt_move != Move::NONE && {
+            let cap = td.pos.board[tt_move.to_sq().index()];
+            tt_move.move_type() != MT_CASTLING
+                && cap != Piece::NONE
+                && (cap.piece_type() as u8) >= (PieceType::Rook as u8)
+        })
     {
         debug_assert!(!in_check, "null move en echec");
         debug_assert!(!NT::PV, "null move en PV node");
         debug_assert!(excluded == Move::NONE, "null move pendant SE");
-        debug_assert!(static_eval >= beta, "null move: eval {} < beta {}", static_eval, beta);
+        debug_assert!(
+            static_eval >= beta,
+            "null move: eval {} < beta {}",
+            static_eval,
+            beta
+        );
         // No two consecutive null moves
-        debug_assert!(ply < 1 || td.ss(ply - 1).played_move != Move::NONE,
-            "null move: consecutive null moves at ply {}", ply);
+        debug_assert!(
+            ply < 1 || td.ss(ply - 1).played_move != Move::NONE,
+            "null move: consecutive null moves at ply {}",
+            ply
+        );
 
-        let r = tune::NMP_BASE_R() + depth / tune::NMP_DEPTH_DIV()
+        let r = tune::NMP_BASE_R()
+            + depth / tune::NMP_DEPTH_DIV()
             + ((static_eval - beta) / tune::NMP_EVAL_DIV()).min(tune::NMP_EVAL_MAX());
 
         // Record null move on stack
@@ -1366,8 +1628,16 @@ fn alpha_beta<NT: NodeType>(
             td.nnue.push_null();
         }
         td.pos.make_null_move();
-        let null_score =
-            -alpha_beta::<NonPv>(td, shared, -beta, -beta + 1, depth - r, ply + 1, true, false);
+        let null_score = -alpha_beta::<NonPv>(
+            td,
+            shared,
+            -beta,
+            -beta + 1,
+            depth - r,
+            ply + 1,
+            true,
+            false,
+        );
         td.pos.unmake_null_move();
         if nnue::network::has_network() {
             td.nnue.pop();
@@ -1391,8 +1661,13 @@ fn alpha_beta<NT: NodeType>(
             st!(td, s, s.nmp_verif_runs += 1;);
             depth -= tune::NMP_VERIF_REDUCTION();
             if depth <= 0 {
-                tree_ret!(td, ply, crate::tree::X_NMP_VERIF_TO_QS, depth,
-                    quiescence::<NT>(td, shared, alpha, beta, ply));
+                tree_ret!(
+                    td,
+                    ply,
+                    crate::tree::X_NMP_VERIF_TO_QS,
+                    depth,
+                    quiescence::<NT>(td, shared, alpha, beta, ply)
+                );
             }
             // Fall through to move loop with reduced depth
         }
@@ -1413,8 +1688,8 @@ fn alpha_beta<NT: NodeType>(
         && depth >= tune::PROBCUT_MIN_DEPTH()
         && beta.abs() < SCORE_MATE_IN_MAX
         && !(tt_depth >= depth - 3
-             && tt_score != SCORE_NONE
-             && tt_score < beta + tune::PROBCUT_MARGIN())
+            && tt_score != SCORE_NONE
+            && tt_score < beta + tune::PROBCUT_MARGIN())
     {
         let probcut_beta = beta + tune::PROBCUT_MARGIN();
         let see_threshold = (probcut_beta - static_eval) * 10 / 16;
@@ -1440,8 +1715,14 @@ fn alpha_beta<NT: NodeType>(
 
         loop {
             let m = pc_picker.next::<true>(
-                &td.pos, &td.history, &td.cap_history, &td.pawn_history,
-                &shared.tt, 0, &td.stack, td.pos.side_to_move,
+                &td.pos,
+                &td.history,
+                &td.cap_history,
+                &td.pawn_history,
+                &shared.tt,
+                0,
+                &td.stack,
+                td.pos.side_to_move,
             );
             if m == Move::NONE {
                 break;
@@ -1458,8 +1739,12 @@ fn alpha_beta<NT: NodeType>(
 
             // Record move context on stack for child conthist/correction lookups
             let pc_piece = td.pos.board[m.from_sq().index()];
-            debug_assert!(pc_piece != Piece::NONE,
-                "probcut: piece NONE for {} at ply {}", m.to_uci(), ply);
+            debug_assert!(
+                pc_piece != Piece::NONE,
+                "probcut: piece NONE for {} at ply {}",
+                m.to_uci(),
+                ply
+            );
             shared.tt.prefetch(child_key(&td.pos, m, pc_piece));
             {
                 let conthist_ptr = td.cont_history.subtable_ptr(true, pc_piece, m.to_sq());
@@ -1480,17 +1765,22 @@ fn alpha_beta<NT: NodeType>(
 
             // Pass 1: qsearch verification
             tr!(td, t, t.mv(ply as u8, m.0, 0, 255, crate::tree::A_PROBCUT_QS, 0, 0););
-            let mut score = -quiescence::<NonPv>(
-                td, shared, -probcut_beta, -probcut_beta + 1, ply + 1,
-            );
+            let mut score =
+                -quiescence::<NonPv>(td, shared, -probcut_beta, -probcut_beta + 1, ply + 1);
 
             // Pass 2: shallow alpha-beta confirmation
             if score >= probcut_beta {
                 let pc_depth = (depth - tune::PROBCUT_REDUCTION()).max(1);
                 tr!(td, t, t.mv(ply as u8, m.0, 0, 255, crate::tree::A_PROBCUT_AB, 0, pc_depth););
                 score = -alpha_beta::<NonPv>(
-                    td, shared, -probcut_beta, -probcut_beta + 1,
-                    pc_depth, ply + 1, false, !cut_node,
+                    td,
+                    shared,
+                    -probcut_beta,
+                    -probcut_beta + 1,
+                    pc_depth,
+                    ply + 1,
+                    false,
+                    !cut_node,
                 );
             }
 
@@ -1506,8 +1796,14 @@ fn alpha_beta<NT: NodeType>(
             if score >= probcut_beta {
                 st!(td, s, s.probcut.cut[crate::stats::db(depth)] += 1;);
                 shared.tt.store(
-                    td.pos.key, depth - 3, raw_eval, score,
-                    Bound::Lower, m, ply as i32, tt_pv,
+                    td.pos.key,
+                    depth - 3,
+                    raw_eval,
+                    score,
+                    Bound::Lower,
+                    m,
+                    ply as i32,
+                    tt_pv,
                 );
                 tree_ret!(td, ply, crate::tree::X_PROBCUT, depth, score);
             }
@@ -1520,7 +1816,11 @@ fn alpha_beta<NT: NodeType>(
     //
     // Reference: CPW — Internal Iterative Deepening (predecessor technique)
     // Follow-PV guard: do not apply the IIR reduction on the predicted PV line
-    if !follow_pv && (NT::PV || cut_node) && depth >= tune::IIR_DEPTH() + 2 * cut_node as i32 && tt_move == Move::NONE {
+    if !follow_pv
+        && (NT::PV || cut_node)
+        && depth >= tune::IIR_DEPTH() + 2 * cut_node as i32
+        && tt_move == Move::NONE
+    {
         depth -= 1;
         st!(td, s, s.iir_applied += 1;);
     }
@@ -1541,7 +1841,8 @@ fn alpha_beta<NT: NodeType>(
     // Look up countermove from previous ply
     let countermove = if ply >= 1 {
         let prev = td.ss(ply - 1);
-        td.countermoves.get(prev.moved_piece, prev.played_move.to_sq())
+        td.countermoves
+            .get(prev.moved_piece, prev.played_move.to_sq())
     } else {
         Move::NONE
     };
@@ -1552,7 +1853,16 @@ fn alpha_beta<NT: NodeType>(
     let mut skip_quiets = false;
 
     loop {
-        let m = picker.next::<false>(&td.pos, &td.history, &td.cap_history, &td.pawn_history, &shared.tt, ply, &td.stack, stm);
+        let m = picker.next::<false>(
+            &td.pos,
+            &td.history,
+            &td.cap_history,
+            &td.pawn_history,
+            &shared.tt,
+            ply,
+            &td.stack,
+            stm,
+        );
         if m == Move::NONE {
             break;
         }
@@ -1570,12 +1880,12 @@ fn alpha_beta<NT: NodeType>(
 
         // The child's cluster is fetched now, so that by the time the child probes it
         // the pruning below and make_move have covered the latency.
-        shared.tt.prefetch(child_key(&td.pos, m, td.pos.board[m.from_sq().index()]));
+        shared
+            .tt
+            .prefetch(child_key(&td.pos, m, td.pos.board[m.from_sq().index()]));
 
         // Multi-PV: skip moves already assigned to earlier PV lines
-        if NT::ROOT && td.pv_index > 0
-            && td.root_moves[..td.pv_index].iter().any(|rm| rm.mv == m)
-        {
+        if NT::ROOT && td.pv_index > 0 && td.root_moves[..td.pv_index].iter().any(|rm| rm.mv == m) {
             continue;
         }
 
@@ -1595,6 +1905,13 @@ fn alpha_beta<NT: NodeType>(
 
         move_count += 1;
 
+        if NT::ROOT && td.id == 0 && !td.silent && td.tm.elapsed_ms() >= 1000 {
+            out!(
+                "info currmove {} currmovenumber {move_count}",
+                m.to_uci_960(td.pos.chess960)
+            );
+        }
+
         let is_quiet_move = is_quiet(&td.pos, m);
 
         // Whether the move checks is asked at most once: the three pruning tests
@@ -1607,16 +1924,31 @@ fn alpha_beta<NT: NodeType>(
         // Quiet skipping is enforced inside the MovePicker (skip_quiet_moves):
         // once armed, quiet stages are bypassed so skipped quiets never reach
         // this loop nor inflate move_count.
-        debug_assert!(!(skip_quiets && is_quiet_move),
-            "search: picker yielded quiet {} while skip_quiets armed", m.to_uci());
+        debug_assert!(
+            !(skip_quiets && is_quiet_move),
+            "search: picker yielded quiet {} while skip_quiets armed",
+            m.to_uci()
+        );
 
         // Compute move context before make_move (board changes after)
         let moved_piece = td.pos.board[m.from_sq().index()];
-        debug_assert!(moved_piece != Piece::NONE,
-            "alpha_beta: piece NONE for {} at ply {}", m.to_uci(), ply);
-        debug_assert!(moved_piece.color() == td.pos.side_to_move,
-            "alpha_beta: piece {:?} wrong color for stm {:?}", moved_piece, td.pos.side_to_move);
-        let captured_pt = if !is_quiet_move { get_captured_pt(&td.pos, m) } else { PieceType::Pawn };
+        debug_assert!(
+            moved_piece != Piece::NONE,
+            "alpha_beta: piece NONE for {} at ply {}",
+            m.to_uci(),
+            ply
+        );
+        debug_assert!(
+            moved_piece.color() == td.pos.side_to_move,
+            "alpha_beta: piece {:?} wrong color for stm {:?}",
+            moved_piece,
+            td.pos.side_to_move
+        );
+        let captured_pt = if !is_quiet_move {
+            get_captured_pt(&td.pos, m)
+        } else {
+            PieceType::Pawn
+        };
 
         // Compute combined history for LMR and pruning (before make_move — board intact).
         // Sums butterfly, pawn structure, and continuation histories for quiet moves,
@@ -1646,8 +1978,7 @@ fn alpha_beta<NT: NodeType>(
             && picker.in_bad_captures()
             && best_score > -SCORE_MATE_IN_MAX
             && alpha.abs() < 2000
-            && (m.move_type() == MT_EN_PASSANT
-                || is_capture(&td.pos, m))
+            && (m.move_type() == MT_EN_PASSANT || is_capture(&td.pos, m))
         {
             let ln_mc = LMR_LN[(move_count as usize).min(63)];
             let ln_d = LMR_LN[(depth as usize).min(63)];
@@ -1665,8 +1996,7 @@ fn alpha_beta<NT: NodeType>(
                 );
                 let futility = static_eval
                     + tune::BNFP_BASE()
-                    + (lmr_depth_cp * tune::BNFP_MULT()
-                        + captured_value * tune::BNFP_CAPTURED())
+                    + (lmr_depth_cp * tune::BNFP_MULT() + captured_value * tune::BNFP_CAPTURED())
                         / 1024;
                 if futility <= alpha {
                     if !is_tb_score(best_score) && best_score < futility {
@@ -1698,9 +2028,8 @@ fn alpha_beta<NT: NodeType>(
                 let ln_mc = LMR_LN[(move_count as usize).min(63)];
                 let ln_d = LMR_LN[(depth as usize).min(63)];
                 let loglog = tune::LMR_LOG_MUL() * ln_mc * ln_d / 1024;
-                let lmr_depth = (depth - loglog / 1024
-                    + combined_history / tune::PRUNE_HIST_DIV())
-                    .max(1);
+                let lmr_depth =
+                    (depth - loglog / 1024 + combined_history / tune::PRUNE_HIST_DIV()).max(1);
                 debug_assert!(lmr_depth >= 1);
                 tune::SEE_QUIET_MARGIN() * lmr_depth * lmr_depth
             } else {
@@ -1710,8 +2039,18 @@ fn alpha_beta<NT: NodeType>(
                 st!(td, s, s.see_pruned[crate::stats::db(depth)] += 1;);
                 tr!(td, t, {
                     if t.recording() {
-                        let cat = crate::stats::move_category(&td.pos, m, tt_move, killers, countermove) as u8;
-                        t.mv(ply as u8, m.0, move_count, cat, crate::tree::A_PRUNED_SEE, threshold, 0);
+                        let cat =
+                            crate::stats::move_category(&td.pos, m, tt_move, killers, countermove)
+                                as u8;
+                        t.mv(
+                            ply as u8,
+                            m.0,
+                            move_count,
+                            cat,
+                            crate::tree::A_PRUNED_SEE,
+                            threshold,
+                            0,
+                        );
                     }
                 });
                 continue;
@@ -1734,14 +2073,25 @@ fn alpha_beta<NT: NodeType>(
             && m != killers[0]
             && m != killers[1]
             && m != countermove
-            && combined_history < (tune::HIST_PRUNE_MARGIN() + tune::HIST_PRUNE_DEPTH() * depth / 1024) * (depth + improving as i32 - 1)
+            && combined_history
+                < (tune::HIST_PRUNE_MARGIN() + tune::HIST_PRUNE_DEPTH() * depth / 1024)
+                    * (depth + improving as i32 - 1)
             && !move_gives_check(&td.pos)
         {
             st!(td, s, s.hist_pruned[crate::stats::db(depth)] += 1;);
             tr!(td, t, {
                 if t.recording() {
-                    let cat = crate::stats::move_category(&td.pos, m, tt_move, killers, countermove) as u8;
-                    t.mv(ply as u8, m.0, move_count, cat, crate::tree::A_PRUNED_HIST, combined_history.clamp(-32768, 32767), 0);
+                    let cat = crate::stats::move_category(&td.pos, m, tt_move, killers, countermove)
+                        as u8;
+                    t.mv(
+                        ply as u8,
+                        m.0,
+                        move_count,
+                        cat,
+                        crate::tree::A_PRUNED_HIST,
+                        combined_history.clamp(-32768, 32767),
+                        0,
+                    );
                 }
             });
             skip_quiets = true;
@@ -1767,8 +2117,18 @@ fn alpha_beta<NT: NodeType>(
                 st!(td, s, s.lmp_pruned[crate::stats::db(depth)] += 1;);
                 tr!(td, t, {
                     if t.recording() {
-                        let cat = crate::stats::move_category(&td.pos, m, tt_move, killers, countermove) as u8;
-                        t.mv(ply as u8, m.0, move_count, cat, crate::tree::A_PRUNED_LMP, 0, 0);
+                        let cat =
+                            crate::stats::move_category(&td.pos, m, tt_move, killers, countermove)
+                                as u8;
+                        t.mv(
+                            ply as u8,
+                            m.0,
+                            move_count,
+                            cat,
+                            crate::tree::A_PRUNED_LMP,
+                            0,
+                            0,
+                        );
                     }
                 });
                 continue;
@@ -1796,8 +2156,17 @@ fn alpha_beta<NT: NodeType>(
             st!(td, s, s.fp_pruned[crate::stats::db(depth)] += 1;);
             tr!(td, t, {
                 if t.recording() {
-                    let cat = crate::stats::move_category(&td.pos, m, tt_move, killers, countermove) as u8;
-                    t.mv(ply as u8, m.0, move_count, cat, crate::tree::A_PRUNED_FUTILITY, fp_value.clamp(-32768, 32767), 0);
+                    let cat = crate::stats::move_category(&td.pos, m, tt_move, killers, countermove)
+                        as u8;
+                    t.mv(
+                        ply as u8,
+                        m.0,
+                        move_count,
+                        cat,
+                        crate::tree::A_PRUNED_FUTILITY,
+                        fp_value.clamp(-32768, 32767),
+                        0,
+                    );
                 }
             });
             skip_quiets = true;
@@ -1828,8 +2197,16 @@ fn alpha_beta<NT: NodeType>(
                 depth - tune::SE_TT_DEPTH_MARGIN()
             );
             // Lower singular beta on ex-PV nodes: widen the margin there
-            let se_ttpv_extra = if tt_pv && !NT::PV { tune::SE_TTPV_DEPTH() * depth / 128 } else { 0 };
-            debug_assert!(se_ttpv_extra >= 0, "SE: se_ttpv_extra negative: {}", se_ttpv_extra);
+            let se_ttpv_extra = if tt_pv && !NT::PV {
+                tune::SE_TTPV_DEPTH() * depth / 128
+            } else {
+                0
+            };
+            debug_assert!(
+                se_ttpv_extra >= 0,
+                "SE: se_ttpv_extra negative: {}",
+                se_ttpv_extra
+            );
             let singular_beta = (tt_score - depth - se_ttpv_extra).max(-SCORE_MATE);
             let singular_depth = (depth - 1) / 2;
 
@@ -1837,10 +2214,14 @@ fn alpha_beta<NT: NodeType>(
             tr!(td, t, t.mv(ply as u8, m.0, move_count, 255, crate::tree::A_SE_VERIF, 0, singular_depth););
             td.ss_mut(ply).excluded = m;
             let se_score = alpha_beta::<NonPv>(
-                td, shared,
-                singular_beta - 1, singular_beta,
-                singular_depth, ply,
-                false, cut_node,
+                td,
+                shared,
+                singular_beta - 1,
+                singular_beta,
+                singular_depth,
+                ply,
+                false,
+                cut_node,
             );
             td.ss_mut(ply).excluded = Move::NONE;
 
@@ -1851,19 +2232,30 @@ fn alpha_beta<NT: NodeType>(
             if se_score < singular_beta {
                 // TT move is singular — extend
                 singular_ext = 1;
-                let parent_de = if ply > 0 { td.ss(ply - 1).double_extensions } else { 0 };
+                let parent_de = if ply > 0 {
+                    td.ss(ply - 1).double_extensions
+                } else {
+                    0
+                };
                 // Adjust SE margins by |correction_value|: when the correction is
                 // large, the static eval is unreliable → shrink the margins so
                 // extensions trigger more easily (corrValAdj-like idea).
                 let corr_adj = correction_value.abs() / tune::SE_CORR_DIV();
                 debug_assert!(corr_adj >= 0, "corr_adj must be non-negative");
                 if !NT::PV
-                    && se_score < singular_beta - (tune::SE_DOUBLE_MARGIN() + tune::SE_DOUBLE_DEPTH() * depth / 1024) + corr_adj
+                    && se_score
+                        < singular_beta
+                            - (tune::SE_DOUBLE_MARGIN() + tune::SE_DOUBLE_DEPTH() * depth / 1024)
+                            + corr_adj
                     && parent_de < tune::SE_MAX_DOUBLE_EXT()
                 {
                     singular_ext = 2;
                     // SE triple extension without a quiet guard: any move may triple-extend
-                    if se_score < singular_beta - (tune::SE_TRIPLE_MARGIN() + tune::SE_TRIPLE_DEPTH() * depth / 1024) + corr_adj {
+                    if se_score
+                        < singular_beta
+                            - (tune::SE_TRIPLE_MARGIN() + tune::SE_TRIPLE_DEPTH() * depth / 1024)
+                            + corr_adj
+                    {
                         singular_ext = 3;
                     }
                 }
@@ -1894,16 +2286,19 @@ fn alpha_beta<NT: NodeType>(
         // ply >= 1 guard: at root there is no previous move (in release the old
         // ply-1 underflow happened to land on a sentinel entry; this guard makes
         // that explicit and keeps debug builds alive).
-        let recapture_ext = if singular_ext == 0 && NT::PV && m == tt_move && !is_quiet_move && ply >= 1 {
-            let prev = td.ss(ply - 1);
-            i32::from(prev.is_capture && m.to_sq() == prev.played_move.to_sq())
-        } else {
-            0
-        };
+        let recapture_ext =
+            if singular_ext == 0 && NT::PV && m == tt_move && !is_quiet_move && ply >= 1 {
+                let prev = td.ss(ply - 1);
+                i32::from(prev.is_capture && m.to_sq() == prev.played_move.to_sq())
+            } else {
+                0
+            };
 
         // Record move context on the stack (AFTER SE to avoid inner search overwriting it)
         {
-            let conthist_ptr = td.cont_history.subtable_ptr(!is_quiet_move, moved_piece, m.to_sq());
+            let conthist_ptr = td
+                .cont_history
+                .subtable_ptr(!is_quiet_move, moved_piece, m.to_sq());
             let cont_corr_ptr = td.cont_correction.subtable_ptr(moved_piece, m.to_sq());
             let se = td.ss_mut(ply);
             se.played_move = m;
@@ -1935,7 +2330,11 @@ fn alpha_beta<NT: NodeType>(
 
         // Propagate double extension counter to child ply
         {
-            let parent_de = if ply > 0 { td.ss(ply - 1).double_extensions } else { 0 };
+            let parent_de = if ply > 0 {
+                td.ss(ply - 1).double_extensions
+            } else {
+                0
+            };
             td.ss_mut(ply).double_extensions = parent_de + if singular_ext >= 2 { 1 } else { 0 };
         }
 
@@ -1966,14 +2365,17 @@ fn alpha_beta<NT: NodeType>(
 
                 // PV: reduce less
                 if NT::PV {
-                    r -= tune::LMR_PV_BASE() + tune::LMR_PV_WINDOW_MUL() * (beta - alpha) / td.root_delta;
+                    r -= tune::LMR_PV_BASE()
+                        + tune::LMR_PV_WINDOW_MUL() * (beta - alpha) / td.root_delta;
                 }
 
                 // tt_pv: reduce less (node was PV in prior iteration)
                 if tt_pv {
                     r -= tune::LMR_TTPV_BASE();
-                    r -= tune::LMR_TTPV_SCORE_MUL() * (tt_score != SCORE_NONE && tt_score > alpha) as i32;
-                    r -= tune::LMR_TTPV_DEPTH_MUL() * (tt_score != SCORE_NONE && tt_depth >= depth) as i32;
+                    r -= tune::LMR_TTPV_SCORE_MUL()
+                        * (tt_score != SCORE_NONE && tt_score > alpha) as i32;
+                    r -= tune::LMR_TTPV_DEPTH_MUL()
+                        * (tt_score != SCORE_NONE && tt_depth >= depth) as i32;
                     // Depth-dependent linear term: reduce ex-PV nodes less as the
                     // remaining depth grows, since over-reducing a deep ex-PV line
                     // costs exponentially more. Scale is 1024 = 1 ply.
@@ -1989,7 +2391,10 @@ fn alpha_beta<NT: NodeType>(
 
                 // Not improving: reduce more with magnitude
                 if !improving {
-                    r += (tune::LMR_NOT_IMPROVING_BASE() + tune::LMR_NOT_IMPROVING_DEPTH() * depth / 1024 - tune::LMR_NOT_IMPROVING_MUL() * improvement / 128).min(tune::LMR_NOT_IMPROVING_MAX());
+                    r += (tune::LMR_NOT_IMPROVING_BASE()
+                        + tune::LMR_NOT_IMPROVING_DEPTH() * depth / 1024
+                        - tune::LMR_NOT_IMPROVING_MUL() * improvement / 128)
+                        .min(tune::LMR_NOT_IMPROVING_MAX());
                 }
 
                 // Gives check: reduce less (~1.3 ply)
@@ -2014,7 +2419,8 @@ fn alpha_beta<NT: NodeType>(
                 }
 
                 // Shallow TT depth is less reliable: reduce more
-                r += tune::LMR_TT_SHALLOW_DEPTH() * (tt_score != SCORE_NONE && tt_depth < depth) as i32;
+                r += tune::LMR_TT_SHALLOW_DEPTH()
+                    * (tt_score != SCORE_NONE && tt_depth < depth) as i32;
 
                 // Correction history: reduce less when the static evaluation is
                 // unreliable (large |correction_value| → hard-to-evaluate
@@ -2031,7 +2437,9 @@ fn alpha_beta<NT: NodeType>(
                 // LMR overextension for heavily boosted early moves:
                 // if r is very negative (many accumulated bonuses) and move_count is
                 // below a threshold, let reduced_depth reach new_depth+2 instead of new_depth+1.
-                let lmr_overext = (r < tune::LMR_OVEREXT_THRESHOLD() && move_count <= tune::LMR_OVEREXT_MAX_MC() as u32) as i32;
+                let lmr_overext = (r < tune::LMR_OVEREXT_THRESHOLD()
+                    && move_count <= tune::LMR_OVEREXT_MAX_MC() as u32)
+                    as i32;
                 debug_assert!(lmr_overext == 0 || lmr_overext == 1);
                 let reduced_depth = (new_depth - r / 1024).clamp(1, new_depth + 1 + lmr_overext);
 
@@ -2044,7 +2452,16 @@ fn alpha_beta<NT: NodeType>(
                     }
                 });
                 tr!(td, t, t.mv(ply as u8, m.0, move_count, tree_cat, crate::tree::A_SEARCH_LMR, r, reduced_depth););
-                s = -alpha_beta::<NonPv>(td, shared, -alpha - 1, -alpha, reduced_depth, ply + 1, false, true);
+                s = -alpha_beta::<NonPv>(
+                    td,
+                    shared,
+                    -alpha - 1,
+                    -alpha,
+                    reduced_depth,
+                    ply + 1,
+                    false,
+                    true,
+                );
                 td.ss_mut(ply).reduction = 0;
 
                 // Adaptive re-search: adjust depth based on score vs best
@@ -2062,12 +2479,22 @@ fn alpha_beta<NT: NodeType>(
                         new_depth += (s > best_score + tune::DEEPER2_BASE()) as i32;
                         // Reduced-depth shallower: threshold proportional to
                         // reduced_depth — less aggressive if the move was already heavily reduced
-                        new_depth -= (s < best_score + tune::SHALLOWER_BASE() + reduced_depth) as i32;
+                        new_depth -=
+                            (s < best_score + tune::SHALLOWER_BASE() + reduced_depth) as i32;
                     }
                     if new_depth > reduced_depth {
                         st!(td, st_, st_.lmr_research += 1;);
                         tr!(td, t, t.mv(ply as u8, m.0, move_count, tree_cat, crate::tree::A_RESEARCH_FULL, 0, new_depth););
-                        s = -alpha_beta::<NonPv>(td, shared, -alpha - 1, -alpha, new_depth, ply + 1, false, !cut_node);
+                        s = -alpha_beta::<NonPv>(
+                            td,
+                            shared,
+                            -alpha - 1,
+                            -alpha,
+                            new_depth,
+                            ply + 1,
+                            false,
+                            !cut_node,
+                        );
                     }
                 }
             } else {
@@ -2082,7 +2509,16 @@ fn alpha_beta<NT: NodeType>(
                     - (r_fds > tune::EMR_R_TWO() && new_depth > 2) as i32;
                 debug_assert!(d >= new_depth - 2);
                 tr!(td, t, t.mv(ply as u8, m.0, move_count, tree_cat, crate::tree::A_SEARCH_FULL, -total_ext * 1024, d););
-                s = -alpha_beta::<NonPv>(td, shared, -alpha - 1, -alpha, d, ply + 1, false, !cut_node);
+                s = -alpha_beta::<NonPv>(
+                    td,
+                    shared,
+                    -alpha - 1,
+                    -alpha,
+                    d,
+                    ply + 1,
+                    false,
+                    !cut_node,
+                );
             }
 
             // PV re-search with full window
@@ -2109,8 +2545,12 @@ fn alpha_beta<NT: NodeType>(
             tree_ret!(td, ply, crate::tree::X_STOPPED, depth, 0);
         }
 
-        debug_assert!(score > -SCORE_INFINITE && score < SCORE_INFINITE,
-            "alpha_beta: invalid score {} from recursion at ply {}", score, ply);
+        debug_assert!(
+            score > -SCORE_INFINITE && score < SCORE_INFINITE,
+            "alpha_beta: invalid score {} from recursion at ply {}",
+            score,
+            ply
+        );
 
         // Track searched moves for history malus on a later cutoff. Recorded only
         // after the recursive search: moves rejected by the pruning tests above
@@ -2147,9 +2587,8 @@ fn alpha_beta<NT: NodeType>(
                             s.cutoff_first += 1;
                         }
                         s.fail_high_index[(move_count as usize - 1).min(63)] += 1;
-                        let cat = crate::stats::move_category(
-                            &td.pos, m, tt_move, killers, countermove,
-                        );
+                        let cat =
+                            crate::stats::move_category(&td.pos, m, tt_move, killers, countermove);
                         s.cutoff_by_cat[cat] += 1;
                     });
                     let mut bonus = stat_bonus(depth);
@@ -2163,7 +2602,8 @@ fn alpha_beta<NT: NodeType>(
                     if !NT::PV {
                         let total_searched = (quiet_count + capture_count) as i64;
                         debug_assert!(total_searched >= 0);
-                        bonus += (bonus as i64 * total_searched / tune::BESTMOVE_MC_DIV() as i64) as i32;
+                        bonus +=
+                            (bonus as i64 * total_searched / tune::BESTMOVE_MC_DIV() as i64) as i32;
                     }
 
                     if is_quiet_move {
@@ -2182,22 +2622,39 @@ fn alpha_beta<NT: NodeType>(
 
                         // Butterfly + pawn history bonus
                         td.history.update(stm, m, td.pos.threats, bonus);
-                        td.pawn_history.update(td.pos.pawn_key, moved_piece, m.to_sq(), bonus);
+                        td.pawn_history
+                            .update(td.pos.pawn_key, moved_piece, m.to_sq(), bonus);
                         // Continuation history bonus
-                        update_continuation_histories(td, ply, moved_piece, m.to_sq(), bonus, in_check);
+                        update_continuation_histories(
+                            td,
+                            ply,
+                            moved_piece,
+                            m.to_sq(),
+                            bonus,
+                            in_check,
+                        );
 
                         // Malus for other tried quiets
                         for &q in quiets_searched.filled(quiet_count) {
                             if q != m {
                                 let q_piece = td.pos.board[q.from_sq().index()];
                                 td.history.update(stm, q, td.pos.threats, -malus);
-                                td.pawn_history.update(td.pos.pawn_key, q_piece, q.to_sq(), -malus);
-                                update_continuation_histories(td, ply, q_piece, q.to_sq(), -malus, in_check);
+                                td.pawn_history
+                                    .update(td.pos.pawn_key, q_piece, q.to_sq(), -malus);
+                                update_continuation_histories(
+                                    td,
+                                    ply,
+                                    q_piece,
+                                    q.to_sq(),
+                                    -malus,
+                                    in_check,
+                                );
                             }
                         }
                     } else {
                         // Capture cutoff: bonus for the best capture
-                        td.cap_history.update(moved_piece, m.to_sq(), captured_pt, bonus);
+                        td.cap_history
+                            .update(moved_piece, m.to_sq(), captured_pt, bonus);
                     }
 
                     // Malus for all non-best captures that were tried
@@ -2205,7 +2662,12 @@ fn alpha_beta<NT: NodeType>(
                         if cap_m != m {
                             let cap_piece = td.pos.board[cap_m.from_sq().index()];
                             let cap_captured_pt = get_captured_pt(&td.pos, cap_m);
-                            td.cap_history.update(cap_piece, cap_m.to_sq(), cap_captured_pt, -malus);
+                            td.cap_history.update(
+                                cap_piece,
+                                cap_m.to_sq(),
+                                cap_captured_pt,
+                                -malus,
+                            );
                         }
                     }
                     break;
@@ -2225,12 +2687,22 @@ fn alpha_beta<NT: NodeType>(
         {
             let mut check_buf: ArrayBuf<Move, MAX_MOVES> = ArrayBuf::new();
             let check_count = movegen::generate_legal_moves(&td.pos, &mut check_buf);
-            debug_assert!(check_count == 0,
+            debug_assert!(
+                check_count == 0,
                 "move_count==0 but {} legal moves exist at ply {} (in_check={})",
-                check_count, ply, in_check);
+                check_count,
+                ply,
+                in_check
+            );
         }
         if in_check {
-            tree_ret!(td, ply, crate::tree::X_CHECKMATE, depth, mated_in(ply as i32));
+            tree_ret!(
+                td,
+                ply,
+                crate::tree::X_CHECKMATE,
+                depth,
+                mated_in(ply as i32)
+            );
         } else {
             tree_ret!(td, ply, crate::tree::X_STALEMATE, depth, 0);
         }
@@ -2263,15 +2735,24 @@ fn alpha_beta<NT: NodeType>(
         {
             // Butterfly history bonus for the parent's quiet move
             let pcm_bonus = tune::PCM_ALLNODE_FACTOR() * stat_bonus(depth) / 128;
-            debug_assert!(pcm_bonus.abs() < 50000, "pcm_bonus out of range: {}", pcm_bonus);
-            td.history.update(stm.flip(), prior_move, td.pos.prior_threats(), pcm_bonus);
+            debug_assert!(
+                pcm_bonus.abs() < 50000,
+                "pcm_bonus out of range: {}",
+                pcm_bonus
+            );
+            td.history
+                .update(stm.flip(), prior_move, td.pos.prior_threats(), pcm_bonus);
 
             // Continuation history bonus via the grandparent (ss-2)
             if idx >= 2 {
                 let grandparent = &td.stack[idx - 2];
                 if grandparent.played_move != Move::NONE {
                     let ch_bonus = tune::PCM_ALLNODE_CONTHIST_FACTOR() * stat_bonus(depth) / 128;
-                    debug_assert!(ch_bonus.abs() < 50000, "pcm ch_bonus out of range: {}", ch_bonus);
+                    debug_assert!(
+                        ch_bonus.abs() < 50000,
+                        "pcm ch_bonus out of range: {}",
+                        ch_bonus
+                    );
                     ContinuationHistory::update(
                         grandparent.conthist_ptr,
                         prev.moved_piece,
@@ -2286,7 +2767,11 @@ fn alpha_beta<NT: NodeType>(
             let cap_piece = td.pos.prior_captured_piece();
             if cap_piece != Piece::NONE {
                 let pcm_cap_bonus = tune::PCM_ALLNODE_CAPTURE_FACTOR() * stat_bonus(depth) / 128;
-                debug_assert!(pcm_cap_bonus.abs() < 50000, "pcm_cap_bonus out of range: {}", pcm_cap_bonus);
+                debug_assert!(
+                    pcm_cap_bonus.abs() < 50000,
+                    "pcm_cap_bonus out of range: {}",
+                    pcm_cap_bonus
+                );
                 td.cap_history.update(
                     prev.moved_piece,
                     prior_move.to_sq(),
@@ -2309,8 +2794,7 @@ fn alpha_beta<NT: NodeType>(
             && (td.pos.board[best_move.to_sq().index()] != Piece::NONE
                 || best_move.move_type() == MT_EN_PASSANT
                 || best_move.move_type() == MT_PROMOTION);
-        let skip_corr_for_capture = best_is_tactical
-            && crate::see::see(&td.pos, best_move, 0);
+        let skip_corr_for_capture = best_is_tactical && crate::see::see(&td.pos, best_move, 0);
         let fail_high = bound == Bound::Lower;
         let fail_low = bound == Bound::Upper;
 
@@ -2321,12 +2805,26 @@ fn alpha_beta<NT: NodeType>(
             let bonus = ((best_score - static_eval) * depth * tune::CORR_UPDATE_FACTOR() / 1024)
                 .clamp(-CORRHIST_LIMIT / 4, CORRHIST_LIMIT / 4);
             let corr_stm = td.pos.side_to_move;
-            shared.corr.update(CorrKind::Pawn, td.pos.pawn_key, corr_stm, bonus);
+            shared
+                .corr
+                .update(CorrKind::Pawn, td.pos.pawn_key, corr_stm, bonus);
             // Non-pawn correction: update both colors' tables
-            shared.corr.update(CorrKind::NonPawnWhite, td.pos.non_pawn_key[0], corr_stm, bonus);
-            shared.corr.update(CorrKind::NonPawnBlack, td.pos.non_pawn_key[1], corr_stm, bonus);
+            shared.corr.update(
+                CorrKind::NonPawnWhite,
+                td.pos.non_pawn_key[0],
+                corr_stm,
+                bonus,
+            );
+            shared.corr.update(
+                CorrKind::NonPawnBlack,
+                td.pos.non_pawn_key[1],
+                corr_stm,
+                bonus,
+            );
             // Minor piece correction
-            shared.corr.update(CorrKind::Minor, td.pos.minor_key, corr_stm, bonus);
+            shared
+                .corr
+                .update(CorrKind::Minor, td.pos.minor_key, corr_stm, bonus);
             // Continuation correction: update subtables at offsets 2 and 4
             let base = ply + SS_OFFSET;
             for &offset in &[2, 4] {
@@ -2349,22 +2847,37 @@ fn alpha_beta<NT: NodeType>(
     // Store in TT (skip during SE search to avoid polluting with partial results)
     if excluded == Move::NONE {
         // If alpha wasn't raised (fail-low), best_move may be NONE
-        debug_assert!(best_score > orig_alpha || bound == Bound::Upper,
-            "alpha not raised but bound is {:?}", bound);
+        debug_assert!(
+            best_score > orig_alpha || bound == Bound::Upper,
+            "alpha not raised but bound is {:?}",
+            bound
+        );
         // If we have an exact or lower bound, we must have a best move
-        debug_assert!(bound == Bound::Upper || best_move != Move::NONE,
-            "bound {:?} but no best_move at ply {}", bound, ply);
+        debug_assert!(
+            bound == Bound::Upper || best_move != Move::NONE,
+            "bound {:?} but no best_move at ply {}",
+            bound,
+            ply
+        );
 
         // TT stores raw eval (not corrected) so correction is re-applied on future probes
         debug_assert!(best_score > -SCORE_INFINITE, "TT store: -INF score");
         debug_assert!(best_score < SCORE_INFINITE, "TT store: +INF score");
-        debug_assert!(raw_eval == SCORE_NONE || raw_eval.abs() < SCORE_INFINITE,
-            "TT store: raw_eval {} suspicious", raw_eval);
+        debug_assert!(
+            raw_eval == SCORE_NONE || raw_eval.abs() < SCORE_INFINITE,
+            "TT store: raw_eval {} suspicious",
+            raw_eval
+        );
         debug_assert!(depth >= 0, "TT store: negative depth {}", depth);
-        debug_assert!(best_move == Move::NONE || best_move.from_sq().0 < 64,
-            "TT store: best_move from OOB {}", best_move.from_sq().0);
+        debug_assert!(
+            best_move == Move::NONE || best_move.from_sq().0 < 64,
+            "TT store: best_move from OOB {}",
+            best_move.from_sq().0
+        );
         st!(td, s, s.tt_stores += 1;);
-        shared.tt.store(td.pos.key, depth, raw_eval, best_score, bound, best_move, ply as i32, tt_pv);
+        shared.tt.store(
+            td.pos.key, depth, raw_eval, best_score, bound, best_move, ply as i32, tt_pv,
+        );
     }
 
     // Clamp to TB upper bound
@@ -2413,12 +2926,24 @@ fn quiescence<NT: NodeType>(
     ply: usize,
 ) -> i32 {
     debug_assert!(alpha < beta, "qsearch: alpha {} >= beta {}", alpha, beta);
-    debug_assert!(alpha >= -SCORE_INFINITE && beta <= SCORE_INFINITE,
-        "qsearch: bounds OOB alpha={} beta={}", alpha, beta);
+    debug_assert!(
+        alpha >= -SCORE_INFINITE && beta <= SCORE_INFINITE,
+        "qsearch: bounds OOB alpha={} beta={}",
+        alpha,
+        beta
+    );
     debug_assert!(ply < MAX_PLY, "qsearch: ply {} >= MAX_PLY", ply);
-    debug_assert!(NT::PV || alpha == beta - 1,
-        "qsearch: non-PV with non-null window [{}, {}]", alpha, beta);
-    debug_assert!(!NT::ROOT, "qsearch: called with ROOT node type at ply {}", ply);
+    debug_assert!(
+        NT::PV || alpha == beta - 1,
+        "qsearch: non-PV with non-null window [{}, {}]",
+        alpha,
+        beta
+    );
+    debug_assert!(
+        !NT::ROOT,
+        "qsearch: called with ROOT node type at ply {}",
+        ply
+    );
 
     td.check_limits();
     if td.should_stop() {
@@ -2427,7 +2952,11 @@ fn quiescence<NT: NodeType>(
 
     // Ply overflow guard
     if ply >= MAX_PLY - 1 {
-        return if td.pos.in_check() { 0 } else { evaluate_pos(td) };
+        return if td.pos.in_check() {
+            0
+        } else {
+            evaluate_pos(td)
+        };
     }
 
     // Upcoming repetition in qsearch
@@ -2461,7 +2990,9 @@ fn quiescence<NT: NodeType>(
     st!(td, s, s.qs_nodes[!NT::PV as usize] += 1;);
     tr!(td, t, {
         let mut f = crate::tree::F_QS;
-        if NT::PV { f |= crate::tree::F_PV; }
+        if NT::PV {
+            f |= crate::tree::F_PV;
+        }
         t.enter(ply as u8, 0, f, alpha, beta);
     });
 
@@ -2478,7 +3009,10 @@ fn quiescence<NT: NodeType>(
     let mut tt_bound = Bound::None;
     // Propagate the PV flag from the TT (mirrors the TT probe in alpha_beta)
     let mut tt_pv = NT::PV;
-    if let Some(hit) = shared.tt.probe(td.pos.key, ply as i32, td.pos.halfmove_clock) {
+    if let Some(hit) = shared
+        .tt
+        .probe(td.pos.key, ply as i32, td.pos.halfmove_clock)
+    {
         tt_move = hit.mv;
         tt_eval = hit.eval;
         tt_score = hit.score;
@@ -2515,7 +3049,11 @@ fn quiescence<NT: NodeType>(
     } else {
         // Reuse TT eval if available (avoids NNUE forward pass)
         td.used_lazy_eval = false;
-        raw_eval = if tt_eval != SCORE_NONE { tt_eval } else { evaluate_pos(td) };
+        raw_eval = if tt_eval != SCORE_NONE {
+            tt_eval
+        } else {
+            evaluate_pos(td)
+        };
         let lazy_eval_qs = td.used_lazy_eval || td.skill.active;
         // Bring the NNUE accumulators (PST and threats) up-to-date even when
         // TT eval is used, so children can do incremental updates instead of
@@ -2531,8 +3069,14 @@ fn quiescence<NT: NodeType>(
             let qs_stm = td.pos.side_to_move;
             let pawn_entry = shared.corr.get(CorrKind::Pawn, td.pos.pawn_key, qs_stm) as i64;
             let non_pawn_entry =
-                shared.corr.get(CorrKind::NonPawnWhite, td.pos.non_pawn_key[0], qs_stm) as i64
-                + shared.corr.get(CorrKind::NonPawnBlack, td.pos.non_pawn_key[1], qs_stm) as i64;
+                shared
+                    .corr
+                    .get(CorrKind::NonPawnWhite, td.pos.non_pawn_key[0], qs_stm)
+                    as i64
+                    + shared
+                        .corr
+                        .get(CorrKind::NonPawnBlack, td.pos.non_pawn_key[1], qs_stm)
+                        as i64;
             let minor_entry = shared.corr.get(CorrKind::Minor, td.pos.minor_key, qs_stm) as i64;
             let cont_corr = {
                 let base = ply + SS_OFFSET;
@@ -2565,19 +3109,21 @@ fn quiescence<NT: NodeType>(
             let material = td.pos.material() / 32;
             let mat_mul = (tune::OPT_MAT_SCALE() + material) as i64;
             let opt_mul = (tune::OPT_MAT_BASE() + material) as i64;
-            ((raw_eval as i64 * mat_mul
-                + td.optimism[qs_stm.index()] as i64 * opt_mul / 32)
-                / 1024) as i32
+            ((raw_eval as i64 * mat_mul + td.optimism[qs_stm.index()] as i64 * opt_mul / 32) / 1024)
+                as i32
         };
         // 50-move rule scaling: scale eval toward 0 as halfmove clock approaches 100,
         // reflecting increasing draw probability. (CPW: Fifty-move Rule)
         let scaled_qs = blended_qs as i64
             * (tune::FIFTY_MOVE_SCALE() - td.pos.halfmove_clock as i32) as i64
             / tune::FIFTY_MOVE_SCALE() as i64;
-        stand_pat = (scaled_qs as i32 + corr_val)
-            .clamp(-SCORE_MATE_IN_MAX + 1, SCORE_MATE_IN_MAX - 1);
-        debug_assert!(stand_pat.abs() < SCORE_MATE_IN_MAX,
-            "qsearch: stand_pat {} looks like mate score", stand_pat);
+        stand_pat =
+            (scaled_qs as i32 + corr_val).clamp(-SCORE_MATE_IN_MAX + 1, SCORE_MATE_IN_MAX - 1);
+        debug_assert!(
+            stand_pat.abs() < SCORE_MATE_IN_MAX,
+            "qsearch: stand_pat {} looks like mate score",
+            stand_pat
+        );
         best_score = stand_pat;
 
         // TT stand-pat blending: use TT score as better position estimate when
@@ -2597,11 +3143,24 @@ fn quiescence<NT: NodeType>(
         if best_score >= beta {
             st!(td, s, s.qs_standpat_cutoffs += 1;);
             // Beta midpoint: reduce overestimation (½ blending)
-            let ret = if !is_mate_score(best_score) { (best_score + beta) / 2 } else { best_score };
+            let ret = if !is_mate_score(best_score) {
+                (best_score + beta) / 2
+            } else {
+                best_score
+            };
             // Only store to TT if no prior hit.
             // Overwriting a deeper entry with depth-0 stand-pat pollutes the TT.
             if tt_score == SCORE_NONE {
-                shared.tt.store(td.pos.key, 0, raw_eval, ret, Bound::Lower, Move::NONE, ply as i32, tt_pv);
+                shared.tt.store(
+                    td.pos.key,
+                    0,
+                    raw_eval,
+                    ret,
+                    Bound::Lower,
+                    Move::NONE,
+                    ply as i32,
+                    tt_pv,
+                );
             }
             tree_ret!(td, ply, crate::tree::X_QS_STANDPAT, 0, ret);
         }
@@ -2631,22 +3190,48 @@ fn quiescence<NT: NodeType>(
     let mut skip_quiet_evasions = false;
 
     // Futility base: precomputed outside loop for unified pruning
-    let futility_base = if !in_check { stand_pat + tune::QS_FUTILITY_BASE() } else { -SCORE_INFINITE };
+    let futility_base = if !in_check {
+        stand_pat + tune::QS_FUTILITY_BASE()
+    } else {
+        -SCORE_INFINITE
+    };
 
     // Recapture square: exempt recaptures from pruning.
     // Only set when previous move was a capture.
     let recapture_sq = {
         let prev_ss = td.ss(ply - 1);
-        if prev_ss.is_capture { prev_ss.played_move.to_sq() } else { Square::NONE }
+        if prev_ss.is_capture {
+            prev_ss.played_move.to_sq()
+        } else {
+            Square::NONE
+        }
     };
 
     loop {
         let m = if in_check {
             // In check: real ply for conthist evasion ordering
-            picker.next::<false>(&td.pos, &td.history, &td.cap_history, &td.pawn_history, &shared.tt, ply, &td.stack, stm)
+            picker.next::<false>(
+                &td.pos,
+                &td.history,
+                &td.cap_history,
+                &td.pawn_history,
+                &shared.tt,
+                ply,
+                &td.stack,
+                stm,
+            )
         } else {
             // Not in check: ply irrelevant since QSEARCH=true eliminates quiet stages
-            picker.next::<true>(&td.pos, &td.history, &td.cap_history, &td.pawn_history, &shared.tt, 0, &td.stack, stm)
+            picker.next::<true>(
+                &td.pos,
+                &td.history,
+                &td.cap_history,
+                &td.pawn_history,
+                &shared.tt,
+                0,
+                &td.stack,
+                stm,
+            )
         };
         if m == Move::NONE {
             break;
@@ -2656,7 +3241,9 @@ fn quiescence<NT: NodeType>(
             continue;
         }
 
-        shared.tt.prefetch(child_key(&td.pos, m, td.pos.board[m.from_sq().index()]));
+        shared
+            .tt
+            .prefetch(child_key(&td.pos, m, td.pos.board[m.from_sq().index()]));
 
         // The same blind spots the main search has (see the move loop there). This is
         // the one that matters most: a beginner who resolved every capture to the end
@@ -2691,7 +3278,11 @@ fn quiescence<NT: NodeType>(
 
         // Compute moved_pc early for history and the stack
         let moved_pc = td.pos.board[m.from_sq().index()];
-        debug_assert!(moved_pc != Piece::NONE, "qsearch: moved_pc is NONE for move {:?}", m);
+        debug_assert!(
+            moved_pc != Piece::NONE,
+            "qsearch: moved_pc is NONE for move {:?}",
+            m
+        );
 
         // QSearch SEE history-adjusted margin:
         // adjust the qsearch SEE threshold by the move's history score —
@@ -2714,13 +3305,41 @@ fn quiescence<NT: NodeType>(
             // Stage 1: material futility — capture can't raise score to alpha
             if futility_value <= alpha {
                 best_score = best_score.max(futility_value);
-                tr!(td, t, if t.qs_moves { t.mv(ply as u8, m.0, move_count, 255, crate::tree::A_QS_PRUNED, 0, 0); });
+                tr!(
+                    td,
+                    t,
+                    if t.qs_moves {
+                        t.mv(
+                            ply as u8,
+                            m.0,
+                            move_count,
+                            255,
+                            crate::tree::A_QS_PRUNED,
+                            0,
+                            0,
+                        );
+                    }
+                );
                 continue;
             }
             // Stage 2: SEE futility with adaptive threshold
             if !crate::see::see(&td.pos, m, alpha - futility_base) {
                 best_score = best_score.max(futility_base.min(alpha));
-                tr!(td, t, if t.qs_moves { t.mv(ply as u8, m.0, move_count, 255, crate::tree::A_QS_PRUNED, 1, 0); });
+                tr!(
+                    td,
+                    t,
+                    if t.qs_moves {
+                        t.mv(
+                            ply as u8,
+                            m.0,
+                            move_count,
+                            255,
+                            crate::tree::A_QS_PRUNED,
+                            1,
+                            0,
+                        );
+                    }
+                );
                 continue;
             }
         }
@@ -2728,16 +3347,38 @@ fn quiescence<NT: NodeType>(
         // SEE pruning in qsearch: threshold adjusted by the move's history score.
         // (CPW: Static Exchange Evaluation)
         if best_score > -SCORE_MATE_IN_MAX
-            && !crate::see::see(&td.pos, m, tune::QS_SEE_THRESHOLD() - qs_history / tune::QS_SEE_HIST_DIV())
+            && !crate::see::see(
+                &td.pos,
+                m,
+                tune::QS_SEE_THRESHOLD() - qs_history / tune::QS_SEE_HIST_DIV(),
+            )
         {
-            tr!(td, t, if t.qs_moves { t.mv(ply as u8, m.0, move_count, 255, crate::tree::A_QS_PRUNED, 2, 0); });
+            tr!(
+                td,
+                t,
+                if t.qs_moves {
+                    t.mv(
+                        ply as u8,
+                        m.0,
+                        move_count,
+                        255,
+                        crate::tree::A_QS_PRUNED,
+                        2,
+                        0,
+                    );
+                }
+            );
             continue;
         }
 
         // Move count limit in qsearch: at non-PV nodes, stop after a few captures to
         // prevent search explosion. Exempt checks and recaptures (tactically sharp).
         // (qsearch move count limiting)
-        if !NT::PV && !is_recapture && move_count >= tune::QS_MOVE_COUNT_LIMIT() as u32 && !td.pos.gives_check(m) {
+        if !NT::PV
+            && !is_recapture
+            && move_count >= tune::QS_MOVE_COUNT_LIMIT() as u32
+            && !td.pos.gives_check(m)
+        {
             break;
         }
 
@@ -2754,7 +3395,21 @@ fn quiescence<NT: NodeType>(
             td.nnue.push(m, &td.pos);
         }
         td.pos.make_move(m);
-        tr!(td, t, if t.qs_moves { t.mv(ply as u8, m.0, move_count, 255, crate::tree::A_QS_SEARCH, 0, 0); });
+        tr!(
+            td,
+            t,
+            if t.qs_moves {
+                t.mv(
+                    ply as u8,
+                    m.0,
+                    move_count,
+                    255,
+                    crate::tree::A_QS_SEARCH,
+                    0,
+                    0,
+                );
+            }
+        );
         let score = -quiescence::<NT>(td, shared, -beta, -alpha, ply + 1);
         td.pos.unmake_move(m);
         if nnue::network::has_network() {
@@ -2796,16 +3451,22 @@ fn quiescence<NT: NodeType>(
         {
             let mut check_buf: ArrayBuf<Move, MAX_MOVES> = ArrayBuf::new();
             let check_count = movegen::generate_legal_moves(&td.pos, &mut check_buf);
-            debug_assert!(check_count == 0,
+            debug_assert!(
+                check_count == 0,
                 "qsearch: mated_in but {} legal moves exist at ply {}",
-                check_count, ply);
+                check_count,
+                ply
+            );
         }
         tree_ret!(td, ply, crate::tree::X_QS_MATED, 0, mated_in(ply as i32));
     }
 
     // Qsearch should never return -INF unless in check
-    debug_assert!(best_score > -SCORE_INFINITE || in_check,
-        "qsearch: -INF score without being in check at ply {}", ply);
+    debug_assert!(
+        best_score > -SCORE_INFINITE || in_check,
+        "qsearch: -INF score without being in check at ply {}",
+        ply
+    );
 
     // Beta midpoint: reduce overestimation (½ blending)
     if best_score >= beta && !is_mate_score(best_score) {
@@ -2813,8 +3474,14 @@ fn quiescence<NT: NodeType>(
     }
 
     // Store to TT
-    let bound = if best_score >= beta { Bound::Lower } else { Bound::Upper };
-    shared.tt.store(td.pos.key, 0, raw_eval, best_score, bound, best_move, ply as i32, tt_pv);
+    let bound = if best_score >= beta {
+        Bound::Lower
+    } else {
+        Bound::Upper
+    };
+    shared.tt.store(
+        td.pos.key, 0, raw_eval, best_score, bound, best_move, ply as i32, tt_pv,
+    );
 
     tr!(td, t, t.exit(ply as u8, crate::tree::X_QS_NORMAL, crate::tree::bound_bits(bound), best_move.0, best_score, move_count, 0););
     best_score
@@ -2826,6 +3493,44 @@ mod tests {
     use crate::threads::SharedState;
     use crate::timeman::SearchLimits;
 
+    /// Only a plain centipawn score rides the display scale. Mate and tablebase values
+    /// mean something the win-rate model cannot express, and must survive untouched.
+    #[test]
+    fn format_score_normalizes_only_plain_scores() {
+        let pos = Position::from_fen("rnb1kbnr/pp1ppppp/8/8/8/8/PP1PPPPP/RNB1KBNR w KQkq - 0 1")
+            .unwrap();
+
+        assert_eq!(format_score(mate_in(5), &pos, true), "mate 3");
+        assert_eq!(format_score(mate_in(5), &pos, false), "mate 3");
+
+        let tb = crate::types::SCORE_TB_WIN_IN_MAX + 1;
+        assert_eq!(format_score(tb, &pos, true), "cp 20000");
+        assert_eq!(format_score(-tb, &pos, true), "cp -20000");
+
+        assert_eq!(format_score(300, &pos, false), "cp 300");
+        assert_eq!(
+            format_score(300, &pos, true),
+            format!("cp {}", crate::wdl::to_cp(300, &pos))
+        );
+    }
+
+    #[test]
+    fn the_wdl_suffix_is_empty_unless_asked_for() {
+        let pos = Position::from_fen("rnb1kbnr/pp1ppppp/8/8/8/8/PP1PPPPP/RNB1KBNR w KQkq - 0 1")
+            .unwrap();
+        assert_eq!(wdl_suffix(120, &pos, false), "");
+
+        let suffix = wdl_suffix(120, &pos, true);
+        let parts: Vec<i32> = suffix
+            .split_whitespace()
+            .skip(1)
+            .map(|n| n.parse().unwrap())
+            .collect();
+        assert!(suffix.starts_with(" wdl "), "unexpected suffix {suffix:?}");
+        assert_eq!(parts.len(), 3);
+        assert_eq!(parts.iter().sum::<i32>(), 1000);
+    }
+
     fn search_depth(fen: &str, depth: i32) -> (Move, i32) {
         // Full strength is a global, and the tests that weaken it run in parallel with
         // this one: without the lock they would hand this search a handicap.
@@ -2833,11 +3538,12 @@ mod tests {
         let pos = Position::from_fen(fen).unwrap();
         let shared = SharedState::new(4, 1);
         let mut td = ThreadData::new(0);
+        td.silent = true;
         // STOP is a process global and other tests leave it raised — an interface
         // engine dropped by its test aborts through it and nothing lowers it after.
         // Searching without clearing it returns the -infinity sentinel instantly.
         crate::threads::STOP.store(false, std::sync::atomic::Ordering::Relaxed);
-        td.prepare_search(&pos, &SearchLimits::Depth(depth));
+        td.prepare_search(&pos, &SearchLimits::depth(depth));
         shared.tt.new_search();
         search(&mut td, &shared);
         let best = td.best_move;
@@ -2853,10 +3559,11 @@ mod tests {
         let pos = Position::from_fen(fen).unwrap();
         let shared = SharedState::new(4, 1);
         let mut td = ThreadData::new(0);
+        td.silent = true;
         // Same residue as in `search_depth`: cleared, or the search never starts.
         crate::threads::STOP.store(false, std::sync::atomic::Ordering::Relaxed);
         skill::set(level, seed);
-        td.prepare_search(&pos, &SearchLimits::Depth(depth));
+        td.prepare_search(&pos, &SearchLimits::depth(depth));
         shared.tt.new_search();
         search(&mut td, &shared);
         skill::set(skill::FULL_STRENGTH, 0);
@@ -2873,9 +3580,11 @@ mod tests {
         // if the last move could ever be skipped — and two ordinary ones that are
         // neither mate nor stalemate and must not be reported as either.
         let corners = [
-            "7k/6Q1/8/8/8/8/8/K7 b - - 0 1",  // only Kxg7
-            "7K/8/8/8/8/8/1Q6/k7 b - - 0 1",  // only Kxb2
-            "4k3/8/4K3/4P3/8/8/8/8 b - - 0 1",
+            "7k/6Q1/8/8/8/8/8/K7 b - - 0 1", // only Kxg7
+            "7K/8/8/8/8/8/1Q6/k7 b - - 0 1", // only Kxb2
+            // Five pieces so 3+4 DTM cannot score a real mate and trip the assertion
+            // when another test has already loaded GaiaTB.
+            "4k3/ppp5/8/8/8/8/PPP5/4K3 w - - 0 1",
             "6k1/5ppp/8/8/8/8/5PPP/6K1 w - - 0 1",
         ];
         for fen in corners {
@@ -2890,9 +3599,15 @@ mod tests {
             for level in [1, 2, 3, 5, 8] {
                 for seed in [0, 0x1234, 0xdead_beef, 0x5eed_5eed] {
                     let (m, score, _) = search_at_level(fen, level, seed, 4);
-                    assert!(m.is_ok(), "level {level} seed {seed} found no move in {fen}");
+                    assert!(
+                        m.is_ok(),
+                        "level {level} seed {seed} found no move in {fen}"
+                    );
                     if legal == 1 {
-                        assert_eq!(m, only, "level {level} seed {seed} missed the only move in {fen}");
+                        assert_eq!(
+                            m, only,
+                            "level {level} seed {seed} missed the only move in {fen}"
+                        );
                     }
                     assert!(
                         score.abs() < SCORE_MATE_IN_MAX,
@@ -2916,9 +3631,13 @@ mod tests {
         }
         // A different seed is allowed to be a different opponent, and at the weak end
         // where the handicap actually bites it had better be one at least sometimes.
-        let seeds: Vec<Move> =
-            (0..8).map(|s| search_at_level(fen, 1, 0x1000 * s + 7, 4).0).collect();
-        assert!(seeds.iter().any(|&m| m != seeds[0]), "every seed played the same move");
+        let seeds: Vec<Move> = (0..8)
+            .map(|s| search_at_level(fen, 1, 0x1000 * s + 7, 4).0)
+            .collect();
+        assert!(
+            seeds.iter().any(|&m| m != seeds[0]),
+            "every seed played the same move"
+        );
     }
 
     /// A level looks exactly as far as its rung allows and no further, whatever budget
@@ -2937,7 +3656,7 @@ mod tests {
                 let mut td = ThreadData::new(0);
                 skill::set(level, seed * 0x9E37);
                 // Ask for far more than the rung permits: the rung must still win.
-                td.prepare_search(&pos, &SearchLimits::Depth(MAX_PLY as i32));
+                td.prepare_search(&pos, &SearchLimits::depth(MAX_PLY as i32));
                 shared.tt.new_search();
                 search(&mut td, &shared);
                 assert!(
@@ -2981,7 +3700,10 @@ mod tests {
     fn a_finished_game_is_answered_rather_than_crashed_on() {
         // Mate, then stalemate, from both colours.
         let over = [
-            ("rnb1kbnr/pppp1ppp/8/4p3/6Pq/5P2/PPPPP2P/RNBQKBNR w KQkq - 1 3", true),
+            (
+                "rnb1kbnr/pppp1ppp/8/4p3/6Pq/5P2/PPPPP2P/RNBQKBNR w KQkq - 1 3",
+                true,
+            ),
             ("7k/5Q2/6K1/8/8/8/8/8 b - - 0 1", false),
             ("k7/P7/K7/8/8/8/8/8 b - - 0 1", false),
         ];
@@ -3010,28 +3732,38 @@ mod tests {
 
     #[test]
     fn test_startpos_returns_move() {
-        let (m, _) = search_depth("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1", 4);
+        let (m, _) = search_depth(
+            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+            4,
+        );
         assert!(m.is_ok(), "Search should return a valid move");
     }
 
     #[test]
     fn soft_nodes_finish_the_iteration_hard_nodes_cut_it() {
         let _guard = skill::lock_level();
-        let pos = Position::from_fen(
-            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
-        ).unwrap();
+        let pos =
+            Position::from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1").unwrap();
 
         // Soft budget: the iteration that crosses it is allowed to finish,
         // so the search overshoots the budget but stays under the hard cap.
         let shared = SharedState::new(4, 1);
         let mut td = ThreadData::new(0);
         crate::threads::STOP.store(false, std::sync::atomic::Ordering::Relaxed);
-        td.prepare_search(&pos, &SearchLimits::SoftNodes { soft: 2000, hard: 200_000 });
+        td.prepare_search(&pos, &SearchLimits::soft_nodes(2000, 200_000));
         shared.tt.new_search();
         search(&mut td, &shared);
         assert!(td.best_move.is_ok(), "soft-node search must return a move");
-        assert!(td.nodes >= 2000, "budget crossed then finished: {} nodes", td.nodes);
-        assert!(td.nodes < 200_000, "hard cap never reached: {} nodes", td.nodes);
+        assert!(
+            td.nodes >= 2000,
+            "budget crossed then finished: {} nodes",
+            td.nodes
+        );
+        assert!(
+            td.nodes < 200_000,
+            "hard cap never reached: {} nodes",
+            td.nodes
+        );
         assert!(td.completed_depth >= 1);
 
         // Bare node limit stays hard: the search aborts within one 512-node
@@ -3039,11 +3771,15 @@ mod tests {
         let shared = SharedState::new(4, 1);
         let mut td = ThreadData::new(0);
         crate::threads::STOP.store(false, std::sync::atomic::Ordering::Relaxed);
-        td.prepare_search(&pos, &SearchLimits::Nodes(2000));
+        td.prepare_search(&pos, &SearchLimits::nodes(2000));
         shared.tt.new_search();
         search(&mut td, &shared);
         assert!(td.best_move.is_ok(), "hard-node search must return a move");
-        assert!(td.nodes <= 2000 + 1024, "hard limit overshot: {} nodes", td.nodes);
+        assert!(
+            td.nodes <= 2000 + 1024,
+            "hard limit overshot: {} nodes",
+            td.nodes
+        );
         crate::threads::STOP.store(false, std::sync::atomic::Ordering::Relaxed);
     }
 
@@ -3068,7 +3804,10 @@ mod tests {
         // Ke6, Qa1, black Kd8 — queen doesn't attack king
         let (mv, score) = search_depth("3k4/8/4K3/8/8/8/8/Q7 w - - 0 1", 10);
         assert!(mv.is_ok(), "KQK must find a move");
-        assert!(is_mate_score(score), "KQK must find mate score, got {score}");
+        assert!(
+            is_mate_score(score),
+            "KQK must find mate score, got {score}"
+        );
     }
 
     #[test]
@@ -3077,7 +3816,10 @@ mod tests {
         // (this is the exact bug scenario from the tournament game)
         let (mv, score) = search_depth("3k4/8/4K3/8/8/8/8/Q7 w - - 88 100", 10);
         assert!(mv.is_ok(), "KQK hmc=88 must find a move");
-        assert!(score > 10000, "KQK hmc=88 must be clearly winning, got {score}");
+        assert!(
+            score > 10000,
+            "KQK hmc=88 must be clearly winning, got {score}"
+        );
     }
 
     #[test]

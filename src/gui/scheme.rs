@@ -111,6 +111,7 @@ impl Scheme {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::assert_matches;
 
     #[test]
     fn schemes_use_distinct_variants_per_side() {
@@ -162,7 +163,7 @@ mod tests {
         // DEFAULT is 2 on Haiku builds; pin what 2 means so a reorder of the table
         // cannot silently hand that desktop a different theme.
         assert!(DEFAULT < SCHEMES.len());
-        assert!(matches!(SCHEMES[2].name, Key::SchemeHaiku));
+        assert_matches!(SCHEMES[2].name, Key::SchemeHaiku);
     }
 
     #[test]
