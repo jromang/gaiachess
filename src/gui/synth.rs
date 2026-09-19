@@ -166,7 +166,10 @@ mod tests {
     /// square wave crosses twice a period and that is all this needs to know.
     fn measured_hz(samples: &[f32]) -> f32 {
         let loud: Vec<f32> = samples.iter().copied().filter(|s| s.abs() > 0.02).collect();
-        let crossings = loud.windows(2).filter(|w| (w[0] < 0.0) != (w[1] < 0.0)).count();
+        let crossings = loud
+            .windows(2)
+            .filter(|w| (w[0] < 0.0) != (w[1] < 0.0))
+            .count();
         crossings as f32 * RATE as f32 / (2.0 * loud.len().max(1) as f32)
     }
 
@@ -207,7 +210,10 @@ mod tests {
             // Silence would pass the peak check on one stray sample; this catches a
             // clip that is a click and nothing else.
             let loud = rendered.iter().filter(|s| s.abs() > 0.1).count();
-            assert!(loud > 32, "{sfx:?} is {loud} loud samples, effectively silent");
+            assert!(
+                loud > 32,
+                "{sfx:?} is {loud} loud samples, effectively silent"
+            );
         }
     }
 

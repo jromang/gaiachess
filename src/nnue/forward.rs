@@ -17,8 +17,8 @@
 
 #![allow(unsafe_op_in_unsafe_fn)]
 
-use super::network::Aligned;
 use super::L1_SIZE;
+use super::network::Aligned;
 
 #[cfg(test)]
 use super::accumulator::Accumulator;
@@ -121,9 +121,7 @@ pub fn find_nnz(ft_out: &Aligned<[u8; L1_SIZE]>) -> ([u16; NNZ_SIZE], usize) {
     )),
     target_feature(enable = "avx512f,avx512bw,avx512vbmi2")
 )]
-pub unsafe fn find_nnz_compress512(
-    ft_out: &Aligned<[u8; L1_SIZE]>,
-) -> ([u16; NNZ_SIZE], usize) {
+pub unsafe fn find_nnz_compress512(ft_out: &Aligned<[u8; L1_SIZE]>) -> ([u16; NNZ_SIZE], usize) {
     use crate::nnue::simd::avx512 as simd;
     use std::arch::x86_64::*;
 
@@ -134,8 +132,8 @@ pub unsafe fn find_nnz_compress512(
     // L1_SIZE / (4 * 32) = 1024 / 128 = 8 iterations exactly.
     let increment = _mm512_set1_epi16(32);
     let mut base = _mm512_set_epi16(
-        31, 30, 29, 28, 27, 26, 25, 24, 23, 22, 21, 20, 19, 18, 17, 16,
-        15, 14, 13, 12, 11, 10,  9,  8,  7,  6,  5,  4,  3,  2,  1,  0,
+        31, 30, 29, 28, 27, 26, 25, 24, 23, 22, 21, 20, 19, 18, 17, 16, 15, 14, 13, 12, 11, 10, 9,
+        8, 7, 6, 5, 4, 3, 2, 1, 0,
     );
 
     let ptr = ft_out.0.as_ptr();
@@ -225,7 +223,10 @@ pub fn propagate_l1(
 
 /// L2 dense layer: f32 matmul + bias → squared activation.
 #[cfg(test)]
-pub fn propagate_l2(l1_out: &Aligned<[f32; 2 * L2_SIZE]>, bucket: usize) -> Aligned<[f32; L3_SIZE]> {
+pub fn propagate_l2(
+    l1_out: &Aligned<[f32; 2 * L2_SIZE]>,
+    bucket: usize,
+) -> Aligned<[f32; L3_SIZE]> {
     unsafe { k::propagate_l2(l1_out, bucket) }
 }
 
@@ -245,11 +246,11 @@ pub fn propagate_l3(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::accumulator::Accumulator;
-    use super::super::threats;
     use super::super::network;
-    use super::super::{FT_QUANT, FT_SHIFT, L1_SIZE, L1_NORMALISATION};
+    use super::super::threats;
+    use super::super::{FT_QUANT, FT_SHIFT, L1_NORMALISATION, L1_SIZE};
+    use super::*;
 
     /// Reference scalar activate_ft (natural order, asymmetric clamp).
     fn activate_ft_reference(
@@ -280,7 +281,9 @@ mod tests {
         for ig in 0..L1_SIZE / 4 {
             for b in 0..4 {
                 let input = ft_out[ig * 4 + b] as i32;
-                if input == 0 { continue; }
+                if input == 0 {
+                    continue;
+                }
                 for j in 0..L2_SIZE {
                     pre_act[j] += input * weights[ig][j * 4 + b] as i32;
                 }
@@ -288,8 +291,8 @@ mod tests {
         }
         let mut output = [0.0f32; 2 * L2_SIZE];
         for j in 0..L2_SIZE {
-            let val = pre_act[j] as f32 * L1_NORMALISATION
-                + network::params().l1_biases.0[bucket][j];
+            let val =
+                pre_act[j] as f32 * L1_NORMALISATION + network::params().l1_biases.0[bucket][j];
             let clamped = val.clamp(0.0, 1.0);
             output[j] = clamped;
             output[j + L2_SIZE] = (val * val).min(1.0); // min(val², 1)
@@ -336,7 +339,9 @@ mod tests {
         for stm in [Color::White, Color::Black] {
             let simd_out = activate_ft(&pst_acc, &combined, stm);
             let ref_out = activate_ft_reference(&pst_acc, &combined, stm);
-            let mismatches = (0..L1_SIZE).filter(|&i| simd_out.0[i] != ref_out[i]).count();
+            let mismatches = (0..L1_SIZE)
+                .filter(|&i| simd_out.0[i] != ref_out[i])
+                .count();
             if let Some(i) = (0..L1_SIZE).find(|&i| simd_out.0[i] != ref_out[i]) {
                 panic!(
                     "activate_ft disagrees with the reference at {i} (stm {stm:?}): \
@@ -361,7 +366,12 @@ mod tests {
             ft_out.0[i] = 1;
         }
         let (_, count) = find_nnz(&ft_out);
-        assert_eq!(count, L1_SIZE / 4, "all non-zero should have {} NNZ groups", L1_SIZE / 4);
+        assert_eq!(
+            count,
+            L1_SIZE / 4,
+            "all non-zero should have {} NNZ groups",
+            L1_SIZE / 4
+        );
     }
 
     #[test]
@@ -384,7 +394,9 @@ mod tests {
         for j in 0..2 * L2_SIZE {
             assert!(
                 (simd_out.0[j] - ref_out[j]).abs() < 1e-6,
-                "propagate_l1 zero mismatch at {j}: simd={}, ref={}", simd_out.0[j], ref_out[j]
+                "propagate_l1 zero mismatch at {j}: simd={}, ref={}",
+                simd_out.0[j],
+                ref_out[j]
             );
         }
     }
@@ -401,7 +413,9 @@ mod tests {
         for j in 0..2 * L2_SIZE {
             assert!(
                 (simd_out.0[j] - ref_out[j]).abs() < 1e-4,
-                "propagate_l1 mismatch at {j}: simd={}, ref={}", simd_out.0[j], ref_out[j]
+                "propagate_l1 mismatch at {j}: simd={}, ref={}",
+                simd_out.0[j],
+                ref_out[j]
             );
         }
     }
@@ -410,7 +424,11 @@ mod tests {
     fn test_nnz_table_correctness() {
         for byte in 0..256u16 {
             let entry = &NNZ_TABLE[byte as usize];
-            assert_eq!(entry.count, byte.count_ones() as usize, "NNZ_TABLE[{byte}] count");
+            assert_eq!(
+                entry.count,
+                byte.count_ones() as usize,
+                "NNZ_TABLE[{byte}] count"
+            );
             let mut j = 0;
             for bit in 0..8 {
                 if (byte & (1 << bit)) != 0 {
@@ -428,8 +446,11 @@ mod tests {
         // With zeroed weights the buffer should be all zeros.
         for pov in 0..2 {
             for i in 0..L1_SIZE {
-                assert_eq!(combined.0[pov][i], 0,
-                    "KK endgame should be 0, got {} at pov={pov} i={i}", combined.0[pov][i]);
+                assert_eq!(
+                    combined.0[pov][i], 0,
+                    "KK endgame should be 0, got {} at pov={pov} i={i}",
+                    combined.0[pov][i]
+                );
             }
         }
     }
@@ -438,7 +459,8 @@ mod tests {
     fn test_compute_full_threats_startpos() {
         let pos = crate::position::Position::from_fen(
             "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
-        ).unwrap();
+        )
+        .unwrap();
         let (combined, _psqt) = threats::compute_full_threats(&pos);
 
         if !crate::nnue::network::has_network() {

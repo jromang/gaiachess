@@ -30,8 +30,8 @@
 
 pub mod accumulator;
 pub mod features;
-pub mod integrity;
 pub(crate) mod forward;
+pub mod integrity;
 pub(crate) mod kernels;
 pub mod network;
 pub mod pawn_pairs;
@@ -194,8 +194,10 @@ impl Network {
         self.index = 0;
         self.accumulators[0].refresh_with_cache(pos, Color::White, &mut self.cache);
         self.accumulators[0].refresh_with_cache(pos, Color::Black, &mut self.cache);
-        debug_assert!(self.accumulators[0].accurate == [true; 2],
-            "NNUE refresh: PST accumulator not accurate after refresh");
+        debug_assert!(
+            self.accumulators[0].accurate == [true; 2],
+            "NNUE refresh: PST accumulator not accurate after refresh"
+        );
         // Full threat compute at root (no parent available)
         self.threat_acc[0].update_full(pos);
     }
@@ -206,10 +208,17 @@ impl Network {
     /// moved and captured pieces from the unmodified board.
     pub fn push(&mut self, mv: Move, pos: &Position) {
         debug_assert!(mv != Move::NONE, "NNUE push: MOVE_NONE");
-        debug_assert!(mv.from_sq().0 < 64 && mv.to_sq().0 < 64,
-            "NNUE push: squares OOB from={} to={}", mv.from_sq().0, mv.to_sq().0);
-        debug_assert!(pos.piece_on(mv.from_sq()) != Piece::NONE,
-            "NNUE push: no piece on from {}", mv.from_sq().0);
+        debug_assert!(
+            mv.from_sq().0 < 64 && mv.to_sq().0 < 64,
+            "NNUE push: squares OOB from={} to={}",
+            mv.from_sq().0,
+            mv.to_sq().0
+        );
+        debug_assert!(
+            pos.piece_on(mv.from_sq()) != Piece::NONE,
+            "NNUE push: no piece on from {}",
+            mv.from_sq().0
+        );
         self.index += 1;
         debug_assert!(self.index < self.accumulators.len());
 
@@ -253,8 +262,12 @@ impl Network {
 
     /// Lazily update the PST accumulator from the nearest accurate ancestor.
     pub fn ensure_updated(&mut self, pos: &Position) {
-        debug_assert!(self.index < self.accumulators.len(),
-            "NNUE ensure_updated: index {} >= len {}", self.index, self.accumulators.len());
+        debug_assert!(
+            self.index < self.accumulators.len(),
+            "NNUE ensure_updated: index {} >= len {}",
+            self.index,
+            self.accumulators.len()
+        );
 
         for &perspective in &[Color::White, Color::Black] {
             let pov = perspective.index();
@@ -273,7 +286,9 @@ impl Network {
                 }
                 None => {
                     self.accumulators[self.index].refresh_with_cache(
-                        pos, perspective, &mut self.cache,
+                        pos,
+                        perspective,
+                        &mut self.cache,
                     );
                 }
             }
@@ -281,8 +296,7 @@ impl Network {
     }
 
     pub fn evaluate(&mut self, pos: &Position) -> i32 {
-        debug_assert!(pos.checkers == 0,
-            "NNUE evaluate: called while in check");
+        debug_assert!(pos.checkers == 0, "NNUE evaluate: called while in check");
 
         self.ensure_all_updated(pos);
         self.forward(pos)
@@ -459,20 +473,25 @@ impl Clone for Network {
 pub fn output_bucket(pos: &Position) -> usize {
     let [wn, wb, wr, wq, div, max] = OUTPUT_BUCKET_SCHEME;
     let knights = (pos.pieces[Piece::WHITE_KNIGHT.index()]
-        | pos.pieces[Piece::BLACK_KNIGHT.index()]).count_ones() as usize;
+        | pos.pieces[Piece::BLACK_KNIGHT.index()])
+    .count_ones() as usize;
     let bishops = (pos.pieces[Piece::WHITE_BISHOP.index()]
-        | pos.pieces[Piece::BLACK_BISHOP.index()]).count_ones() as usize;
-    let rooks = (pos.pieces[Piece::WHITE_ROOK.index()]
-        | pos.pieces[Piece::BLACK_ROOK.index()]).count_ones() as usize;
-    let queens = (pos.pieces[Piece::WHITE_QUEEN.index()]
-        | pos.pieces[Piece::BLACK_QUEEN.index()]).count_ones() as usize;
+        | pos.pieces[Piece::BLACK_BISHOP.index()])
+    .count_ones() as usize;
+    let rooks = (pos.pieces[Piece::WHITE_ROOK.index()] | pos.pieces[Piece::BLACK_ROOK.index()])
+        .count_ones() as usize;
+    let queens = (pos.pieces[Piece::WHITE_QUEEN.index()] | pos.pieces[Piece::BLACK_QUEEN.index()])
+        .count_ones() as usize;
     let value = wn * knights + wb * bishops + wr * rooks + wq * queens;
     let bucket = (value / div).min(max);
-    debug_assert!(bucket < OUTPUT_BUCKETS,
-        "output_bucket: bucket {} >= OUTPUT_BUCKETS {}", bucket, OUTPUT_BUCKETS);
+    debug_assert!(
+        bucket < OUTPUT_BUCKETS,
+        "output_bucket: bucket {} >= OUTPUT_BUCKETS {}",
+        bucket,
+        OUTPUT_BUCKETS
+    );
     bucket
 }
-
 
 // ============================================================
 // Tests
@@ -496,7 +515,10 @@ mod tests {
     fn the_output_bucket_follows_material_value_not_piece_count() {
         let cases = [
             // startpos: (3*4 + 4*4 + 8*4 + 18*2) / 12 = 96/12 = 8 → capped at 7
-            ("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1", 7),
+            (
+                "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+                7,
+            ),
             // bare kings (pawns and kings are worth 0)
             ("4k3/8/8/8/8/8/8/4K3 w - - 0 1", 0),
             // king + 8 pawns each: still bucket 0
@@ -516,22 +538,23 @@ mod tests {
 
     #[test]
     fn test_evaluate_startpos() {
-        let pos = Position::from_fen(
-            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
-        ).unwrap();
+        let pos =
+            Position::from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1").unwrap();
         let mut net = Network::new();
         net.refresh(&pos);
 
         let score = net.evaluate(&pos);
         // Startpos is symmetric → score should be near 0 (small due to eval noise)
-        assert!(score.abs() < 500, "startpos eval should be near 0, got {score}");
+        assert!(
+            score.abs() < 500,
+            "startpos eval should be near 0, got {score}"
+        );
     }
 
     #[test]
     fn test_push_pop() {
-        let mut pos = Position::from_fen(
-            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
-        ).unwrap();
+        let mut pos =
+            Position::from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1").unwrap();
         let mut net = Network::new();
         net.refresh(&pos);
 
@@ -556,9 +579,8 @@ mod tests {
     fn test_refresh_vs_incremental() {
         // The key correctness test: for any move, refresh and incremental
         // should produce identical accumulator values.
-        let mut pos = Position::from_fen(
-            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
-        ).unwrap();
+        let mut pos =
+            Position::from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1").unwrap();
         let mut net = Network::new();
         net.refresh(&pos);
 
@@ -594,9 +616,8 @@ mod tests {
 
     #[test]
     fn test_output_bucket() {
-        let pos = Position::from_fen(
-            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
-        ).unwrap();
+        let pos =
+            Position::from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1").unwrap();
         let bucket = output_bucket(&pos);
         assert_eq!(bucket, 7, "startpos has 32 pieces → bucket 7");
 
@@ -767,9 +788,9 @@ mod tests {
     fn test_incremental_null_move() {
         // Lazy push_null: index advances but values are NOT cloned.
         // ensure_updated copies from parent on demand.
-        let mut pos = Position::from_fen(
-            "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq - 0 1",
-        ).unwrap();
+        let mut pos =
+            Position::from_fen("rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq - 0 1")
+                .unwrap();
         let mut net = Network::new();
         net.refresh(&pos);
 
@@ -792,8 +813,14 @@ mod tests {
         acc_ref.refresh(&pos, Color::Black);
 
         for i in 0..L1_SIZE {
-            assert_eq!(acc_w[i], acc_ref.values.0[0][i], "Null move: White mismatch at {i}");
-            assert_eq!(acc_b[i], acc_ref.values.0[1][i], "Null move: Black mismatch at {i}");
+            assert_eq!(
+                acc_w[i], acc_ref.values.0[0][i],
+                "Null move: White mismatch at {i}"
+            );
+            assert_eq!(
+                acc_b[i], acc_ref.values.0[1][i],
+                "Null move: Black mismatch at {i}"
+            );
         }
 
         pos.unmake_null_move();
@@ -804,9 +831,9 @@ mod tests {
     #[test]
     fn test_null_move_child_push() {
         // A real move after a null move pushes at parent_index+2 and updates correctly.
-        let mut pos = Position::from_fen(
-            "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq - 0 1",
-        ).unwrap();
+        let mut pos =
+            Position::from_fen("rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq - 0 1")
+                .unwrap();
         let mut net = Network::new();
         net.refresh(&pos);
 
@@ -846,18 +873,17 @@ mod tests {
     #[test]
     fn test_incremental_multi_move_sequence() {
         // Play a sequence of moves and check after each one
-        let mut pos = Position::from_fen(
-            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
-        ).unwrap();
+        let mut pos =
+            Position::from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1").unwrap();
         let mut net = Network::new();
         net.refresh(&pos);
 
         let moves = [
-            Move::new(Square::E2, Square::E4),  // 1. e4
-            Move::new(Square::E7, Square::E5),  // 1... e5
-            Move::new(Square::G1, Square::F3),  // 2. Nf3
-            Move::new(Square::B8, Square::C6),  // 2... Nc6
-            Move::new(Square::F1, Square::B5),  // 3. Bb5
+            Move::new(Square::E2, Square::E4), // 1. e4
+            Move::new(Square::E7, Square::E5), // 1... e5
+            Move::new(Square::G1, Square::F3), // 2. Nf3
+            Move::new(Square::B8, Square::C6), // 2... Nc6
+            Move::new(Square::F1, Square::B5), // 3. Bb5
         ];
 
         for (i, &mv) in moves.iter().enumerate() {
@@ -875,12 +901,16 @@ mod tests {
 
             for j in 0..L1_SIZE {
                 assert_eq!(
-                    inc_w[j], acc_ref.values.0[0][j],
-                    "Move {}: White mismatch at {j}", i + 1
+                    inc_w[j],
+                    acc_ref.values.0[0][j],
+                    "Move {}: White mismatch at {j}",
+                    i + 1
                 );
                 assert_eq!(
-                    inc_b[j], acc_ref.values.0[1][j],
-                    "Move {}: Black mismatch at {j}", i + 1
+                    inc_b[j],
+                    acc_ref.values.0[1][j],
+                    "Move {}: Black mismatch at {j}",
+                    i + 1
                 );
             }
         }
@@ -890,9 +920,7 @@ mod tests {
     fn test_incremental_king_move_triggers_refresh() {
         // King moves to different bucket → needs full refresh
         // King on e1 (file 4, bucket from KING_BUCKETS) → d2 (different bucket)
-        let mut pos = Position::from_fen(
-            "4k3/8/8/8/8/8/8/4K3 w - - 0 1",
-        ).unwrap();
+        let mut pos = Position::from_fen("4k3/8/8/8/8/8/8/4K3 w - - 0 1").unwrap();
         let mut net = Network::new();
         net.refresh(&pos);
 
@@ -911,8 +939,14 @@ mod tests {
         acc_ref.refresh(&pos, Color::Black);
 
         for i in 0..L1_SIZE {
-            assert_eq!(inc_w[i], acc_ref.values.0[0][i], "King move refresh: White at {i}");
-            assert_eq!(inc_b[i], acc_ref.values.0[1][i], "King move refresh: Black at {i}");
+            assert_eq!(
+                inc_w[i], acc_ref.values.0[0][i],
+                "King move refresh: White at {i}"
+            );
+            assert_eq!(
+                inc_b[i], acc_ref.values.0[1][i],
+                "King move refresh: Black at {i}"
+            );
         }
     }
 }

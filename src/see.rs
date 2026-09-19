@@ -20,12 +20,22 @@ const SEE_VALUE: [i32; 7] = [100, 320, 330, 500, 900, 20000, 0];
 /// the lint would have it, would compute all six of them every time round the loop.
 #[allow(clippy::blocks_in_conditions)]
 pub fn see(pos: &Position, m: Move, threshold: i32) -> bool {
-    debug_assert!(m.from_sq().0 < 64 && m.to_sq().0 < 64,
-        "SEE: squares OOB from={} to={}", m.from_sq().0, m.to_sq().0);
-    debug_assert!(pos.board[m.from_sq().index()] != Piece::NONE,
-        "SEE: no piece on from {}", m.from_sq().0);
-    debug_assert!(threshold.abs() < SCORE_MATE,
-        "SEE: threshold {} suspiciously large", threshold);
+    debug_assert!(
+        m.from_sq().0 < 64 && m.to_sq().0 < 64,
+        "SEE: squares OOB from={} to={}",
+        m.from_sq().0,
+        m.to_sq().0
+    );
+    debug_assert!(
+        pos.board[m.from_sq().index()] != Piece::NONE,
+        "SEE: no piece on from {}",
+        m.from_sq().0
+    );
+    debug_assert!(
+        threshold.abs() < SCORE_MATE,
+        "SEE: threshold {} suspiciously large",
+        threshold
+    );
 
     // Castling, en passant, and promotions are almost always good — skip SEE
     if m.move_type() != MT_NORMAL {
@@ -84,34 +94,49 @@ pub fn see(pos: &Position, m: Move, threshold: i32) -> bool {
 
         // Try each piece type from least to most valuable
         let mut bb;
-        if { bb = mine & pos.pieces[Piece::new(PieceType::Pawn, stm).index()]; bb != 0 } {
+        if {
+            bb = mine & pos.pieces[Piece::new(PieceType::Pawn, stm).index()];
+            bb != 0
+        } {
             v = SEE_VALUE[PieceType::Pawn as usize] - v;
             if v < result {
                 break;
             }
             occ ^= bb & bb.wrapping_neg();
             attackers |= bishop_attacks(to, occ) & diag;
-        } else if { bb = mine & pos.pieces[Piece::new(PieceType::Knight, stm).index()]; bb != 0 } {
+        } else if {
+            bb = mine & pos.pieces[Piece::new(PieceType::Knight, stm).index()];
+            bb != 0
+        } {
             v = SEE_VALUE[PieceType::Knight as usize] - v;
             if v < result {
                 break;
             }
             occ ^= bb & bb.wrapping_neg();
-        } else if { bb = mine & pos.pieces[Piece::new(PieceType::Bishop, stm).index()]; bb != 0 } {
+        } else if {
+            bb = mine & pos.pieces[Piece::new(PieceType::Bishop, stm).index()];
+            bb != 0
+        } {
             v = SEE_VALUE[PieceType::Bishop as usize] - v;
             if v < result {
                 break;
             }
             occ ^= bb & bb.wrapping_neg();
             attackers |= bishop_attacks(to, occ) & diag;
-        } else if { bb = mine & pos.pieces[Piece::new(PieceType::Rook, stm).index()]; bb != 0 } {
+        } else if {
+            bb = mine & pos.pieces[Piece::new(PieceType::Rook, stm).index()];
+            bb != 0
+        } {
             v = SEE_VALUE[PieceType::Rook as usize] - v;
             if v < result {
                 break;
             }
             occ ^= bb & bb.wrapping_neg();
             attackers |= rook_attacks(to, occ) & orth;
-        } else if { bb = mine & pos.pieces[Piece::new(PieceType::Queen, stm).index()]; bb != 0 } {
+        } else if {
+            bb = mine & pos.pieces[Piece::new(PieceType::Queen, stm).index()];
+            bb != 0
+        } {
             v = SEE_VALUE[PieceType::Queen as usize] - v;
             if v < result {
                 break;
@@ -145,7 +170,9 @@ mod tests {
         // White rook captures undefended black pawn on e5
         assert!(see_test(
             "1k1r4/1pp4p/p7/4p3/8/P5P1/1PP4P/2K1R3 w - - 0 1",
-            "e1", "e5", 0
+            "e1",
+            "e5",
+            0
         ));
     }
 
@@ -155,11 +182,15 @@ mod tests {
         // PxQ = +900, then NxP = -100, net = +800
         assert!(see_test(
             "4k3/8/3n4/3q4/4P3/8/8/4K3 w - - 0 1",
-            "e4", "d5", 0
+            "e4",
+            "d5",
+            0
         ));
         assert!(see_test(
             "4k3/8/3n4/3q4/4P3/8/8/4K3 w - - 0 1",
-            "e4", "d5", 800
+            "e4",
+            "d5",
+            800
         ));
     }
 
@@ -169,7 +200,9 @@ mod tests {
         // NxP = +100, RxN = -320, net = -220
         assert!(!see_test(
             "4k3/8/4r3/4p3/8/3N4/8/4K3 w - - 0 1",
-            "d3", "e5", 0
+            "d3",
+            "e5",
+            0
         ));
     }
 
@@ -177,10 +210,7 @@ mod tests {
     fn test_see_equal_exchange() {
         // Knight takes knight: NxN = +320, then defended?
         // White Nc3 captures Nd5, no other defenders
-        assert!(see_test(
-            "4k3/8/8/3n4/8/2N5/8/4K3 w - - 0 1",
-            "c3", "d5", 0
-        ));
+        assert!(see_test("4k3/8/8/3n4/8/2N5/8/4K3 w - - 0 1", "c3", "d5", 0));
     }
 
     #[test]
@@ -191,7 +221,9 @@ mod tests {
         // NxP = +100, RxN = -(320-100) net for black. For white: 100 - 320 = -220
         assert!(!see_test(
             "4k3/8/4r3/4p3/8/4N3/8/4K3 w - - 0 1",
-            "e3", "e5", 0
+            "e3",
+            "e5",
+            0
         ));
     }
 
@@ -199,14 +231,22 @@ mod tests {
     fn test_see_promotion_always_true() {
         // Promotions always return true (non-MT_NORMAL)
         let pos = Position::from_fen("4k3/4P3/8/8/8/8/8/4K3 w - - 0 1").unwrap();
-        let m = Move::new_promotion(Square::from_string("e7").unwrap(), Square::from_string("e8").unwrap(), PieceType::Queen);
+        let m = Move::new_promotion(
+            Square::from_string("e7").unwrap(),
+            Square::from_string("e8").unwrap(),
+            PieceType::Queen,
+        );
         assert!(see(&pos, m, 0));
     }
 
     #[test]
     fn test_see_castling_always_true() {
         let pos = Position::from_fen("r3k2r/pppppppp/8/8/8/8/PPPPPPPP/R3K2R w KQkq - 0 1").unwrap();
-        let m = Move::new_with_type(Square::from_string("e1").unwrap(), Square::from_string("h1").unwrap(), MT_CASTLING);
+        let m = Move::new_with_type(
+            Square::from_string("e1").unwrap(),
+            Square::from_string("h1").unwrap(),
+            MT_CASTLING,
+        );
         assert!(see(&pos, m, 0));
     }
 
@@ -215,19 +255,13 @@ mod tests {
         // White king captures black pawn on d2, defended by black rook on d8.
         // KxP = +100, Rd8xK — king can't capture if opponent has attackers.
         // SEE < 0.
-        assert!(!see_test(
-            "3rk3/8/8/8/8/8/3p4/3K4 w - - 0 1",
-            "d1", "d2", 0
-        ));
+        assert!(!see_test("3rk3/8/8/8/8/8/3p4/3K4 w - - 0 1", "d1", "d2", 0));
     }
 
     #[test]
     fn test_see_king_capture_undefended() {
         // White king captures undefended black pawn on d2. KxP = +100. SEE >= 0.
-        assert!(see_test(
-            "4k3/8/8/8/8/8/3p4/3K4 w - - 0 1",
-            "d1", "d2", 0
-        ));
+        assert!(see_test("4k3/8/8/8/8/8/3p4/3K4 w - - 0 1", "d1", "d2", 0));
     }
 
     #[test]
@@ -237,12 +271,16 @@ mod tests {
         // Rd2xPd5 = +100, Rd8xRd5 = -500, Qd1xRd5 = +500. Net = +100.
         assert!(see_test(
             "3rk3/8/8/3p4/8/8/3R4/3QK3 w - - 0 1",
-            "d2", "d5", 0
+            "d2",
+            "d5",
+            0
         ));
         // With threshold 100 it should still pass (net = 100)
         assert!(see_test(
             "3rk3/8/8/3p4/8/8/3R4/3QK3 w - - 0 1",
-            "d2", "d5", 100
+            "d2",
+            "d5",
+            100
         ));
     }
 }

@@ -177,7 +177,11 @@ const EDGE_ON: f32 = 0.02;
 
 impl BoardFlip {
     pub fn new() -> BoardFlip {
-        BoardFlip { t: 0.0, turned: false, done: false }
+        BoardFlip {
+            t: 0.0,
+            turned: false,
+            done: false,
+        }
     }
 
     /// Advances the turn. Returns true on the single step it passes through edge-on,

@@ -116,7 +116,11 @@ mod tests {
     #[test]
     fn schemes_use_distinct_variants_per_side() {
         for s in &SCHEMES {
-            assert_ne!(s.white_variant, s.black_variant, "{:?} reuses a variant", s.name);
+            assert_ne!(
+                s.white_variant, s.black_variant,
+                "{:?} reuses a variant",
+                s.name
+            );
             assert!(s.white_variant < super::super::assets::VARIANTS);
             assert!(s.black_variant < super::super::assets::VARIANTS);
         }
@@ -126,7 +130,11 @@ mod tests {
     fn luminance(c: Rgba) -> f32 {
         let channel = |shift: u32| {
             let v = ((c >> shift) & 0xff) as f32 / 255.0;
-            if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
+            if v <= 0.04045 {
+                v / 12.92
+            } else {
+                ((v + 0.055) / 1.055).powf(2.4)
+            }
         };
         0.2126 * channel(0) + 0.7152 * channel(8) + 0.0722 * channel(16)
     }
@@ -142,13 +150,25 @@ mod tests {
         // quieter has to mean less loud, not less legible. The band and the strip under
         // the board are the two grounds the HUD writes on.
         for s in &SCHEMES {
-            for (name, ink) in [("text", s.text), ("text_dim", s.text_dim), ("accent", s.accent)] {
+            for (name, ink) in [
+                ("text", s.text),
+                ("text_dim", s.text_dim),
+                ("accent", s.accent),
+            ] {
                 for (spot, ground) in [("bg", s.bg), ("panel_edge", s.panel_edge)] {
                     let ratio = contrast(ink, ground);
-                    assert!(ratio >= 4.5, "{:?}: {name} on {spot} is only {ratio:.1}:1", s.name);
+                    assert!(
+                        ratio >= 4.5,
+                        "{:?}: {name} on {spot} is only {ratio:.1}:1",
+                        s.name
+                    );
                 }
             }
-            assert!(contrast(s.text, s.panel) >= 4.5, "{:?}: text on panel", s.name);
+            assert!(
+                contrast(s.text, s.panel) >= 4.5,
+                "{:?}: text on panel",
+                s.name
+            );
             // And it does have to be the quieter of the two, or the pair says nothing.
             assert!(
                 contrast(s.text_dim, s.bg) < contrast(s.text, s.bg),

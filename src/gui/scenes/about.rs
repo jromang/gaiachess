@@ -50,8 +50,9 @@ const ROLL: &[Line] = &[
     Text(VERSION),
     Text("made with love"),
     Gap,
-    Head("author"),
+    Head("authors"),
     Text("jean-francois romang"),
+    Text("david rabel"),
     Link("jromang@protonmail.com"),
     Link("github.com/jromang/gaiachess"),
     Gap,
@@ -119,11 +120,12 @@ const ROLL: &[Line] = &[
     Gap,
     Head("licence"),
     Text("(c) 2003-2026 jean-francois"),
-    Text("romang. free software under the"),
-    Text("gnu general public licence,"),
-    Text("version 3 or later. it comes"),
-    Text("with no warranty. the source is"),
-    Text("on github: read it, change it,"),
+    Text("romang, david rabel. free"),
+    Text("software under the gnu general"),
+    Text("public licence, version 3 or"),
+    Text("later. it comes with no"),
+    Text("warranty. the source is on"),
+    Text("github: read it, change it,"),
     Text("pass it on under the same terms."),
     Gap,
     Head("pieces"),
@@ -254,15 +256,15 @@ impl About {
             scheme.panel_edge,
         );
 
-        font::print_centered(fb, t(Key::About, lang), FB_W as i32 / 2, HEAD_Y, scheme.accent);
+        font::print_centered(
+            fb,
+            t(Key::About, lang),
+            FB_W as i32 / 2,
+            HEAD_Y,
+            scheme.accent,
+        );
         for y in [RULE_TOP, RULE_FOOT] {
-            fb.rect(
-                PANEL_X + 4,
-                y,
-                PANEL_X + PANEL_W - 5,
-                y,
-                scheme.panel_edge,
-            );
+            fb.rect(PANEL_X + 4, y, PANEL_X + PANEL_W - 5, y, scheme.panel_edge);
         }
 
         // Clipped to the text column, so a line arriving or leaving is cut cleanly at
@@ -281,7 +283,13 @@ impl About {
         }
         fb.set_clip(clip);
 
-        font::print_centered(fb, t(Key::AboutHint, lang), FB_W as i32 / 2, FOOT_Y, scheme.tile_light);
+        font::print_centered(
+            fb,
+            t(Key::AboutHint, lang),
+            FB_W as i32 / 2,
+            FOOT_Y,
+            scheme.tile_light,
+        );
     }
 }
 
@@ -439,12 +447,16 @@ mod tests {
             "krystman",
             "lichess-org/chess-openings",
             "jean-francois romang",
+            "david rabel",
             "github.com/jromang/gaiachess",
             "jromang@protonmail.com",
             "lexaloffle.com/bbs/?tid=31213",
             "general public licence",
         ] {
-            assert!(all.contains(owed), "{owed:?} is missing from the about roll");
+            assert!(
+                all.contains(owed),
+                "{owed:?} is missing from the about roll"
+            );
         }
     }
 }

@@ -11,8 +11,9 @@
 //! Nesting notes for the parser:
 //! - Singular-extension verification searches run at the SAME ply as their
 //!   parent (Enter flag `F_EXCLUDED`).
-//! - Razoring and NMP verification drop into quiescence at the same ply; the
-//!   qsearch subtree nests between the node's Enter and its Exit.
+//! - Razoring drops into quiescence at the same ply. NMP verification runs a
+//!   second alpha-beta search at the same ply. Both subtrees nest between the
+//!   node's Enter and its Exit.
 //! - Nodes are recorded only after the node counter increments; early returns
 //!   before that point (stop, ply overflow, leaf-to-qsearch dispatch) emit
 //!   nothing.
@@ -66,6 +67,7 @@ pub const A_NULL_SEARCH: u8 = 12;
 pub const A_SE_VERIF: u8 = 13;
 pub const A_QS_SEARCH: u8 = 14;
 pub const A_QS_PRUNED: u8 = 15;
+pub const A_NMP_VERIF: u8 = 16;
 
 // ─── Exit reasons ───────────────────────────────────────────────────────────
 pub const X_NORMAL: u8 = 0;
@@ -363,8 +365,7 @@ mod imp {
             out.extend_from_slice(MAGIC);
             out.extend_from_slice(&VERSION.to_le_bytes());
             out.extend_from_slice(&(RECORD_SIZE as u16).to_le_bytes());
-            let flags: u32 =
-                (self.qs_moves as u32) | ((self.truncated as u32) << 1);
+            let flags: u32 = (self.qs_moves as u32) | ((self.truncated as u32) << 1);
             out.extend_from_slice(&flags.to_le_bytes());
             out.extend_from_slice(&self.min_record_depth.to_le_bytes());
             out.extend_from_slice(&(fen.len() as u16).to_le_bytes());
@@ -399,7 +400,16 @@ mod imp {
         fn test_golden_records() {
             let mut t = TreeRec::new(1 << 20, 0, false);
             t.enter(3, 7, F_PV | F_IN_CHECK, -150, 200);
-            t.eval(3, 42, 40, 0x1234, 55, 50, 6, EF_TT_HIT | (3 << 1) | EF_IMPROVING);
+            t.eval(
+                3,
+                42,
+                40,
+                0x1234,
+                55,
+                50,
+                6,
+                EF_TT_HIT | (3 << 1) | EF_IMPROVING,
+            );
             t.mv(3, 0x1234, 1, 0, A_SEARCH_LMR, 2048, 5);
             t.exit(3, X_NORMAL, 2, 0x1234, 60, 12, 7);
             assert_eq!(t.records, 4);
@@ -416,12 +426,31 @@ mod imp {
             );
             assert_eq!(
                 &b[32..48],
-                &[3, 3, 0x34, 0x12, 1, 0, A_SEARCH_LMR, 5, 0x00, 0x08, 0, 0, 0, 0, 0, 0],
+                &[
+                    3,
+                    3,
+                    0x34,
+                    0x12,
+                    1,
+                    0,
+                    A_SEARCH_LMR,
+                    5,
+                    0x00,
+                    0x08,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0
+                ],
                 "Move record"
             );
             assert_eq!(
                 &b[48..64],
-                &[4, 3, X_NORMAL, 2, 0x34, 0x12, 60, 0, 12, 7, 0, 0, 0, 0, 0, 0],
+                &[
+                    4, 3, X_NORMAL, 2, 0x34, 0x12, 60, 0, 12, 7, 0, 0, 0, 0, 0, 0
+                ],
                 "Exit record"
             );
         }
@@ -474,7 +503,8 @@ mod imp {
             let flags = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
             assert_eq!(flags & 1, 1, "qs_moves flag");
             assert_eq!(&data[data.len() - 16..data.len() - 12], b"GEND");
-            let count = u64::from_le_bytes(data[data.len() - 12..data.len() - 4].try_into().unwrap());
+            let count =
+                u64::from_le_bytes(data[data.len() - 12..data.len() - 4].try_into().unwrap());
             assert_eq!(count, 2);
             std::fs::remove_file(path).ok();
         }

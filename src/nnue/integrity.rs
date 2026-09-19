@@ -25,9 +25,8 @@
 use super::features::KING_BUCKETS;
 use super::network::{FILE_PERM, NNUE_FILE_SIZE};
 use super::{
-    FT_SIZE, INPUT_BUCKETS, L1_QUANT, L1_SIZE, L2_SIZE, L3_SIZE, NETWORK_SCALE,
-    OUTPUT_BUCKETS, OUTPUT_BUCKET_SCHEME, FT_QUANT, PAWN_PAIR_SIZE, PSQT_QUANT,
-    THREAT_INPUT_SIZE,
+    FT_QUANT, FT_SIZE, INPUT_BUCKETS, L1_QUANT, L1_SIZE, L2_SIZE, L3_SIZE, NETWORK_SCALE,
+    OUTPUT_BUCKET_SCHEME, OUTPUT_BUCKETS, PAWN_PAIR_SIZE, PSQT_QUANT, THREAT_INPUT_SIZE,
 };
 
 /// Size of the integrity footer appended to the payload.
@@ -256,7 +255,11 @@ mod tests {
 
         let bare = content_hash(&data);
         assert_eq!(bare, fnv1a64(&data));
-        assert_eq!(content_hash(&footered), bare, "footer must carry the payload digest");
+        assert_eq!(
+            content_hash(&footered),
+            bare,
+            "footer must carry the payload digest"
+        );
 
         // Legacy padding is not payload: it must not move the name.
         let mut padded = data.clone();

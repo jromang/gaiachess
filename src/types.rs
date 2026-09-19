@@ -114,7 +114,11 @@ impl Piece {
 
     #[inline(always)]
     pub const fn color(self) -> Color {
-        if self.0 & 1 == 0 { Color::White } else { Color::Black }
+        if self.0 & 1 == 0 {
+            Color::White
+        } else {
+            Color::Black
+        }
     }
 
     #[inline(always)]
@@ -123,7 +127,9 @@ impl Piece {
     }
 
     pub fn to_char(self) -> char {
-        const CHARS: [char; 13] = ['P', 'p', 'N', 'n', 'B', 'b', 'R', 'r', 'Q', 'q', 'K', 'k', '.'];
+        const CHARS: [char; 13] = [
+            'P', 'p', 'N', 'n', 'B', 'b', 'R', 'r', 'Q', 'q', 'K', 'k', '.',
+        ];
         CHARS[self.0 as usize]
     }
 
@@ -293,7 +299,12 @@ impl std::fmt::Display for Square {
         if *self == Square::NONE {
             return f.write_str("-");
         }
-        write!(f, "{}{}", (b'a' + self.file()) as char, (b'1' + self.rank()) as char)
+        write!(
+            f,
+            "{}{}",
+            (b'a' + self.file()) as char,
+            (b'1' + self.rank()) as char
+        )
     }
 }
 
@@ -473,7 +484,9 @@ impl<T: Copy, const N: usize> ArrayBuf<T, N> {
     /// Create a new uninitialized buffer.
     #[inline(always)]
     pub const fn new() -> Self {
-        Self { data: [const { std::mem::MaybeUninit::uninit() }; N] }
+        Self {
+            data: [const { std::mem::MaybeUninit::uninit() }; N],
+        }
     }
 
     #[inline(always)]
@@ -539,7 +552,9 @@ pub const CASTLING_NB: usize = 4;
 /// Index of a single right bit (1, 2, 4, 8) into the 4-slot castling tables.
 #[inline(always)]
 pub const fn castling_idx(right: u8) -> usize {
-    debug_assert!(right == WHITE_OO || right == WHITE_OOO || right == BLACK_OO || right == BLACK_OOO);
+    debug_assert!(
+        right == WHITE_OO || right == WHITE_OOO || right == BLACK_OO || right == BLACK_OOO
+    );
     right.trailing_zeros() as usize
 }
 
@@ -551,8 +566,6 @@ pub const fn castling_rights_for(us: Color) -> (u8, u8) {
         Color::Black => (BLACK_OO, BLACK_OOO),
     }
 }
-
-
 
 // ============================================================
 // Direction constants (square index offsets on the 8x8 board)
@@ -600,21 +613,70 @@ pub const SCORE_TB_WIN_IN_MAX: i32 = SCORE_TB_WIN - MAX_PLY as i32;
 /// Score for "TB win at `ply` plies from root".
 #[allow(dead_code)]
 #[inline(always)]
-pub const fn tb_win_in(ply: i32) -> i32 { SCORE_TB_WIN - ply }
+pub const fn tb_win_in(ply: i32) -> i32 {
+    SCORE_TB_WIN - ply
+}
 
 /// Score for "TB loss at `ply` plies from root".
 #[allow(dead_code)]
 #[inline(always)]
-pub const fn tb_loss_in(ply: i32) -> i32 { -SCORE_TB_WIN + ply }
+pub const fn tb_loss_in(ply: i32) -> i32 {
+    -SCORE_TB_WIN + ply
+}
 
 /// Score for "mating the opponent in `ply` plies from root".
 #[allow(dead_code)]
 #[inline(always)]
-pub const fn mate_in(ply: i32) -> i32 { SCORE_MATE - ply }
+pub const fn mate_in(ply: i32) -> i32 {
+    SCORE_MATE - ply
+}
 
 /// Score for "being mated in `ply` plies from root".
 #[inline(always)]
-pub const fn mated_in(ply: i32) -> i32 { -SCORE_MATE + ply }
+pub const fn mated_in(ply: i32) -> i32 {
+    -SCORE_MATE + ply
+}
+
+/// Convert a tablebase DTM (halfmoves, STM-relative) at `ply` from root into a
+/// negamax score that always stays in the mate or TB bands.
+///
+/// Positive `dtm` = side to move wins. Distances that fit in [`MAX_PLY`] stay
+/// mates and print as `mate N`. Longer ones become TB wins and print as
+/// `cp ±20000` — never a raw centipawn leak (a 400-move tablebase mate used to
+/// come out as `cp 31200`).
+///
+/// A distance of zero means the side to move is checkmated right now — no
+/// table encodes a draw as a distance, the callers map their draw value before
+/// getting here. It used to come back as 0, i.e. a draw: the child of a mating
+/// move was then scored as equal by any probe that reached it, so the engine
+/// discarded mates in one for "mates in two" for dozens of moves on end.
+#[inline(always)]
+pub fn dtm_score(ply: i32, dtm: i32) -> i32 {
+    debug_assert!(ply >= 0, "dtm_score: negative ply {ply}");
+    if dtm == 0 {
+        return mated_in(ply);
+    }
+    let dist = ply.saturating_add(dtm.unsigned_abs() as i32);
+    let score = if dist <= MAX_PLY as i32 {
+        if dtm > 0 {
+            mate_in(dist)
+        } else {
+            mated_in(dist)
+        }
+    } else {
+        let ply = ply.min(MAX_PLY as i32);
+        if dtm > 0 {
+            tb_win_in(ply)
+        } else {
+            tb_loss_in(ply)
+        }
+    };
+    debug_assert!(
+        is_mate_score(score) || is_tb_score(score),
+        "dtm_score: {score} left the mate/TB bands (ply {ply}, dtm {dtm})"
+    );
+    score
+}
 
 /// Returns true if `score` represents a forced mate (either side).
 #[inline(always)]
@@ -626,8 +688,61 @@ pub const fn is_mate_score(score: i32) -> bool {
 #[allow(dead_code)]
 #[inline(always)]
 pub const fn is_tb_score(score: i32) -> bool {
-    score.unsigned_abs() >= SCORE_TB_WIN_IN_MAX as u32
-        && !is_mate_score(score)
+    score.unsigned_abs() >= SCORE_TB_WIN_IN_MAX as u32 && !is_mate_score(score)
+}
+
+/// Returns true if `score` is a proven win for the side to move: a mate or a
+/// tablebase win. Such scores carry no evaluation information and must not
+/// feed any static-eval-based pruning, extension or score blending.
+#[inline(always)]
+pub const fn is_win(score: i32) -> bool {
+    score >= SCORE_TB_WIN_IN_MAX
+}
+
+/// Returns true if `score` is a proven loss for the side to move (mated or
+/// tablebase loss).
+#[inline(always)]
+pub const fn is_loss(score: i32) -> bool {
+    score <= -SCORE_TB_WIN_IN_MAX
+}
+
+/// Returns true if `score` is decisive either way: mate or tablebase, win or
+/// loss. `-SCORE_INFINITE` counts as a loss, so a fresh `best_score` is
+/// decisive until a move has actually been searched.
+#[inline(always)]
+pub const fn is_decisive(score: i32) -> bool {
+    is_win(score) || is_loss(score)
+}
+
+/// The value `score_from_tt` hands back for a mate or tablebase result that the
+/// 50-move rule may void before it happens: one below the tablebase band, the
+/// best score that proves nothing. See [`is_beyond_eval`].
+pub const SCORE_UNPROVEN_WIN: i32 = SCORE_TB_WIN_IN_MAX - 1;
+
+/// Returns true if `score` is a proven win or the unproven-win sentinel.
+#[inline(always)]
+pub const fn is_win_or_unproven(score: i32) -> bool {
+    score >= SCORE_UNPROVEN_WIN
+}
+
+/// Returns true if `score` is a proven loss or the unproven-loss sentinel.
+#[inline(always)]
+pub const fn is_loss_or_unproven(score: i32) -> bool {
+    score <= -SCORE_UNPROVEN_WIN
+}
+
+/// Returns true if `score` is not an evaluation at all: a mate, a tablebase
+/// result, or the sentinel a transposition-table read leaves in place of one
+/// it cannot vouch for. The pruning guards test this rather than
+/// [`is_decisive`]: the sentinel sits one point outside the tablebase band, so
+/// it passed every guard, and a bound equal to it made reverse futility and
+/// the fail-high blend return `(eval + beta) / 2` — a number halfway between an
+/// evaluation and a proof, stored in the table as if it were either (issues
+/// #19, #21). Only the guards use it; ply adjustment, root ranking and the
+/// thread vote keep the exact bands.
+#[inline(always)]
+pub const fn is_beyond_eval(score: i32) -> bool {
+    is_win_or_unproven(score) || is_loss_or_unproven(score)
 }
 
 /// MVV-LVA piece values indexed by `PieceType` (Pawn=0..King=5, None=6).
@@ -640,6 +755,73 @@ pub const PIECE_VALUE: [i32; 7] = [100, 320, 330, 500, 900, 20000, 0];
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dtm_score_short_stays_mate() {
+        assert_eq!(dtm_score(0, 13), mate_in(13));
+        assert_eq!(dtm_score(0, -13), mated_in(13));
+        assert!(is_mate_score(dtm_score(0, 13)));
+        assert!(is_mate_score(dtm_score(50, 78))); // dist == MAX_PLY: still a mate
+        assert_eq!(dtm_score(5, 0), mated_in(5));
+        assert_eq!(dtm_score(3, 1), mate_in(4));
+        assert_eq!(dtm_score(3, -2), mated_in(5));
+    }
+
+    /// The mated side has no distance to go: zero is the mate itself, never a draw.
+    #[test]
+    fn dtm_score_zero_is_checkmated_now() {
+        for ply in [0, 1, 7, 42] {
+            assert_eq!(dtm_score(ply, 0), mated_in(ply));
+            assert!(is_mate_score(dtm_score(ply, 0)));
+        }
+        assert!(
+            dtm_score(1, 0) < dtm_score(1, -1),
+            "mated now is worse than mated next ply"
+        );
+    }
+
+    #[test]
+    fn dtm_score_long_becomes_tb() {
+        // 800 plies is a routine 6-piece mate and used to print as cp 31200.
+        let win = dtm_score(0, 800);
+        let loss = dtm_score(0, -800);
+        assert!(
+            is_tb_score(win),
+            "long DTM must stay in the TB band, got {win}"
+        );
+        assert!(
+            is_tb_score(loss),
+            "long DTM loss must stay in the TB band, got {loss}"
+        );
+        assert_eq!(win, tb_win_in(0));
+        assert_eq!(loss, tb_loss_in(0));
+        assert_eq!(dtm_score(50, 79), tb_win_in(50)); // dist == MAX_PLY + 1
+    }
+
+    #[test]
+    fn dtm_score_never_leaves_the_bands() {
+        for ply in [0, 1, 50, 127, 128, 200] {
+            for dtm in [0, 1, 13, 83, 128, 129, 257, 258, 800, 2000, -1, -83, -800] {
+                let s = dtm_score(ply, dtm);
+                if dtm == 0 {
+                    assert_eq!(s, mated_in(ply), "ply {ply} checkmated now");
+                } else {
+                    assert!(
+                        is_mate_score(s) || is_tb_score(s),
+                        "ply {ply} dtm {dtm} -> {s}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dtm_score_prefers_shorter_wins() {
+        assert!(dtm_score(0, 5) > dtm_score(0, 20));
+        assert!(dtm_score(0, 20) > dtm_score(0, 800));
+        assert!(dtm_score(0, 800) > 0);
+        assert!(dtm_score(0, -800) < 0);
+    }
 
     #[test]
     fn test_square_encoding() {

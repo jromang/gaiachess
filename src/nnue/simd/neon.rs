@@ -16,6 +16,8 @@ pub const I16_LANES: usize = size_of::<int16x8_t>() / size_of::<i16>();
 pub const I32_LANES: usize = size_of::<int32x4_t>() / size_of::<i32>();
 /// Number of f32 elements per SIMD register.
 pub const F32_LANES: usize = size_of::<float32x4_t>() / size_of::<f32>();
+/// Emulated widening multiply: one chain. Dot-prod overrides this to 3.
+pub const DPBUSD_CHAINS: usize = 1;
 
 // ============================================================
 // i16 operations (accumulator, FT activation)

@@ -190,7 +190,11 @@ impl Accumulator {
         let mut n_features = 0;
 
         for pc in 0..12u8 {
-            let piece_color = if pc & 1 == 0 { Color::White } else { Color::Black };
+            let piece_color = if pc & 1 == 0 {
+                Color::White
+            } else {
+                Color::Black
+            };
             let piece_type = match pc >> 1 {
                 0 => PieceType::Pawn,
                 1 => PieceType::Knight,
@@ -278,28 +282,78 @@ impl Accumulator {
                 let rook_from = to;
                 let king_to = mv.castle_king_to();
                 let rook_to = mv.castle_rook_to();
-                let sub1 = features::feature_index(piece_color, PieceType::King, from, king_sq, perspective);
-                let sub2 = features::feature_index(piece_color, PieceType::Rook, rook_from, king_sq, perspective);
-                let add1 = features::feature_index(piece_color, PieceType::King, king_to, king_sq, perspective);
-                let add2 = features::feature_index(piece_color, PieceType::Rook, rook_to, king_sq, perspective);
+                let sub1 = features::feature_index(
+                    piece_color,
+                    PieceType::King,
+                    from,
+                    king_sq,
+                    perspective,
+                );
+                let sub2 = features::feature_index(
+                    piece_color,
+                    PieceType::Rook,
+                    rook_from,
+                    king_sq,
+                    perspective,
+                );
+                let add1 = features::feature_index(
+                    piece_color,
+                    PieceType::King,
+                    king_to,
+                    king_sq,
+                    perspective,
+                );
+                let add2 = features::feature_index(
+                    piece_color,
+                    PieceType::Rook,
+                    rook_to,
+                    king_sq,
+                    perspective,
+                );
                 self.apply_add2_sub2(prev, pov, add1, add2, sub1, sub2);
             }
             MT_EN_PASSANT => {
                 // Pawn moves, captured pawn removed from different square
                 let cap_sq = Square(to.0 ^ 8); // captured pawn is one rank behind
-                let sub1 = features::feature_index(piece_color, PieceType::Pawn, from, king_sq, perspective);
-                let sub2 = features::feature_index(!piece_color, PieceType::Pawn, cap_sq, king_sq, perspective);
-                let add1 = features::feature_index(piece_color, PieceType::Pawn, to, king_sq, perspective);
+                let sub1 = features::feature_index(
+                    piece_color,
+                    PieceType::Pawn,
+                    from,
+                    king_sq,
+                    perspective,
+                );
+                let sub2 = features::feature_index(
+                    !piece_color,
+                    PieceType::Pawn,
+                    cap_sq,
+                    king_sq,
+                    perspective,
+                );
+                let add1 =
+                    features::feature_index(piece_color, PieceType::Pawn, to, king_sq, perspective);
                 self.apply_add1_sub2(prev, pov, add1, sub1, sub2);
             }
             MT_PROMOTION => {
                 let promo_type = mv.promo_type();
-                let sub1 = features::feature_index(piece_color, PieceType::Pawn, from, king_sq, perspective);
-                let add1 = features::feature_index(piece_color, promo_type, to, king_sq, perspective);
+                let sub1 = features::feature_index(
+                    piece_color,
+                    PieceType::Pawn,
+                    from,
+                    king_sq,
+                    perspective,
+                );
+                let add1 =
+                    features::feature_index(piece_color, promo_type, to, king_sq, perspective);
 
                 if captured != Piece::NONE {
                     // Promotion-capture
-                    let sub2 = features::feature_index(captured.color(), captured.piece_type(), to, king_sq, perspective);
+                    let sub2 = features::feature_index(
+                        captured.color(),
+                        captured.piece_type(),
+                        to,
+                        king_sq,
+                        perspective,
+                    );
                     self.apply_add1_sub2(prev, pov, add1, sub1, sub2);
                 } else {
                     // Promotion without capture
@@ -308,11 +362,19 @@ impl Accumulator {
             }
             _ => {
                 // Normal move or normal capture
-                let sub1 = features::feature_index(piece_color, piece_type, from, king_sq, perspective);
-                let add1 = features::feature_index(piece_color, piece_type, to, king_sq, perspective);
+                let sub1 =
+                    features::feature_index(piece_color, piece_type, from, king_sq, perspective);
+                let add1 =
+                    features::feature_index(piece_color, piece_type, to, king_sq, perspective);
 
                 if captured != Piece::NONE {
-                    let sub2 = features::feature_index(captured.color(), captured.piece_type(), to, king_sq, perspective);
+                    let sub2 = features::feature_index(
+                        captured.color(),
+                        captured.piece_type(),
+                        to,
+                        king_sq,
+                        perspective,
+                    );
                     self.apply_add1_sub2(prev, pov, add1, sub1, sub2);
                 } else {
                     self.apply_add1_sub1(prev, pov, add1, sub1);
@@ -360,8 +422,12 @@ impl Accumulator {
     /// Capture / EP: one feature added, two removed.
     #[inline]
     fn apply_add1_sub2(
-        &mut self, prev: &Accumulator, pov: usize,
-        add1: usize, sub1: usize, sub2: usize,
+        &mut self,
+        prev: &Accumulator,
+        pov: usize,
+        add1: usize,
+        sub1: usize,
+        sub2: usize,
     ) {
         let vacc = self.values.0[pov].as_mut_ptr();
         let vprev = prev.values.0[pov].as_ptr();
@@ -372,8 +438,13 @@ impl Accumulator {
     /// Castling: two features added, two removed.
     #[inline]
     fn apply_add2_sub2(
-        &mut self, prev: &Accumulator, pov: usize,
-        add1: usize, add2: usize, sub1: usize, sub2: usize,
+        &mut self,
+        prev: &Accumulator,
+        pov: usize,
+        add1: usize,
+        add2: usize,
+        sub1: usize,
+        sub2: usize,
     ) {
         let vacc = self.values.0[pov].as_mut_ptr();
         let vprev = prev.values.0[pov].as_ptr();
@@ -414,7 +485,11 @@ impl Accumulator {
         let mut n_subs = 0usize;
 
         for pc in 0..12u8 {
-            let piece_color = if pc & 1 == 0 { Color::White } else { Color::Black };
+            let piece_color = if pc & 1 == 0 {
+                Color::White
+            } else {
+                Color::Black
+            };
             let piece_type = match pc >> 1 {
                 0 => PieceType::Pawn,
                 1 => PieceType::Knight,
@@ -447,7 +522,13 @@ impl Accumulator {
         }
 
         // Apply delta with SIMD register blocking
-        unsafe { dispatch::finny_apply(entry.values.0.as_mut_ptr(), &adds[..n_adds], &subs[..n_subs]) };
+        unsafe {
+            dispatch::finny_apply(
+                entry.values.0.as_mut_ptr(),
+                &adds[..n_adds],
+                &subs[..n_subs],
+            )
+        };
 
         // PSQT head: same diff, scalar (8 i32 per feature)
         let params = network::params();
@@ -477,8 +558,6 @@ impl Accumulator {
 // ============================================================
 // Helpers
 // ============================================================
-
-
 
 /// Check whether we can incrementally update from an ancestor ply,
 /// or if a full refresh is needed.
@@ -531,7 +610,8 @@ mod tests {
 
     #[test]
     fn test_refresh_startpos() {
-        let pos = Position::from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1").unwrap();
+        let pos =
+            Position::from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1").unwrap();
         let mut acc = Accumulator::new();
         acc.refresh(&pos, Color::White);
         acc.refresh(&pos, Color::Black);
@@ -630,10 +710,7 @@ mod tests {
 
     #[test]
     fn test_finny_cold_cache_endgame() {
-        assert_finny_matches_refresh(
-            "4k3/8/8/8/8/8/8/4K3 w - - 0 1",
-            "KK endgame",
-        );
+        assert_finny_matches_refresh("4k3/8/8/8/8/8/8/4K3 w - - 0 1", "KK endgame");
     }
 
     #[test]
@@ -648,12 +725,10 @@ mod tests {
     fn test_finny_warm_cache() {
         // Use cache with pos1, then refresh with pos2 (1 pawn moved).
         // The warm cache should produce correct results via delta.
-        let pos1 = Position::from_fen(
-            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
-        ).unwrap();
-        let pos2 = Position::from_fen(
-            "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq - 0 1",
-        ).unwrap();
+        let pos1 =
+            Position::from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1").unwrap();
+        let pos2 = Position::from_fen("rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq - 0 1")
+            .unwrap();
         let mut cache = FinnyTable::new();
 
         // Warm the cache with pos1
@@ -675,19 +750,18 @@ mod tests {
                 acc2.values.0[0][i], acc_ref.values.0[0][i],
             );
         }
-        assert_eq!(acc2.psqt[0], acc_ref.psqt[0], "Warm cache: White psqt mismatch");
+        assert_eq!(
+            acc2.psqt[0], acc_ref.psqt[0],
+            "Warm cache: White psqt mismatch"
+        );
     }
 
     #[test]
     fn test_finny_king_midline_crossing() {
         // King on e1 (file 4, mirrored=1) vs king on d1 (file 3, mirrored=0).
         // These use different Finny entries. Both must be correct.
-        let pos_e1 = Position::from_fen(
-            "4k3/8/8/8/8/8/8/4K3 w - - 0 1",
-        ).unwrap();
-        let pos_d1 = Position::from_fen(
-            "4k3/8/8/8/8/8/8/3K4 w - - 0 1",
-        ).unwrap();
+        let pos_e1 = Position::from_fen("4k3/8/8/8/8/8/8/4K3 w - - 0 1").unwrap();
+        let pos_d1 = Position::from_fen("4k3/8/8/8/8/8/8/3K4 w - - 0 1").unwrap();
         let mut cache = FinnyTable::new();
 
         // Refresh with king on e1 (mirrored=1)
@@ -697,8 +771,10 @@ mod tests {
         ref_e1.refresh(&pos_e1, Color::White);
 
         for i in 0..L1_SIZE {
-            assert_eq!(acc_e1.values.0[0][i], ref_e1.values.0[0][i],
-                "King e1: White mismatch at {i}");
+            assert_eq!(
+                acc_e1.values.0[0][i], ref_e1.values.0[0][i],
+                "King e1: White mismatch at {i}"
+            );
         }
 
         // Refresh with king on d1 (mirrored=0, different entry)
@@ -708,8 +784,10 @@ mod tests {
         ref_d1.refresh(&pos_d1, Color::White);
 
         for i in 0..L1_SIZE {
-            assert_eq!(acc_d1.values.0[0][i], ref_d1.values.0[0][i],
-                "King d1: White mismatch at {i}");
+            assert_eq!(
+                acc_d1.values.0[0][i], ref_d1.values.0[0][i],
+                "King d1: White mismatch at {i}"
+            );
         }
     }
 
@@ -746,5 +824,4 @@ mod tests {
             }
         }
     }
-
 }

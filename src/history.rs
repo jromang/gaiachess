@@ -7,7 +7,7 @@
 
 use std::sync::atomic::{AtomicI16, Ordering};
 
-use crate::types::{Color, Move, Piece, PieceType, Square, MAX_PLY};
+use crate::types::{Color, MAX_PLY, Move, Piece, PieceType, Square};
 
 /// Maximum history value for gravity formula.
 const MAX_HISTORY: i32 = 16384;
@@ -60,10 +60,15 @@ impl ButterflyHistory {
     /// Get the history score for a move, conditioned on threat status.
     #[inline]
     pub fn get(&self, color: Color, m: Move, threats: u64) -> i32 {
-        debug_assert!(m != Move::NONE && m != Move::NULL,
-            "ButterflyHistory::get: invalid move {:?}", m);
-        debug_assert!(m.from_sq().0 < 64 && m.to_sq().0 < 64,
-            "ButterflyHistory::get: squares OOB");
+        debug_assert!(
+            m != Move::NONE && m != Move::NULL,
+            "ButterflyHistory::get: invalid move {:?}",
+            m
+        );
+        debug_assert!(
+            m.from_sq().0 < 64 && m.to_sq().0 < 64,
+            "ButterflyHistory::get: squares OOB"
+        );
         let from_thr = ((threats >> m.from_sq().index()) & 1) as usize;
         let to_thr = ((threats >> m.to_sq().index()) & 1) as usize;
         self.table[color.index()][from_thr][to_thr][Self::index(m)] as i32
@@ -72,10 +77,15 @@ impl ButterflyHistory {
     /// Gravity update: `val += bonus - val * |bonus| / MAX_HISTORY`.
     #[inline]
     pub fn update(&mut self, color: Color, m: Move, threats: u64, bonus: i32) {
-        debug_assert!(m != Move::NONE && m != Move::NULL,
-            "ButterflyHistory::update: invalid move {:?}", m);
-        debug_assert!(m.from_sq().0 < 64 && m.to_sq().0 < 64,
-            "ButterflyHistory::update: squares OOB");
+        debug_assert!(
+            m != Move::NONE && m != Move::NULL,
+            "ButterflyHistory::update: invalid move {:?}",
+            m
+        );
+        debug_assert!(
+            m.from_sq().0 < 64 && m.to_sq().0 < 64,
+            "ButterflyHistory::update: squares OOB"
+        );
         let from_thr = ((threats >> m.from_sq().index()) & 1) as usize;
         let to_thr = ((threats >> m.to_sq().index()) & 1) as usize;
         let entry = &mut self.table[color.index()][from_thr][to_thr][Self::index(m)];
@@ -102,7 +112,8 @@ pub struct PawnHistory {
 impl PawnHistory {
     pub fn new() -> Self {
         unsafe {
-            let layout = std::alloc::Layout::new::<[[[i16; Square::NUM]; Piece::NUM]; PAWN_HIST_SIZE]>();
+            let layout =
+                std::alloc::Layout::new::<[[[i16; Square::NUM]; Piece::NUM]; PAWN_HIST_SIZE]>();
             let ptr = std::alloc::alloc_zeroed(layout);
             if ptr.is_null() {
                 std::alloc::handle_alloc_error(layout);
@@ -128,7 +139,11 @@ impl PawnHistory {
 
     #[inline]
     pub fn update(&mut self, pawn_key: u64, piece: Piece, to: Square, bonus: i32) {
-        debug_assert!(piece.0 < 12, "PawnHistory::update: piece {} invalid", piece.0);
+        debug_assert!(
+            piece.0 < 12,
+            "PawnHistory::update: piece {} invalid",
+            piece.0
+        );
         debug_assert!(to.0 < 64, "PawnHistory::update: to sq {} OOB", to.0);
         let entry = &mut self.table[pawn_key as usize % PAWN_HIST_SIZE][piece.index()][to.index()];
         let val = *entry as i32;
@@ -177,13 +192,15 @@ impl Killers {
 /// History bonus: linear in depth, clamped.
 #[inline]
 pub fn stat_bonus(depth: i32) -> i32 {
-    (crate::tune::STAT_BONUS_MUL() * depth + crate::tune::STAT_BONUS_ADD()).min(crate::tune::STAT_BONUS_MAX())
+    (crate::tune::STAT_BONUS_MUL() * depth + crate::tune::STAT_BONUS_ADD())
+        .min(crate::tune::STAT_BONUS_MAX())
 }
 
 /// History malus: linear in depth, clamped.
 #[inline]
 pub fn stat_malus(depth: i32) -> i32 {
-    (crate::tune::STAT_MALUS_MUL() * depth - crate::tune::STAT_MALUS_SUB()).min(crate::tune::STAT_MALUS_MAX())
+    (crate::tune::STAT_MALUS_MUL() * depth - crate::tune::STAT_MALUS_SUB())
+        .min(crate::tune::STAT_MALUS_MAX())
 }
 
 /// Capture history table: `[piece][to_sq][captured_piece_type]`.
@@ -213,7 +230,10 @@ impl CaptureHistory {
     pub fn get(&self, piece: Piece, to: Square, captured_pt: PieceType) -> i32 {
         debug_assert!(piece.0 < 12, "CaptureHistory::get: piece NONE");
         debug_assert!(to.0 < 64, "CaptureHistory::get: sq OOB {}", to.0);
-        debug_assert!((captured_pt as usize) < 6, "CaptureHistory::get: captured_pt OOB");
+        debug_assert!(
+            (captured_pt as usize) < 6,
+            "CaptureHistory::get: captured_pt OOB"
+        );
         self.table[piece.index()][to.index()][captured_pt.index()] as i32
     }
 
@@ -222,7 +242,10 @@ impl CaptureHistory {
     pub fn update(&mut self, piece: Piece, to: Square, captured_pt: PieceType, bonus: i32) {
         debug_assert!(piece.0 < 12, "CaptureHistory::update: piece NONE");
         debug_assert!(to.0 < 64, "CaptureHistory::update: sq OOB {}", to.0);
-        debug_assert!((captured_pt as usize) < 6, "CaptureHistory::update: captured_pt OOB");
+        debug_assert!(
+            (captured_pt as usize) < 6,
+            "CaptureHistory::update: captured_pt OOB"
+        );
         let entry = &mut self.table[piece.index()][to.index()][captured_pt.index()];
         let val = *entry as i32;
         let new_val = val + bonus - val * bonus.abs() / MAX_HISTORY;
@@ -249,7 +272,8 @@ impl ContinuationHistory {
     pub fn new() -> Self {
         // Use alloc_zeroed for large heap allocation
         let table = unsafe {
-            let layout = std::alloc::Layout::new::<[[[PieceToTable; Square::NUM]; Piece::NUM]; 2]>();
+            let layout =
+                std::alloc::Layout::new::<[[[PieceToTable; Square::NUM]; Piece::NUM]; 2]>();
             let ptr = std::alloc::alloc_zeroed(layout);
             if ptr.is_null() {
                 std::alloc::handle_alloc_error(layout);
@@ -276,15 +300,25 @@ impl ContinuationHistory {
         piece: Piece,
         to: Square,
     ) -> *mut PieceToTable {
-        debug_assert!(piece.0 < 12, "ContinuationHistory::subtable_ptr: piece NONE");
-        debug_assert!(to.0 < 64, "ContinuationHistory::subtable_ptr: sq OOB {}", to.0);
+        debug_assert!(
+            piece.0 < 12,
+            "ContinuationHistory::subtable_ptr: piece NONE"
+        );
+        debug_assert!(
+            to.0 < 64,
+            "ContinuationHistory::subtable_ptr: sq OOB {}",
+            to.0
+        );
         &raw mut self.table[is_capture as usize][piece.index()][to.index()]
     }
 
     /// Get the continuation history score from a subtable pointer.
     #[inline]
     pub fn get(subtable_ptr: *const PieceToTable, piece: Piece, to: Square) -> i32 {
-        debug_assert!(!subtable_ptr.is_null(), "ContinuationHistory::get: null ptr");
+        debug_assert!(
+            !subtable_ptr.is_null(),
+            "ContinuationHistory::get: null ptr"
+        );
         debug_assert!(piece.0 < 12, "ContinuationHistory::get: piece NONE");
         debug_assert!(to.0 < 64, "ContinuationHistory::get: sq OOB {}", to.0);
         unsafe { (*subtable_ptr)[piece.index()][to.index()] as i32 }
@@ -293,7 +327,10 @@ impl ContinuationHistory {
     /// Gravity update via a subtable pointer.
     #[inline]
     pub fn update(subtable_ptr: *mut PieceToTable, piece: Piece, to: Square, bonus: i32) {
-        debug_assert!(!subtable_ptr.is_null(), "ContinuationHistory::update: null ptr");
+        debug_assert!(
+            !subtable_ptr.is_null(),
+            "ContinuationHistory::update: null ptr"
+        );
         debug_assert!(piece.0 < 12, "ContinuationHistory::update: piece NONE");
         debug_assert!(to.0 < 64, "ContinuationHistory::update: sq OOB {}", to.0);
         let entry = unsafe { &mut (*subtable_ptr)[piece.index()][to.index()] };
@@ -407,8 +444,13 @@ impl SharedCorrectionHistory {
 
     pub fn new(threads: usize) -> Self {
         let slots = Self::slots_for(threads);
-        let table = (0..slots * 2 * CORR_KINDS).map(|_| AtomicI16::new(0)).collect();
-        SharedCorrectionHistory { table, mask: slots - 1 }
+        let table = (0..slots * 2 * CORR_KINDS)
+            .map(|_| AtomicI16::new(0))
+            .collect();
+        SharedCorrectionHistory {
+            table,
+            mask: slots - 1,
+        }
     }
 
     /// Reallocate for a new thread count. Zeroes the table, like resizing the
@@ -431,7 +473,11 @@ impl SharedCorrectionHistory {
     #[inline]
     fn slot(&self, kind: CorrKind, key: u64, stm: Color) -> &AtomicI16 {
         let idx = ((key as usize & self.mask) * 2 + stm.index()) * CORR_KINDS + kind.index();
-        debug_assert!(idx < self.table.len(), "SharedCorrectionHistory: index {} OOB", idx);
+        debug_assert!(
+            idx < self.table.len(),
+            "SharedCorrectionHistory: index {} OOB",
+            idx
+        );
         &self.table[idx]
     }
 
@@ -447,12 +493,19 @@ impl SharedCorrectionHistory {
     /// of which cost far more than the observation is worth on a line this hot.
     #[inline]
     pub fn update(&self, kind: CorrKind, key: u64, stm: Color, bonus: i32) {
-        debug_assert!(bonus.abs() <= CORRHIST_LIMIT,
-            "SharedCorrectionHistory::update: bonus {} exceeds limit {}", bonus, CORRHIST_LIMIT);
+        debug_assert!(
+            bonus.abs() <= CORRHIST_LIMIT,
+            "SharedCorrectionHistory::update: bonus {} exceeds limit {}",
+            bonus,
+            CORRHIST_LIMIT
+        );
         let slot = self.slot(kind, key, stm);
         let val = slot.load(Ordering::Relaxed) as i32;
         let new_val = val + bonus - val * bonus.abs() / CORRHIST_LIMIT;
-        slot.store(new_val.clamp(-CORRHIST_LIMIT, CORRHIST_LIMIT) as i16, Ordering::Relaxed);
+        slot.store(
+            new_val.clamp(-CORRHIST_LIMIT, CORRHIST_LIMIT) as i16,
+            Ordering::Relaxed,
+        );
     }
 }
 
@@ -495,8 +548,15 @@ impl ContCorrectionHistory {
     /// Get a mutable pointer to the subtable for a given move context.
     #[inline]
     pub fn subtable_ptr(&mut self, piece: Piece, to: Square) -> *mut PieceToCorrTable {
-        debug_assert!(piece.0 < 12, "ContCorrectionHistory::subtable_ptr: piece NONE");
-        debug_assert!(to.0 < 64, "ContCorrectionHistory::subtable_ptr: sq OOB {}", to.0);
+        debug_assert!(
+            piece.0 < 12,
+            "ContCorrectionHistory::subtable_ptr: piece NONE"
+        );
+        debug_assert!(
+            to.0 < 64,
+            "ContCorrectionHistory::subtable_ptr: sq OOB {}",
+            to.0
+        );
         &raw mut self.table[piece.index()][to.index()]
     }
 
@@ -546,7 +606,9 @@ mod tests {
         assert_eq!(h.mask, CORRHIST_SIZE - 1);
         let mut key = 0x9E3779B97F4A7C15u64;
         for _ in 0..2000 {
-            key = key.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            key = key
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             assert_eq!(key as usize & h.mask, key as usize % CORRHIST_SIZE);
         }
     }
@@ -585,12 +647,18 @@ mod tests {
             h.update(CorrKind::Minor, key, Color::Black, CORRHIST_LIMIT);
         }
         let v = h.get(CorrKind::Minor, key, Color::Black);
-        assert!(v > 0 && v <= CORRHIST_LIMIT, "value {v} outside [0, {CORRHIST_LIMIT}]");
+        assert!(
+            v > 0 && v <= CORRHIST_LIMIT,
+            "value {v} outside [0, {CORRHIST_LIMIT}]"
+        );
         for _ in 0..500 {
             h.update(CorrKind::Minor, key, Color::Black, -CORRHIST_LIMIT);
         }
         let v = h.get(CorrKind::Minor, key, Color::Black);
-        assert!(v < 0 && v >= -CORRHIST_LIMIT, "value {v} outside [-{CORRHIST_LIMIT}, 0]");
+        assert!(
+            v < 0 && v >= -CORRHIST_LIMIT,
+            "value {v} outside [-{CORRHIST_LIMIT}, 0]"
+        );
     }
 
     #[test]
@@ -640,7 +708,11 @@ mod tests {
             for t in 0..4 {
                 let h = h.clone();
                 s.spawn(move || {
-                    let bonus = if t % 2 == 0 { CORRHIST_LIMIT / 4 } else { -CORRHIST_LIMIT / 4 };
+                    let bonus = if t % 2 == 0 {
+                        CORRHIST_LIMIT / 4
+                    } else {
+                        -CORRHIST_LIMIT / 4
+                    };
                     for i in 0..20_000u64 {
                         h.update(CorrKind::Pawn, i % 8, Color::White, bonus);
                     }

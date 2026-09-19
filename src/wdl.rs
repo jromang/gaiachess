@@ -100,7 +100,10 @@ pub fn material_count(pos: &Position) -> i32 {
 fn params_for_material(material: i32) -> Params {
     let m = material.clamp(MATERIAL_MIN, MATERIAL_MAX) as f64 / MATERIAL_ANCHOR;
     let cubic = |c: [f64; 4]| ((c[0] * m + c[1]) * m + c[2]) * m + c[3];
-    Params { a: cubic(AS).max(1.0), b: cubic(BS).max(1.0) }
+    Params {
+        a: cubic(AS).max(1.0),
+        b: cubic(BS).max(1.0),
+    }
 }
 
 /// The logistic coefficients for this position.

@@ -26,6 +26,7 @@ pub const I16_LANES: usize = size_of::<v128>() / size_of::<i16>();
 pub const I32_LANES: usize = size_of::<v128>() / size_of::<i32>();
 /// Number of f32 elements per SIMD register.
 pub const F32_LANES: usize = size_of::<v128>() / size_of::<f32>();
+pub const DPBUSD_CHAINS: usize = 1;
 
 // ============================================================
 // i16 operations (accumulator, FT activation)
@@ -151,9 +152,8 @@ pub unsafe fn dpbusd(acc: v128, u8s: v128, i8s: v128) -> v128 {
     let dot_hi = i32x4_dot_i16x8(u16x8_extend_high_u8x16(u8s), i16x8_extend_high_i8x16(i8s));
     let even =
         i8x16_shuffle::<0, 1, 2, 3, 8, 9, 10, 11, 16, 17, 18, 19, 24, 25, 26, 27>(dot_lo, dot_hi);
-    let odd = i8x16_shuffle::<4, 5, 6, 7, 12, 13, 14, 15, 20, 21, 22, 23, 28, 29, 30, 31>(
-        dot_lo, dot_hi,
-    );
+    let odd =
+        i8x16_shuffle::<4, 5, 6, 7, 12, 13, 14, 15, 20, 21, 22, 23, 28, 29, 30, 31>(dot_lo, dot_hi);
     i32x4_add(acc, i32x4_add(even, odd))
 }
 
@@ -162,13 +162,7 @@ pub unsafe fn dpbusd(acc: v128, u8s: v128, i8s: v128) -> v128 {
 /// The two dot products are summed before the gather, which saves one pair of shuffles
 /// over calling [`dpbusd`] twice. Every addition is in i32, so nothing can overflow.
 #[inline(always)]
-pub unsafe fn double_dpbusd(
-    acc: v128,
-    u8s1: v128,
-    i8s1: v128,
-    u8s2: v128,
-    i8s2: v128,
-) -> v128 {
+pub unsafe fn double_dpbusd(acc: v128, u8s1: v128, i8s1: v128, u8s2: v128, i8s2: v128) -> v128 {
     let lo = i32x4_add(
         i32x4_dot_i16x8(u16x8_extend_low_u8x16(u8s1), i16x8_extend_low_i8x16(i8s1)),
         i32x4_dot_i16x8(u16x8_extend_low_u8x16(u8s2), i16x8_extend_low_i8x16(i8s2)),

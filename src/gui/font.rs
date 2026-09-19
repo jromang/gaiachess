@@ -278,7 +278,15 @@ pub fn print_block(
 
 /// Draws scaled `text` centred horizontally on `cx`, ringed by a one-pixel-per-block
 /// outline so it reads over the busiest background.
-pub fn print_title(fb: &mut Fb, text: &str, cx: i32, y: i32, scale: i32, color: Rgba, border: Rgba) {
+pub fn print_title(
+    fb: &mut Fb,
+    text: &str,
+    cx: i32,
+    y: i32,
+    scale: i32,
+    color: Rgba,
+    border: Rgba,
+) {
     let x = cx - width_scaled(text, scale) / 2;
     for (dx, dy) in OUTLINE {
         print_scaled(fb, text, x + dx * scale, y + dy * scale, scale, border);

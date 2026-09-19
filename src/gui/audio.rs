@@ -14,7 +14,6 @@
 //! The clips themselves are not files. They are made at start-up by [`super::synth`],
 //! from a few numbers each.
 
-
 use super::synth;
 
 /// Every sound the interface can make. What each one sounds like is in
@@ -143,20 +142,22 @@ mod desktop {
             };
             let clips = Sfx::EVERY
                 .iter()
-                .map(|&sfx| Clip { samples: Vec::leak(synth::clip(sfx)) })
+                .map(|&sfx| Clip {
+                    samples: Vec::leak(synth::clip(sfx)),
+                })
                 .collect();
-            Some(Audio { _device: device, clips })
+            Some(Audio {
+                _device: device,
+                clips,
+            })
         }
 
         pub fn play(&self, sfx: Sfx) {
             if let Some(clip) = self.clips.get(sfx as usize) {
-                self._device
-                    .mixer()
-                    .add(clip.source().amplify(volume(sfx)));
+                self._device.mixer().add(clip.source().amplify(volume(sfx)));
             }
         }
     }
-
 }
 
 #[cfg(all(feature = "gui", not(target_os = "haiku")))]
@@ -232,7 +233,10 @@ mod tests {
         queue.push(Sfx::Cursor);
         queue.push(Sfx::Cursor);
         queue.push(Sfx::Land);
-        assert_eq!(queue.drain().collect::<Vec<_>>(), vec![Sfx::Cursor, Sfx::Land]);
+        assert_eq!(
+            queue.drain().collect::<Vec<_>>(),
+            vec![Sfx::Cursor, Sfx::Land]
+        );
     }
 
     #[test]

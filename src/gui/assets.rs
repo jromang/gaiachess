@@ -24,9 +24,19 @@ fn decode_rgba(bytes: &[u8]) -> (usize, usize, Vec<u8>) {
     let decoder = png::Decoder::new(std::io::Cursor::new(bytes));
     let mut reader = decoder.read_info().expect("embedded PNG must decode");
     let mut buf = vec![0u8; reader.output_buffer_size().expect("PNG size must fit")];
-    let info = reader.next_frame(&mut buf).expect("embedded PNG must decode");
-    assert_eq!(info.color_type, png::ColorType::Rgba, "sheets are exported as 8-bit RGBA");
-    assert_eq!(info.bit_depth, png::BitDepth::Eight, "sheets are exported as 8-bit RGBA");
+    let info = reader
+        .next_frame(&mut buf)
+        .expect("embedded PNG must decode");
+    assert_eq!(
+        info.color_type,
+        png::ColorType::Rgba,
+        "sheets are exported as 8-bit RGBA"
+    );
+    assert_eq!(
+        info.bit_depth,
+        png::BitDepth::Eight,
+        "sheets are exported as 8-bit RGBA"
+    );
     buf.truncate(info.buffer_size());
     (info.width as usize, info.height as usize, buf)
 }
@@ -155,7 +165,11 @@ pub struct Assets {
 impl Assets {
     pub fn load() -> Assets {
         let (w, h, pieces) = decode_rgba(PIECES_PNG);
-        assert_eq!(w, CELL_W as usize * 6, "piece sheet width does not match CELL_W");
+        assert_eq!(
+            w,
+            CELL_W as usize * 6,
+            "piece sheet width does not match CELL_W"
+        );
         assert_eq!(
             h,
             CELL_H as usize * (VARIANTS as usize + 1),
@@ -221,7 +235,13 @@ mod tests {
 
     #[test]
     fn every_hotspot_lands_inside_its_sprite() {
-        for item in [Ui::Pointer, Ui::HandOpen, Ui::HandGrab, Ui::MoveDot, Ui::MoveRing] {
+        for item in [
+            Ui::Pointer,
+            Ui::HandOpen,
+            Ui::HandGrab,
+            Ui::MoveDot,
+            Ui::MoveRing,
+        ] {
             let ((w, h), (hx, hy)) = (item.size(), item.hotspot());
             assert!(
                 (0..w as i32).contains(&hx) && (0..h as i32).contains(&hy),

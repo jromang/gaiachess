@@ -47,7 +47,10 @@ pub const LAYER_BOTTOM: i32 = BOARD_Y + BOARD_H + 2;
 /// The line the board tips about: the middle of the board itself, not of the band.
 pub const LAYER_PIVOT: f32 = BOARD_Y as f32 + BOARD_H as f32 / 2.0;
 
-const _: () = assert!(BOARD_Y + BOARD_H + 4 <= FB_H as i32, "board overflows the canvas");
+const _: () = assert!(
+    BOARD_Y + BOARD_H + 4 <= FB_H as i32,
+    "board overflows the canvas"
+);
 /// The status band is painted after the pieces, so anything of a back-rank piece that
 /// reaches into it is simply lost — which is how the king's crown went missing.
 const _: () = assert!(
@@ -232,7 +235,14 @@ pub fn draw_flying_piece(
     ground: (f32, f32),
     height: f32,
 ) {
-    draw_piece_shadow(fb, assets, scheme, piece.piece_type(), ground, shadow_fade(height));
+    draw_piece_shadow(
+        fb,
+        assets,
+        scheme,
+        piece.piece_type(),
+        ground,
+        shadow_fade(height),
+    );
     draw_loose_piece(fb, assets, scheme, piece, (ground.0, ground.1 - height));
 }
 
@@ -287,13 +297,7 @@ pub fn tile_center(sq: Square, flipped: bool) -> (f32, f32) {
 
 /// Draws a fat arrow between two square centres, with a round tail. It is what tells
 /// the player, at a glance, which move they are about to commit to.
-pub fn draw_arrow(
-    fb: &mut Fb,
-    assets: &Assets,
-    from: (f32, f32),
-    to: (f32, f32),
-    color: Rgba,
-) {
+pub fn draw_arrow(fb: &mut Fb, assets: &Assets, from: (f32, f32), to: (f32, f32), color: Rgba) {
     const HALF_STEM: f32 = 2.5;
     const HALF_HEAD: f32 = 7.0;
     const HEAD_LEN: f32 = 9.0;
@@ -335,7 +339,14 @@ pub fn draw_arrow(
 
 /// Rings a piece in a flat colour, marking it as capturable or in check. Eight offset
 /// silhouettes, so the ring follows the piece's own shape rather than boxing it in.
-pub fn draw_outline(fb: &mut Fb, assets: &Assets, sq: Square, flipped: bool, pt: crate::types::PieceType, color: Rgba) {
+pub fn draw_outline(
+    fb: &mut Fb,
+    assets: &Assets,
+    sq: Square,
+    flipped: bool,
+    pt: crate::types::PieceType,
+    color: Rgba,
+) {
     let (x, y) = piece_xy(sq, flipped);
     let sprite = assets.piece(pt, 0);
     for (dx, dy) in [

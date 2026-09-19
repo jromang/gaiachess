@@ -14,8 +14,9 @@
 //!
 //! Two kernels are *not* macro-generated:
 //! - `find_nnz` (in `forward.rs`): three genuinely different algorithms per ISA.
-//! - `threat512::threat_batch`: a hand-scheduled tiled AVX-512 form with no
-//!   narrower equivalent; the macro instances carry the generic row-loop form.
+//! - `threat512::threat_batch`: a hand-scheduled 16-ZMM tile; the macro
+//!   instances carry the same algorithm at `THREAT_REGISTERS` of the
+//!   backend's width (8 YMM on AVX2).
 //!
 //! Which instance runs is selected at compile time (`pub use ... as k`),
 //! mirroring the historical `#[cfg(target_feature)]` cascade.
@@ -23,6 +24,12 @@
 /// Number of SIMD registers held in flight by the Finny batch apply.
 /// Must divide L1_SIZE / I16_LANES for all SIMD widths — asserted per instance.
 pub(crate) const FINNY_REGISTERS: usize = 4;
+
+/// Number of SIMD registers held in flight by the generic threat-batch tile.
+/// Same divisor constraint as `FINNY_REGISTERS`. Eight matches a half-file of
+/// AVX2 YMMs and leaves room for the i8→i16 weight load; AVX-512 uses the
+/// dedicated 16-ZMM form instead.
+pub(crate) const THREAT_REGISTERS: usize = 8;
 
 macro_rules! nnue_kernels {
     ($backend:path $(, #[$tf:meta])?) => {
@@ -34,6 +41,9 @@ macro_rules! nnue_kernels {
 
         const _: () = assert!(
             L1_SIZE.is_multiple_of(crate::nnue::kernels::FINNY_REGISTERS * simd::I16_LANES)
+        );
+        const _: () = assert!(
+            L1_SIZE.is_multiple_of(crate::nnue::kernels::THREAT_REGISTERS * simd::I16_LANES)
         );
 
         // ============================================================
@@ -152,60 +162,72 @@ macro_rules! nnue_kernels {
             let params = network::params();
 
             let packed = ft_out.0.as_ptr() as *const i32;
-
-            // 3 independent accumulator chains for latency hiding on VNNI (5-cycle latency).
             let n_vecs = L2_SIZE / simd::F32_LANES;
-            let mut chain0 = [simd::zeroed_i32(); L2_SIZE / simd::F32_LANES];
-            let mut chain1 = [simd::zeroed_i32(); L2_SIZE / simd::F32_LANES];
-            let mut chain2 = [simd::zeroed_i32(); L2_SIZE / simd::F32_LANES];
-
-            let mut triples = nnz.chunks_exact(3);
-            for triple in &mut triples {
-                let idx0 = triple[0] as usize;
-                let idx1 = triple[1] as usize;
-                let idx2 = triple[2] as usize;
-
-                let in0 = simd::splat_i32(*packed.add(idx0));
-                let in1 = simd::splat_i32(*packed.add(idx1));
-                let in2 = simd::splat_i32(*packed.add(idx2));
-
-                let w0 = params.l1_weights.0[bucket][idx0].as_ptr();
-                let w1 = params.l1_weights.0[bucket][idx1].as_ptr();
-                let w2 = params.l1_weights.0[bucket][idx2].as_ptr();
-
-                for j in 0..n_vecs {
-                    let off = j * simd::F32_LANES * 4;
-                    chain0[j] = simd::dpbusd(chain0[j], in0, *w0.add(off).cast());
-                    chain1[j] = simd::dpbusd(chain1[j], in1, *w1.add(off).cast());
-                    chain2[j] = simd::dpbusd(chain2[j], in2, *w2.add(off).cast());
-                }
-            }
-
-            // Handle remainder (0, 1, or 2 leftover NNZ indices)
-            let rem = triples.remainder();
-            if !rem.is_empty() {
-                let idx = rem[0] as usize;
-                let input = simd::splat_i32(*packed.add(idx));
-                let w = params.l1_weights.0[bucket][idx].as_ptr();
-                for j in 0..n_vecs {
-                    let off = j * simd::F32_LANES * 4;
-                    chain0[j] = simd::dpbusd(chain0[j], input, *w.add(off).cast());
-                }
-            }
-            if rem.len() >= 2 {
-                let idx = rem[1] as usize;
-                let input = simd::splat_i32(*packed.add(idx));
-                let w = params.l1_weights.0[bucket][idx].as_ptr();
-                for j in 0..n_vecs {
-                    let off = j * simd::F32_LANES * 4;
-                    chain1[j] = simd::dpbusd(chain1[j], input, *w.add(off).cast());
-                }
-            }
-
-            // Merge chains
             let mut pre_act = [simd::zeroed_i32(); L2_SIZE / simd::F32_LANES];
-            for j in 0..n_vecs {
-                pre_act[j] = simd::add_i32(simd::add_i32(chain0[j], chain1[j]), chain2[j]);
+
+            // One chain on emulated dpbusd (AVX2 / AVX-512). Three on native
+            // VNNI/`sdot`, whose ~5-cycle latency needs independent accumulators.
+            // i32 wrapping add is associative: the split does not change eval.
+            if simd::DPBUSD_CHAINS == 1 {
+                for &idx16 in nnz {
+                    let idx = idx16 as usize;
+                    let input = simd::splat_i32(*packed.add(idx));
+                    let w = params.l1_weights.0[bucket][idx].as_ptr();
+                    for j in 0..n_vecs {
+                        let off = j * simd::F32_LANES * 4;
+                        pre_act[j] = simd::dpbusd(pre_act[j], input, *w.add(off).cast());
+                    }
+                }
+            } else {
+                let mut chain0 = [simd::zeroed_i32(); L2_SIZE / simd::F32_LANES];
+                let mut chain1 = [simd::zeroed_i32(); L2_SIZE / simd::F32_LANES];
+                let mut chain2 = [simd::zeroed_i32(); L2_SIZE / simd::F32_LANES];
+
+                let mut triples = nnz.chunks_exact(3);
+                for triple in &mut triples {
+                    let idx0 = triple[0] as usize;
+                    let idx1 = triple[1] as usize;
+                    let idx2 = triple[2] as usize;
+
+                    let in0 = simd::splat_i32(*packed.add(idx0));
+                    let in1 = simd::splat_i32(*packed.add(idx1));
+                    let in2 = simd::splat_i32(*packed.add(idx2));
+
+                    let w0 = params.l1_weights.0[bucket][idx0].as_ptr();
+                    let w1 = params.l1_weights.0[bucket][idx1].as_ptr();
+                    let w2 = params.l1_weights.0[bucket][idx2].as_ptr();
+
+                    for j in 0..n_vecs {
+                        let off = j * simd::F32_LANES * 4;
+                        chain0[j] = simd::dpbusd(chain0[j], in0, *w0.add(off).cast());
+                        chain1[j] = simd::dpbusd(chain1[j], in1, *w1.add(off).cast());
+                        chain2[j] = simd::dpbusd(chain2[j], in2, *w2.add(off).cast());
+                    }
+                }
+
+                let rem = triples.remainder();
+                if !rem.is_empty() {
+                    let idx = rem[0] as usize;
+                    let input = simd::splat_i32(*packed.add(idx));
+                    let w = params.l1_weights.0[bucket][idx].as_ptr();
+                    for j in 0..n_vecs {
+                        let off = j * simd::F32_LANES * 4;
+                        chain0[j] = simd::dpbusd(chain0[j], input, *w.add(off).cast());
+                    }
+                }
+                if rem.len() >= 2 {
+                    let idx = rem[1] as usize;
+                    let input = simd::splat_i32(*packed.add(idx));
+                    let w = params.l1_weights.0[bucket][idx].as_ptr();
+                    for j in 0..n_vecs {
+                        let off = j * simd::F32_LANES * 4;
+                        chain1[j] = simd::dpbusd(chain1[j], input, *w.add(off).cast());
+                    }
+                }
+
+                for j in 0..n_vecs {
+                    pre_act[j] = simd::add_i32(simd::add_i32(chain0[j], chain1[j]), chain2[j]);
+                }
             }
 
             // Dequantize + bias + CReLU+squared:
@@ -497,28 +519,8 @@ macro_rules! nnue_kernels {
         }
 
         // ============================================================
-        // Threat accumulator batch apply — generic row-loop form
+        // Threat accumulator batch apply — register-tiled form
         // ============================================================
-
-        /// Add an i8 weight row (L1_SIZE elements) into an i16 accumulator.
-        #[inline(always)]
-        unsafe fn accumulate_i8_row(weights: *const i8, acc: *mut i16) {
-            for j in (0..L1_SIZE).step_by(simd::I16_LANES) {
-                let w = simd::load_i8_as_i16(weights.add(j));
-                let slot = acc.add(j).cast();
-                *slot = simd::add_i16(*slot, w);
-            }
-        }
-
-        /// Subtract an i8 weight row (L1_SIZE elements) from an i16 accumulator.
-        #[inline(always)]
-        unsafe fn subtract_i8_row(weights: *const i8, acc: *mut i16) {
-            for j in (0..L1_SIZE).step_by(simd::I16_LANES) {
-                let w = simd::load_i8_as_i16(weights.add(j));
-                let slot = acc.add(j).cast();
-                *slot = simd::sub_i16(*slot, w);
-            }
-        }
 
         /// Extract indices of non-zero 4-byte groups from the FT output:
         /// NNZ_TABLE walk over this backend's `nnz_bitmask` width.
@@ -560,12 +562,21 @@ macro_rules! nnue_kernels {
             (indexes, count)
         }
 
-        /// Batched threat-row accumulation: per-feature row loops with prefetch.
+        /// Batched threat-row accumulation: keep a tile of the accumulator in
+        /// registers and apply every add/sub row against it, then store once.
+        ///
+        /// Per element the arithmetic is wrapping i16, all subs then all adds —
+        /// the same order as a row-at-a-time walk, so the search node count is
+        /// unchanged. Tiling only reorders *which* elements are in flight.
         ///
         /// `input_acc`: source accumulator (null = zero-init for full recompute).
-        /// `output_acc`: destination accumulator.
+        /// `output_acc`: destination accumulator. In-place apply (same pointer
+        /// twice) is allowed — pawn-pair rows stacked on an already-filled
+        /// threat acc.
         ///
-        /// The AVX-512 tiers use `threat512::threat_batch` instead (tiled 16-ZMM).
+        /// The AVX-512 tiers use `threat512::threat_batch` instead (16 ZMMs).
+        /// No software prefetch: the rows a search touches stay in LLC, and
+        /// look-ahead branches in these loops measured slower than nothing.
         $(#[$tf])?
         #[inline]
         pub unsafe fn threat_batch(
@@ -575,20 +586,37 @@ macro_rules! nnue_kernels {
             adds: &[u32],
             subs: &[u32],
         ) {
-            if input_acc.is_null() {
-                std::ptr::write_bytes(output_acc, 0, L1_SIZE);
-            } else if input_acc != output_acc as *const i16 {
-                // In-place apply (pawn-pair rows stacked on an already-filled
-                // threat acc) passes the same pointer twice; a nonoverlapping
-                // copy would be UB there.
-                std::ptr::copy_nonoverlapping(input_acc, output_acc, L1_SIZE);
-            }
-            // No software prefetch, as in `threat512::threat_batch`.
-            for &s in subs {
-                subtract_i8_row((*weights_base.add(s as usize)).as_ptr(), output_acc);
-            }
-            for &a in adds {
-                accumulate_i8_row((*weights_base.add(a as usize)).as_ptr(), output_acc);
+            debug_assert!(!output_acc.is_null());
+            const TILE: usize = crate::nnue::kernels::THREAT_REGISTERS;
+            const TILE_ELEMS: usize = TILE * simd::I16_LANES;
+
+            for tile in 0..(L1_SIZE / TILE_ELEMS) {
+                let base = tile * TILE_ELEMS;
+                let mut regs: [_; TILE] = std::mem::zeroed();
+                if !input_acc.is_null() {
+                    for i in 0..TILE {
+                        regs[i] = *input_acc.add(base + i * simd::I16_LANES).cast();
+                    }
+                }
+
+                for &s in subs {
+                    let w_ptr = (*weights_base.add(s as usize)).as_ptr().add(base);
+                    for (j, r) in regs.iter_mut().enumerate() {
+                        let w = simd::load_i8_as_i16(w_ptr.add(j * simd::I16_LANES));
+                        *r = simd::sub_i16(*r, w);
+                    }
+                }
+                for &a in adds {
+                    let w_ptr = (*weights_base.add(a as usize)).as_ptr().add(base);
+                    for (j, r) in regs.iter_mut().enumerate() {
+                        let w = simd::load_i8_as_i16(w_ptr.add(j * simd::I16_LANES));
+                        *r = simd::add_i16(*r, w);
+                    }
+                }
+
+                for (i, r) in regs.into_iter().enumerate() {
+                    *output_acc.add(base + i * simd::I16_LANES).cast() = r;
+                }
             }
         }
     };
@@ -604,8 +632,8 @@ macro_rules! nnue_kernels {
 #[cfg(target_arch = "x86_64")]
 #[allow(dead_code)] // selected per build target (and, later, per detected CPU)
 pub mod threat512 {
-    use crate::nnue::simd::avx512 as simd;
     use crate::nnue::L1_SIZE;
+    use crate::nnue::simd::avx512 as simd;
 
     /// `input_acc`: source accumulator (null = zero-init for full recompute).
     /// `output_acc`: destination accumulator.
@@ -762,41 +790,41 @@ pub mod k_native {
 
 #[cfg(all(
     target_arch = "x86_64",
-    target_feature = "avx512f",
-    target_feature = "avx512vnni"
+    target_feature = "avx2",
+    not(target_feature = "avx512f")
 ))]
-pub(crate) use k_vnni512 as k;
+pub(crate) use k_avx2 as k;
 #[cfg(all(
     target_arch = "x86_64",
     target_feature = "avx512f",
     not(target_feature = "avx512vnni")
 ))]
 pub(crate) use k_avx512 as k;
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "avx2",
-    not(target_feature = "avx512f")
-))]
-pub(crate) use k_avx2 as k;
-#[cfg(all(target_arch = "x86_64", not(target_feature = "avx2")))]
-pub(crate) use k_scalar as k;
 #[cfg(all(target_arch = "aarch64", target_feature = "dotprod"))]
 pub(crate) use k_dotprod as k;
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+pub(crate) use k_native as k;
 #[cfg(all(
     target_arch = "aarch64",
     target_feature = "neon",
     not(target_feature = "dotprod")
 ))]
 pub(crate) use k_neon as k;
-#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-pub(crate) use k_native as k;
+#[cfg(all(target_arch = "x86_64", not(target_feature = "avx2")))]
+pub(crate) use k_scalar as k;
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vnni"
+))]
+pub(crate) use k_vnni512 as k;
 
-/// Threat batch apply for the current build target: the hand-scheduled 20-ZMM
-/// form when AVX-512 is available, the generic row-loop form otherwise.
-#[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
-pub(crate) use threat512::threat_batch;
 #[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f")))]
 pub(crate) use k::threat_batch;
+/// Threat batch apply for the current build target: the hand-scheduled 16-ZMM
+/// form when AVX-512 is available, the tiled generic form otherwise.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+pub(crate) use threat512::threat_batch;
 
 /// True when the build target already guarantees the whole top-tier feature
 /// set, so the resolver could never pick anything else: the dispatch helpers
@@ -828,9 +856,9 @@ pub(crate) const STATIC_TOP: bool = false;
 #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
 pub mod arm {
     use super::{k_dotprod, k_neon};
+    use crate::nnue::L1_SIZE;
     use crate::nnue::accumulator::Accumulator;
     use crate::nnue::network::Aligned;
-    use crate::nnue::L1_SIZE;
     use crate::types::Color;
     use std::sync::OnceLock;
 
@@ -841,8 +869,7 @@ pub mod arm {
         pub acc_add1_sub2: unsafe fn(*const i16, *mut i16, usize, usize, usize),
         pub acc_add2_sub2: unsafe fn(*const i16, *mut i16, usize, usize, usize, usize),
         pub finny_apply: unsafe fn(*mut i16, &[usize], &[usize]),
-        pub threat_batch:
-            unsafe fn(*const i16, *mut i16, *const [i8; L1_SIZE], &[u32], &[u32]),
+        pub threat_batch: unsafe fn(*const i16, *mut i16, *const [i8; L1_SIZE], &[u32], &[u32]),
         pub dotprod: bool,
         #[allow(dead_code)]
         pub forced: bool,
@@ -863,14 +890,12 @@ pub mod arm {
     }
 
     fn resolve() -> Table {
-        let detected = cfg!(target_feature = "dotprod")
-            || std::arch::is_aarch64_feature_detected!("dotprod");
+        let detected =
+            cfg!(target_feature = "dotprod") || std::arch::is_aarch64_feature_detected!("dotprod");
         let cap = read_cap();
         let (use_dot, forced) = if super::STATIC_TOP {
             if cap.is_some() {
-                eprintln!(
-                    "info string GAIA_SIMD ignored: this build pins DOTPROD at compile time"
-                );
+                eprintln!("info string GAIA_SIMD ignored: this build pins DOTPROD at compile time");
             }
             (true, false)
         } else if let Some(want) = cap {
@@ -946,9 +971,9 @@ pub mod arm {
 // ============================================================
 
 pub(crate) mod dispatch {
+    use crate::nnue::L1_SIZE;
     use crate::nnue::accumulator::Accumulator;
     use crate::nnue::network::Aligned;
-    use crate::nnue::L1_SIZE;
     use crate::types::Color;
 
     /// Forward pass through the dense layers, on the resolved tier.
@@ -1257,7 +1282,11 @@ mod tests {
             state ^= state << 13;
             state ^= state >> 7;
             state ^= state << 17;
-            ft_out.0[i] = if state % 5 == 0 { (state >> 32) as u8 } else { 0 };
+            ft_out.0[i] = if state % 5 == 0 {
+                (state >> 32) as u8
+            } else {
+                0
+            };
         }
 
         let (want_idx, want_n) = unsafe { k_scalar::find_nnz_generic(&ft_out) };
@@ -1276,6 +1305,34 @@ mod tests {
         }
     }
 
+    /// Element-wise wrapping i16: all subs, then all adds. This is the old
+    /// row-loop contract; the tiled kernels must match it bit for bit, or the
+    /// bench node count moves.
+    fn threat_batch_elementwise(
+        input: Option<&[i16; L1_SIZE]>,
+        weights: &[[i8; L1_SIZE]],
+        adds: &[u32],
+        subs: &[u32],
+    ) -> [i16; L1_SIZE] {
+        let mut out = match input {
+            Some(v) => *v,
+            None => [0i16; L1_SIZE],
+        };
+        for &s in subs {
+            let row = &weights[s as usize];
+            for i in 0..L1_SIZE {
+                out[i] = out[i].wrapping_sub(row[i] as i16);
+            }
+        }
+        for &a in adds {
+            let row = &weights[a as usize];
+            for i in 0..L1_SIZE {
+                out[i] = out[i].wrapping_add(row[i] as i16);
+            }
+        }
+        out
+    }
+
     #[test]
     fn threat_batch_forms_agree_on_synthetic_weights() {
         // Synthetic weight rows: no dependence on a loaded network.
@@ -1290,28 +1347,91 @@ mod tests {
         for i in 0..L1_SIZE {
             input.0[i] = ((i as i32 * 97) % 1601 - 800) as i16;
         }
-        let adds: [u32; 3] = [0, 3, 6];
-        let subs: [u32; 2] = [1, 5];
+        // Values that wrap i16: the tiled walk must not reorder subs vs adds
+        // on a lane, or these diverge from the element-wise oracle.
+        let mut wrap_input = Aligned([0i16; L1_SIZE]);
+        for i in 0..L1_SIZE {
+            wrap_input.0[i] = if i % 2 == 0 { 30_000 } else { -30_000 };
+        }
+        let wrap_weights: Vec<[i8; L1_SIZE]> = (0..ROWS)
+            .map(|r| {
+                let mut row = [0i8; L1_SIZE];
+                for (i, w) in row.iter_mut().enumerate() {
+                    *w = if (r + i) % 2 == 0 { 127 } else { -128 };
+                }
+                row
+            })
+            .collect();
 
-        let run = |f: unsafe fn(*const i16, *mut i16, *const [i8; L1_SIZE], &[u32], &[u32]),
-                   from_null: bool| {
+        let cases: &[(
+            &str,
+            &Aligned<[i16; L1_SIZE]>,
+            &[[i8; L1_SIZE]],
+            &[u32],
+            &[u32],
+        )] = &[
+            ("copy", &input, &weights, &[0, 3, 6], &[1, 5]),
+            ("from_zero_pattern", &input, &weights, &[0, 3, 6], &[1, 5]),
+            ("empty", &input, &weights, &[], &[]),
+            ("adds_only", &input, &weights, &[2, 7], &[]),
+            ("subs_only", &input, &weights, &[], &[4, 1, 0]),
+            (
+                "wrap",
+                &wrap_input,
+                &wrap_weights,
+                &[0, 1, 2, 3],
+                &[4, 5, 6, 7],
+            ),
+        ];
+
+        type BatchFn = unsafe fn(*const i16, *mut i16, *const [i8; L1_SIZE], &[u32], &[u32]);
+        let run = |f: BatchFn, src: *const i16, w: &[[i8; L1_SIZE]], adds: &[u32], subs: &[u32]| {
             let mut out = Aligned([0i16; L1_SIZE]);
-            let src = if from_null { std::ptr::null() } else { input.0.as_ptr() };
-            unsafe { f(src, out.0.as_mut_ptr(), weights.as_ptr(), &adds, &subs) };
+            unsafe { f(src, out.0.as_mut_ptr(), w.as_ptr(), adds, subs) };
             out
         };
+        let run_in_place = |f: BatchFn,
+                            start: &[i16; L1_SIZE],
+                            w: &[[i8; L1_SIZE]],
+                            adds: &[u32],
+                            subs: &[u32]| {
+            let mut acc = Aligned(*start);
+            unsafe {
+                f(acc.0.as_ptr(), acc.0.as_mut_ptr(), w.as_ptr(), adds, subs);
+            }
+            acc
+        };
 
-        for from_null in [false, true] {
-            let want = run(k_scalar::threat_batch, from_null);
+        for (name, start, w, adds, subs) in cases {
+            let from_null = *name == "from_zero_pattern";
+            let want = threat_batch_elementwise(
+                if from_null { None } else { Some(&start.0) },
+                w,
+                adds,
+                subs,
+            );
+            let src = if from_null {
+                std::ptr::null()
+            } else {
+                start.0.as_ptr()
+            };
+
+            let got = run(k_scalar::threat_batch, src, w, adds, subs);
+            assert_eq!(got.0, want, "scalar threat batch ({name})");
+
             if std::arch::is_x86_feature_detected!("avx2") {
-                let got = run(k_avx2::threat_batch, from_null);
-                assert_eq!(got.0, want.0, "avx2 threat batch (from_null={from_null})");
+                let got = run(k_avx2::threat_batch, src, w, adds, subs);
+                assert_eq!(got.0, want, "avx2 threat batch ({name})");
+                if !from_null {
+                    let got = run_in_place(k_avx2::threat_batch, &start.0, w, adds, subs);
+                    assert_eq!(got.0, want, "avx2 threat batch in-place ({name})");
+                }
             }
             if std::arch::is_x86_feature_detected!("avx512f")
                 && std::arch::is_x86_feature_detected!("avx512bw")
             {
-                let got = run(threat512::threat_batch, from_null);
-                assert_eq!(got.0, want.0, "threat512 batch (from_null={from_null})");
+                let got = run(threat512::threat_batch, src, w, adds, subs);
+                assert_eq!(got.0, want, "threat512 batch ({name})");
             }
         }
     }

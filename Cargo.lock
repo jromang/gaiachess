@@ -252,6 +252,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "cpu-time"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e9e393a7668fe1fad3075085b86c781883000b4ede868f43627b34a87c8b7ded"
+dependencies = [
+ "libc",
+ "winapi",
+]
+
+[[package]]
 name = "crc32fast"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -395,10 +405,11 @@ dependencies = [
 
 [[package]]
 name = "gaiachess"
-version = "4.3.1"
+version = "4.3.2"
 dependencies = [
  "bpaf",
  "cc",
+ "cpu-time",
  "ctrlc",
  "indicatif",
  "macroquad",
@@ -692,9 +703,8 @@ dependencies = [
 
 [[package]]
 name = "nalimov"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "55c539674b035ac5c39a3074ca7874794a692f7f26725d2b2affb780d27c29e0"
+version = "0.3.0"
+source = "git+https://github.com/jromang/nalimov-rs?rev=279c4843c9fd1d4bab8910ea46037e3f51be3418#279c4843c9fd1d4bab8910ea46037e3f51be3418"
 
 [[package]]
 name = "ndk"

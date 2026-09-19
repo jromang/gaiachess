@@ -110,7 +110,12 @@ enum MenuRow {
 }
 
 impl MenuRow {
-    const ALL: [MenuRow; 4] = [MenuRow::TakeBack, MenuRow::Restart, MenuRow::Sound, MenuRow::Quit];
+    const ALL: [MenuRow; 4] = [
+        MenuRow::TakeBack,
+        MenuRow::Restart,
+        MenuRow::Sound,
+        MenuRow::Quit,
+    ];
 
     /// Where the row sits in the panel, so opening the menu on a particular row names
     /// it rather than counting to it.
@@ -534,7 +539,12 @@ impl GameScene {
             sfx.push(Sfx::Select);
             return true;
         }
-        let Some(m) = self.targets.iter().copied().find(|m| game::drop_square(*m) == sq || m.to_sq() == sq) else {
+        let Some(m) = self
+            .targets
+            .iter()
+            .copied()
+            .find(|m| game::drop_square(*m) == sq || m.to_sq() == sq)
+        else {
             return false;
         };
         self.begin_move_from(m, start);
@@ -602,7 +612,11 @@ impl GameScene {
 
     fn update_menu(&mut self, input: &Input, sfx: &mut Queue) -> GameExit {
         if input.dir(Dir::Down) || input.dir(Dir::Up) {
-            let step = if input.dir(Dir::Down) { 1 } else { MenuRow::ALL.len() - 1 };
+            let step = if input.dir(Dir::Down) {
+                1
+            } else {
+                MenuRow::ALL.len() - 1
+            };
             self.menu_row = (self.menu_row + step) % MenuRow::ALL.len();
             sfx.push(Sfx::Cursor);
         }
@@ -623,7 +637,11 @@ impl GameScene {
             let row = MenuRow::ALL[self.menu_row];
             // A setting changing, not a screen being taken — the same distinction the
             // title menu draws between its own rows.
-            sfx.push(if row == MenuRow::Sound { Sfx::Confirm } else { Sfx::Action });
+            sfx.push(if row == MenuRow::Sound {
+                Sfx::Confirm
+            } else {
+                Sfx::Action
+            });
             match row {
                 MenuRow::TakeBack => self.take_back(sfx),
                 MenuRow::Restart => self.restart(),
@@ -679,8 +697,13 @@ impl GameScene {
                 // through the player's turn, and only needs telling the turn is over.
                 if !self.engine.ponderhit(&self.game.pos) {
                     let limits = self.engine_budget(0);
-                    self.engine
-                        .think(&self.game.pos, &self.game.moves, limits, self.level, self.handicap_seed);
+                    self.engine.think(
+                        &self.game.pos,
+                        &self.game.moves,
+                        limits,
+                        self.level,
+                        self.handicap_seed,
+                    );
                 }
                 self.cpu_state = CpuState::Thinking;
                 self.waited = 0;
@@ -769,7 +792,8 @@ impl GameScene {
         moves.push(thought.best);
         moves.push(expected);
         let limits = self.engine_budget(self.clocks.increment_ms());
-        self.engine.ponder(&pos, &moves, limits, self.level, self.handicap_seed);
+        self.engine
+            .ponder(&pos, &moves, limits, self.level, self.handicap_seed);
     }
 
     /// The engine's hand closes on the piece and sets off for the destination.
@@ -842,7 +866,12 @@ impl GameScene {
                     self.promo_index = 0;
                     self.mode = UiMode::Promo;
                     sfx.push(Sfx::Select);
-                } else if let Some(m) = self.targets.iter().copied().find(|m| game::drop_square(*m) == sq || m.to_sq() == sq) {
+                } else if let Some(m) = self
+                    .targets
+                    .iter()
+                    .copied()
+                    .find(|m| game::drop_square(*m) == sq || m.to_sq() == sq)
+                {
                     self.begin_move(m);
                 }
             }
@@ -1021,9 +1050,7 @@ impl GameScene {
         self.banner = match self.game.outcome {
             Some(Outcome::Checkmate(_)) => Some(BigText::new("checkmate", 84.0, 12)),
             Some(Outcome::Flag(_)) => Some(BigText::new("time", 84.0, 12)),
-            Some(Outcome::Stalemate) | Some(Outcome::Draw) => {
-                Some(BigText::new("draw", 84.0, 12))
-            }
+            Some(Outcome::Stalemate) | Some(Outcome::Draw) => Some(BigText::new("draw", 84.0, 12)),
             None => None,
         };
         if self.game.outcome.is_some() {
@@ -1187,13 +1214,7 @@ impl GameScene {
             } else {
                 12
             };
-            font::print(
-                fb,
-                &text,
-                FB_W as i32 - 4 - font::width(&text),
-                y,
-                ink,
-            );
+            font::print(fb, &text, FB_W as i32 - 4 - font::width(&text), y, ink);
         }
     }
 
@@ -1208,7 +1229,11 @@ impl GameScene {
             if selected {
                 fb.rectfill(x + 3, ry - 1, x + w - 4, ry + 7, scheme.accent);
             }
-            let ink = if selected { scheme.panel_edge } else { scheme.text };
+            let ink = if selected {
+                scheme.panel_edge
+            } else {
+                scheme.text
+            };
             let label = self.say(row.label(self.config.sound));
             font::print_centered(fb, label, x + w / 2, ry, ink);
         }
@@ -1364,8 +1389,7 @@ impl GameScene {
         for m in &self.targets {
             let dest = game::drop_square(*m);
             let occupied = m.move_type() != MT_CASTLING
-                && (self.game.pos.piece_on(dest) != Piece::NONE
-                    || m.move_type() == MT_EN_PASSANT);
+                && (self.game.pos.piece_on(dest) != Piece::NONE || m.move_type() == MT_EN_PASSANT);
             let mark = if occupied { Ui::MoveRing } else { Ui::MoveDot };
             let sprite = assets.ui(mark);
             let (x, y) = board::tile_xy(dest, self.flipped);
@@ -1403,7 +1427,14 @@ impl GameScene {
         }
         if self.game.pos.in_check() {
             let king = self.game.pos.king_sq(self.game.pos.side_to_move);
-            board::draw_outline(fb, assets, king, self.flipped, PieceType::King, scheme.accent);
+            board::draw_outline(
+                fb,
+                assets,
+                king,
+                self.flipped,
+                PieceType::King,
+                scheme.accent,
+            );
         }
     }
 
@@ -1463,7 +1494,13 @@ impl GameScene {
         fb.rectfill(x + 2, y + 3, x + w + 1, y + h + 1, rgba(0x000000, 90));
         fb.rectfill(x, y, x + w - 1, y + h - 1, scheme.panel);
         fb.rect(x, y, x + w - 1, y + h - 1, scheme.panel_edge);
-        font::print_centered(fb, self.say(Key::PromoteTo), FB_W as i32 / 2, y + 3, scheme.text);
+        font::print_centered(
+            fb,
+            self.say(Key::PromoteTo),
+            FB_W as i32 / 2,
+            y + 3,
+            scheme.text,
+        );
 
         let side = self.game.pos.side_to_move;
         for (i, pt) in PROMOTIONS.iter().enumerate() {
@@ -1535,8 +1572,8 @@ impl Typewriter {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::super::lang::Lang;
+    use super::*;
 
     /// A scene with both sides human and the opening parade over with.
     fn hotseat() -> GameScene {
@@ -1562,7 +1599,10 @@ mod tests {
         after.make_move(best);
         let reply = crate::uci::parse_uci_move(&after, expected)
             .unwrap_or_else(|| panic!("{expected} is not legal after {played}"));
-        Thought { best, ponder: Some(reply) }
+        Thought {
+            best,
+            ponder: Some(reply),
+        }
     }
 
     fn settle(scene: &mut GameScene) {
@@ -1622,7 +1662,11 @@ mod tests {
         assert_eq!(scene.update(&take, &mut Queue::default()), GameExit::Stay);
         assert!(!scene.sound(), "the sound is off");
         assert_eq!(scene.mode, UiMode::Menu, "and the menu is still up");
-        assert_eq!(MenuRow::Sound.label(scene.sound()), Key::SoundOff, "which the row says");
+        assert_eq!(
+            MenuRow::Sound.label(scene.sound()),
+            Key::SoundOff,
+            "which the row says"
+        );
 
         assert_eq!(scene.update(&take, &mut Queue::default()), GameExit::Stay);
         assert!(scene.sound(), "and it comes back on");
@@ -1654,15 +1698,26 @@ mod tests {
     fn the_menu_opens_while_the_engine_is_on_the_move() {
         let mut scene = machines();
         settle(&mut scene);
-        assert!(scene.engine_to_move(), "the board is the engine's, both sides of it");
+        assert!(
+            scene.engine_to_move(),
+            "the board is the engine's, both sides of it"
+        );
 
         let mut cancel = Input::default();
         cancel.cancel = true;
         assert_eq!(scene.update(&cancel, &mut Queue::default()), GameExit::Stay);
-        assert_eq!(scene.mode, UiMode::Menu, "esc reaches the menu, as the hint says");
+        assert_eq!(
+            scene.mode,
+            UiMode::Menu,
+            "esc reaches the menu, as the hint says"
+        );
 
         assert_eq!(scene.update(&cancel, &mut Queue::default()), GameExit::Stay);
-        assert_eq!(scene.mode, UiMode::Select, "and esc again hands the board back");
+        assert_eq!(
+            scene.mode,
+            UiMode::Select,
+            "and esc again hands the board back"
+        );
 
         // Which makes the row that ends the game reachable, the point of all of it.
         assert_eq!(scene.update(&cancel, &mut Queue::default()), GameExit::Stay);
@@ -1686,9 +1741,17 @@ mod tests {
         assert_eq!(scene.mode, UiMode::Menu);
 
         scene.update(&cancel, &mut Queue::default());
-        assert_eq!(scene.mode, UiMode::Ani, "the parade takes up where it stopped");
+        assert_eq!(
+            scene.mode,
+            UiMode::Ani,
+            "the parade takes up where it stopped"
+        );
         settle(&mut scene);
-        assert_eq!(scene.game.pos.side_to_move, Color::White, "and nothing was played");
+        assert_eq!(
+            scene.game.pos.side_to_move,
+            Color::White,
+            "and nothing was played"
+        );
     }
 
     /// Every row has to fit the panel it is written across, in a font three pixels wide.
@@ -1715,11 +1778,19 @@ mod tests {
         let grab = aim(&scene, Square::E2, true, true);
         step(&mut scene, grab);
         assert_eq!(scene.mode, UiMode::Drag);
-        assert_eq!(scene.hidden, 1 << Square::E2.0, "the piece has left its square");
+        assert_eq!(
+            scene.hidden,
+            1 << Square::E2.0,
+            "the piece has left its square"
+        );
 
         let carry = aim(&scene, Square::E4, true, false);
         step(&mut scene, carry);
-        assert_eq!(scene.mode, UiMode::Drag, "still carrying while the button is down");
+        assert_eq!(
+            scene.mode,
+            UiMode::Drag,
+            "still carrying while the button is down"
+        );
 
         let release = aim(&scene, Square::E4, false, false);
         step(&mut scene, release);
@@ -1738,7 +1809,10 @@ mod tests {
         // Three squares is no move a pawn has.
         let release = aim(&scene, Square::E5, false, false);
         step(&mut scene, release);
-        assert!(scene.animating(), "the piece hops back rather than vanishing");
+        assert!(
+            scene.animating(),
+            "the piece hops back rather than vanishing"
+        );
         assert!(scene.pending.is_none(), "nothing is waiting to be played");
 
         settle(&mut scene);
@@ -1755,7 +1829,11 @@ mod tests {
         step(&mut scene, press);
         let release = aim(&scene, Square::G1, false, false);
         step(&mut scene, release);
-        assert_eq!(scene.mode, UiMode::Move, "picked up, waiting for a destination");
+        assert_eq!(
+            scene.mode,
+            UiMode::Move,
+            "picked up, waiting for a destination"
+        );
         assert_eq!(scene.hidden, 0, "and standing on its square while it waits");
         assert_eq!(scene.targets.len(), 2, "the knight has two moves to show");
 
@@ -1823,7 +1901,11 @@ mod tests {
         assert!(steps > CHECK_HOLD + CHECK_PAUSE, "the wait was cut short");
         // And it does get going once the board is quiet again.
         scene.update(&Input::default(), &mut Queue::default());
-        assert_ne!(scene.cpu_state, CpuState::Idle, "the engine never took its turn");
+        assert_ne!(
+            scene.cpu_state,
+            CpuState::Idle,
+            "the engine never took its turn"
+        );
     }
 
     #[test]
@@ -1861,7 +1943,10 @@ mod tests {
         let mut projected = scene.game.pos.clone();
         projected.make_move(thought.best);
         projected.make_move(thought.ponder.expect("the guess names a reply"));
-        assert!(scene.engine.ponderhit(&projected), "the wrong position was pondered");
+        assert!(
+            scene.engine.ponderhit(&projected),
+            "the wrong position was pondered"
+        );
     }
 
     #[test]
@@ -1873,7 +1958,10 @@ mod tests {
         scene.start_pondering(&guess(&scene, "e2e4", "e7e5"));
         play(&mut scene, "e2e4");
         play(&mut scene, "e7e5");
-        assert!(scene.engine.is_pondering(), "the wait was given up on partway");
+        assert!(
+            scene.engine.is_pondering(),
+            "the wait was given up on partway"
+        );
         // And now the board is there. Everything turned over while the player was
         // choosing counts towards the move about to be asked for; had the projection
         // been a ply out, or the history not carried, the two would not meet.
@@ -1936,12 +2024,18 @@ mod tests {
         scene.start_pondering(&guess(&scene, "g2g4", "d8h4"));
         assert!(scene.engine.is_pondering());
         play(&mut scene, "g2g4");
-        assert!(scene.engine.is_pondering(), "a game still going lost its thinking");
+        assert!(
+            scene.engine.is_pondering(),
+            "a game still going lost its thinking"
+        );
         // And that is mate: what was being turned over is now a position nobody reaches,
         // and a core left turning it over is a core spent on nothing.
         play(&mut scene, "d8h4");
         assert!(scene.game.outcome.is_some(), "d8h4 is mate");
-        assert!(!scene.engine.is_pondering(), "the engine went on thinking past the end");
+        assert!(
+            !scene.engine.is_pondering(),
+            "the engine went on thinking past the end"
+        );
     }
 
     #[test]
@@ -2099,7 +2193,11 @@ mod tests {
         // Everything the pointer added is the arrow under it, so the board behind is
         // untouched — and it is an arrow, not a second hand.
         let item = scene.pointer_item();
-        assert_eq!(item, Ui::Pointer, "no second hand while the engine holds the board");
+        assert_eq!(
+            item,
+            Ui::Pointer,
+            "no second hand while the engine holds the board"
+        );
         let sprite = assets.ui(item);
         let (hx, hy) = item.hotspot();
         let (ox, oy) = (at.0 - hx, at.1 - hy);
@@ -2204,7 +2302,10 @@ mod tests {
         input.fire(Dir::Left);
         step(&mut scene, input);
         assert_eq!(scene.cursor.sq, Square::D2, "the hand stepped one square");
-        assert!(scene.mouse.is_none(), "and no pointer appeared out of nowhere");
+        assert!(
+            scene.mouse.is_none(),
+            "and no pointer appeared out of nowhere"
+        );
 
         let mut confirm = Input::default();
         confirm.confirm = true;

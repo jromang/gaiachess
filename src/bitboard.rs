@@ -9,8 +9,9 @@
 //! Non-sliding attacks (knight, king, pawn) use pre-computed lookup tables.
 //!
 //! All tables are computed at compile time via `const fn` — zero `unsafe`.
-//! Magic numbers generated with a trial-and-error finder (fixed SplitMix64 seed,
-//! generator kept in tools/scripts/magic_finder.rs).
+//! AArch64 uses Hyperbola Quintessence with its native `rbit` instruction. Other
+//! portable targets use magic bitboards; their numbers come from a trial-and-error
+//! finder with a fixed SplitMix64 seed (`tools/scripts/magic_finder.rs`).
 
 use crate::types::*;
 
@@ -45,9 +46,13 @@ pub const RANK_7: u64 = RANK_1 << 48;
 pub const RANK_8: u64 = RANK_1 << 56;
 
 #[allow(dead_code)]
-pub const FILES: [u64; 8] = [FILE_A, FILE_B, FILE_C, FILE_D, FILE_E, FILE_F, FILE_G, FILE_H];
+pub const FILES: [u64; 8] = [
+    FILE_A, FILE_B, FILE_C, FILE_D, FILE_E, FILE_F, FILE_G, FILE_H,
+];
 #[allow(dead_code)]
-pub const RANKS: [u64; 8] = [RANK_1, RANK_2, RANK_3, RANK_4, RANK_5, RANK_6, RANK_7, RANK_8];
+pub const RANKS: [u64; 8] = [
+    RANK_1, RANK_2, RANK_3, RANK_4, RANK_5, RANK_6, RANK_7, RANK_8,
+];
 
 // ============================================================
 // Bitboard operations
@@ -86,35 +91,60 @@ pub fn more_than_one(bb: u64) -> bool {
 // ============================================================
 
 #[inline(always)]
-pub const fn shift_north(bb: u64) -> u64 { bb << 8 }
+pub const fn shift_north(bb: u64) -> u64 {
+    bb << 8
+}
 #[inline(always)]
-pub const fn shift_south(bb: u64) -> u64 { bb >> 8 }
+pub const fn shift_south(bb: u64) -> u64 {
+    bb >> 8
+}
 #[inline(always)]
-pub const fn shift_east(bb: u64) -> u64 { (bb & !FILE_H) << 1 }
+pub const fn shift_east(bb: u64) -> u64 {
+    (bb & !FILE_H) << 1
+}
 #[inline(always)]
-pub const fn shift_west(bb: u64) -> u64 { (bb & !FILE_A) >> 1 }
+pub const fn shift_west(bb: u64) -> u64 {
+    (bb & !FILE_A) >> 1
+}
 #[inline(always)]
-pub const fn shift_north_east(bb: u64) -> u64 { (bb & !FILE_H) << 9 }
+pub const fn shift_north_east(bb: u64) -> u64 {
+    (bb & !FILE_H) << 9
+}
 #[inline(always)]
-pub const fn shift_north_west(bb: u64) -> u64 { (bb & !FILE_A) << 7 }
+pub const fn shift_north_west(bb: u64) -> u64 {
+    (bb & !FILE_A) << 7
+}
 #[inline(always)]
-pub const fn shift_south_east(bb: u64) -> u64 { (bb & !FILE_H) >> 7 }
+pub const fn shift_south_east(bb: u64) -> u64 {
+    (bb & !FILE_H) >> 7
+}
 #[inline(always)]
-pub const fn shift_south_west(bb: u64) -> u64 { (bb & !FILE_A) >> 9 }
+pub const fn shift_south_west(bb: u64) -> u64 {
+    (bb & !FILE_A) >> 9
+}
 
 #[inline(always)]
 pub fn pawn_push_bb(bb: u64, c: Color) -> u64 {
-    match c { Color::White => shift_north(bb), Color::Black => shift_south(bb) }
+    match c {
+        Color::White => shift_north(bb),
+        Color::Black => shift_south(bb),
+    }
 }
 
 #[inline(always)]
 pub fn pawn_attack_east(bb: u64, c: Color) -> u64 {
-    match c { Color::White => shift_north_east(bb), Color::Black => shift_south_east(bb) }
+    match c {
+        Color::White => shift_north_east(bb),
+        Color::Black => shift_south_east(bb),
+    }
 }
 
 #[inline(always)]
 pub fn pawn_attack_west(bb: u64, c: Color) -> u64 {
-    match c { Color::White => shift_north_west(bb), Color::Black => shift_south_west(bb) }
+    match c {
+        Color::White => shift_north_west(bb),
+        Color::Black => shift_south_west(bb),
+    }
 }
 
 // ============================================================
@@ -122,7 +152,7 @@ pub fn pawn_attack_west(bb: u64, c: Color) -> u64 {
 // Compiled only when AVX2 SIMD attacks are not available.
 // ============================================================
 
-#[cfg(not(target_feature = "avx2"))]
+#[cfg(all(not(target_feature = "avx2"), not(target_arch = "aarch64")))]
 #[derive(Clone, Copy)]
 struct MagicEntry {
     mask: u64,
@@ -131,7 +161,7 @@ struct MagicEntry {
     offset: u32,
 }
 
-#[cfg(not(target_feature = "avx2"))]
+#[cfg(all(not(target_feature = "avx2"), not(target_arch = "aarch64")))]
 #[inline(always)]
 const fn magic_index(occupancies: u64, entry: &MagicEntry) -> usize {
     let hash = (occupancies & entry.mask).wrapping_mul(entry.magic) >> entry.shift;
@@ -220,7 +250,7 @@ pub(crate) const fn init_pawn_attacks() -> [[u64; 64]; 2] {
     table
 }
 
-#[cfg(not(target_feature = "avx2"))]
+#[cfg(all(not(target_feature = "avx2"), not(target_arch = "aarch64")))]
 const fn init_rook_table() -> [u64; 102400] {
     let mut table = [0u64; 102400];
     let mut sq = 0u8;
@@ -233,14 +263,16 @@ const fn init_rook_table() -> [u64; 102400] {
             let idx = magic_index(occ, entry);
             table[idx] = attacks;
             occ = occ.wrapping_sub(mask) & mask;
-            if occ == 0 { break; }
+            if occ == 0 {
+                break;
+            }
         }
         sq += 1;
     }
     table
 }
 
-#[cfg(not(target_feature = "avx2"))]
+#[cfg(all(not(target_feature = "avx2"), not(target_arch = "aarch64")))]
 const fn init_bishop_table() -> [u64; 5248] {
     let mut table = [0u64; 5248];
     let mut sq = 0u8;
@@ -253,7 +285,9 @@ const fn init_bishop_table() -> [u64; 5248] {
             let idx = magic_index(occ, entry);
             table[idx] = attacks;
             occ = occ.wrapping_sub(mask) & mask;
-            if occ == 0 { break; }
+            if occ == 0 {
+                break;
+            }
         }
         sq += 1;
     }
@@ -304,9 +338,9 @@ const fn init_between_line() -> ([[u64; 64]; 64], [[u64; 64]; 64]) {
 static KNIGHT_ATTACKS: [u64; 64] = init_knight_attacks();
 static KING_ATTACKS: [u64; 64] = init_king_attacks();
 static PAWN_ATTACKS: [[u64; 64]; 2] = init_pawn_attacks();
-#[cfg(not(target_feature = "avx2"))]
+#[cfg(all(not(target_feature = "avx2"), not(target_arch = "aarch64")))]
 static ROOK_TABLE: [u64; 102400] = init_rook_table();
-#[cfg(not(target_feature = "avx2"))]
+#[cfg(all(not(target_feature = "avx2"), not(target_arch = "aarch64")))]
 static BISHOP_TABLE: [u64; 5248] = init_bishop_table();
 
 const _BETWEEN_LINE: ([[u64; 64]; 64], [[u64; 64]; 64]) = init_between_line();
@@ -353,7 +387,7 @@ pub fn pawn_attacks(sq: Square, c: Color) -> u64 {
 }
 
 /// Magic-based bishop attacks (fallback when AVX2 is not available).
-#[cfg(not(target_feature = "avx2"))]
+#[cfg(all(not(target_feature = "avx2"), not(target_arch = "aarch64")))]
 #[inline(always)]
 fn magic_bishop_attacks(sq: Square, occupied: u64) -> u64 {
     let entry = &BISHOP_MAGICS[sq.index()];
@@ -362,12 +396,85 @@ fn magic_bishop_attacks(sq: Square, occupied: u64) -> u64 {
 }
 
 /// Magic-based rook attacks (fallback when AVX2 is not available).
-#[cfg(not(target_feature = "avx2"))]
+#[cfg(all(not(target_feature = "avx2"), not(target_arch = "aarch64")))]
 #[inline(always)]
 fn magic_rook_attacks(sq: Square, occupied: u64) -> u64 {
     let entry = &ROOK_MAGICS[sq.index()];
     let idx = magic_index(occupied, entry);
     ROOK_TABLE[idx]
+}
+
+// ============================================================
+// AArch64 sliding attacks — Hyperbola Quintessence
+// ============================================================
+
+/// ARM64 has a single-instruction 64-bit bit reversal (`rbit`). Hyperbola
+/// Quintessence uses it to find the nearest blocker at both ends of a line,
+/// avoiding the large and cache-sensitive magic attack tables on this target.
+/// Kept in test builds too so every occupancy can be checked on non-ARM hosts.
+#[cfg(any(target_arch = "aarch64", test))]
+mod aarch64_hq {
+    use super::*;
+
+    #[derive(Clone, Copy)]
+    struct Entry {
+        line1: u64,
+        line2: u64,
+    }
+
+    const fn line_mask(sq: u8, first: i8, second: i8) -> u64 {
+        sliding_attack_otf(sq, 0, &[first, second, first, second])
+    }
+
+    const fn build_entries(bishop: bool) -> [Entry; 64] {
+        let mut entries = [Entry { line1: 0, line2: 0 }; 64];
+        let mut sq = 0u8;
+        while sq < 64 {
+            entries[sq as usize] = if bishop {
+                Entry {
+                    line1: line_mask(sq, NORTH_EAST, SOUTH_WEST),
+                    line2: line_mask(sq, NORTH_WEST, SOUTH_EAST),
+                }
+            } else {
+                Entry {
+                    line1: line_mask(sq, NORTH, SOUTH),
+                    line2: line_mask(sq, EAST, WEST),
+                }
+            };
+            sq += 1;
+        }
+        entries
+    }
+
+    static BISHOP_ENTRIES: [Entry; 64] = build_entries(true);
+    static ROOK_ENTRIES: [Entry; 64] = build_entries(false);
+
+    #[inline(always)]
+    fn line_attacks(sq: Square, occupied: u64, mask: u64) -> u64 {
+        let occupancy = occupied & mask;
+        let forward = occupancy.wrapping_sub(sq.bb());
+        let reverse_origin = 1u64 << (63 - sq.0);
+        let backward = occupancy
+            .reverse_bits()
+            .wrapping_sub(reverse_origin)
+            .reverse_bits();
+        (forward ^ backward) & mask
+    }
+
+    #[inline(always)]
+    fn attacks(entry: &Entry, sq: Square, occupied: u64) -> u64 {
+        line_attacks(sq, occupied, entry.line1) | line_attacks(sq, occupied, entry.line2)
+    }
+
+    #[inline(always)]
+    pub fn bishop_attacks(sq: Square, occupied: u64) -> u64 {
+        attacks(&BISHOP_ENTRIES[sq.index()], sq, occupied)
+    }
+
+    #[inline(always)]
+    pub fn rook_attacks(sq: Square, occupied: u64) -> u64 {
+        attacks(&ROOK_ENTRIES[sq.index()], sq, occupied)
+    }
 }
 
 // ============================================================
@@ -379,7 +486,7 @@ fn magic_rook_attacks(sq: Square, occupied: u64) -> u64 {
 mod pext {
     #![allow(unsafe_op_in_unsafe_fn)]
 
-    use super::{sliding_attack_otf, BISHOP_DELTAS, ROOK_DELTAS};
+    use super::{BISHOP_DELTAS, ROOK_DELTAS, sliding_attack_otf};
     use crate::types::Square;
 
     #[derive(Clone, Copy)]
@@ -395,12 +502,16 @@ mod pext {
         let mut mask = 0u64;
         let mut f = 1;
         while f < 7 {
-            if f != file { mask |= 1u64 << (rank * 8 + f); }
+            if f != file {
+                mask |= 1u64 << (rank * 8 + f);
+            }
             f += 1;
         }
         let mut r = 1;
         while r < 7 {
-            if r != rank { mask |= 1u64 << (r * 8 + file); }
+            if r != rank {
+                mask |= 1u64 << (r * 8 + file);
+            }
             r += 1;
         }
         mask
@@ -486,7 +597,10 @@ mod pext {
         let mut sq = 0u8;
         while sq < 64 {
             let mask = if rook { rook_mask(sq) } else { bishop_mask(sq) };
-            out[sq as usize] = PextEntry { mask, offset: offset as u32 };
+            out[sq as usize] = PextEntry {
+                mask,
+                offset: offset as u32,
+            };
             offset += 1 << mask.count_ones();
             sq += 1;
         }
@@ -567,7 +681,9 @@ mod pext {
 /// The PEXT tables are compile-time constants; this is kept so that the callers
 /// that ordered their construction before the first search still compile.
 #[cfg(target_arch = "x86_64")]
-pub fn init_pext() { pext::ensure_init(); }
+pub fn init_pext() {
+    pext::ensure_init();
+}
 
 /// Whether slider attacks go through hardware PEXT — decided once at startup
 /// by `cpu::init` (BMI2 present, and not an AMD generation that microcodes
@@ -601,6 +717,8 @@ fn use_pext() -> bool {
 /// Distribution builds elect PEXT at runtime; others pin it at compile time.
 #[inline(always)]
 pub fn bishop_attacks(sq: Square, occupied: u64) -> u64 {
+    #[cfg(target_arch = "aarch64")]
+    return aarch64_hq::bishop_attacks(sq, occupied);
     #[cfg(all(target_arch = "x86_64", gaia_dist))]
     if use_pext() {
         return unsafe { pext::bishop_attacks(sq, occupied) };
@@ -609,7 +727,7 @@ pub fn bishop_attacks(sq: Square, occupied: u64) -> u64 {
     return unsafe { pext::bishop_attacks(sq, occupied) };
     #[cfg(all(target_feature = "avx2", any(not(target_feature = "bmi2"), gaia_dist)))]
     return crate::simd_attacks::bishop_attacks(sq, occupied);
-    #[cfg(not(target_feature = "avx2"))]
+    #[cfg(all(not(target_feature = "avx2"), not(target_arch = "aarch64")))]
     magic_bishop_attacks(sq, occupied)
 }
 
@@ -617,6 +735,8 @@ pub fn bishop_attacks(sq: Square, occupied: u64) -> u64 {
 /// Distribution builds elect PEXT at runtime; others pin it at compile time.
 #[inline(always)]
 pub fn rook_attacks(sq: Square, occupied: u64) -> u64 {
+    #[cfg(target_arch = "aarch64")]
+    return aarch64_hq::rook_attacks(sq, occupied);
     #[cfg(all(target_arch = "x86_64", gaia_dist))]
     if use_pext() {
         return unsafe { pext::rook_attacks(sq, occupied) };
@@ -625,7 +745,7 @@ pub fn rook_attacks(sq: Square, occupied: u64) -> u64 {
     return unsafe { pext::rook_attacks(sq, occupied) };
     #[cfg(all(target_feature = "avx2", any(not(target_feature = "bmi2"), gaia_dist)))]
     return crate::simd_attacks::rook_attacks(sq, occupied);
-    #[cfg(not(target_feature = "avx2"))]
+    #[cfg(all(not(target_feature = "avx2"), not(target_arch = "aarch64")))]
     magic_rook_attacks(sq, occupied)
 }
 
@@ -633,6 +753,8 @@ pub fn rook_attacks(sq: Square, occupied: u64) -> u64 {
 /// Distribution builds elect PEXT at runtime; others pin it at compile time.
 #[inline(always)]
 pub fn queen_attacks(sq: Square, occupied: u64) -> u64 {
+    #[cfg(target_arch = "aarch64")]
+    return aarch64_hq::bishop_attacks(sq, occupied) | aarch64_hq::rook_attacks(sq, occupied);
     #[cfg(all(target_arch = "x86_64", gaia_dist))]
     if use_pext() {
         return unsafe { pext::bishop_attacks(sq, occupied) | pext::rook_attacks(sq, occupied) };
@@ -641,8 +763,10 @@ pub fn queen_attacks(sq: Square, occupied: u64) -> u64 {
     return unsafe { pext::bishop_attacks(sq, occupied) | pext::rook_attacks(sq, occupied) };
     #[cfg(all(target_feature = "avx2", any(not(target_feature = "bmi2"), gaia_dist)))]
     return crate::simd_attacks::queen_attacks(sq, occupied);
-    #[cfg(not(target_feature = "avx2"))]
-    { magic_bishop_attacks(sq, occupied) | magic_rook_attacks(sq, occupied) }
+    #[cfg(all(not(target_feature = "avx2"), not(target_arch = "aarch64")))]
+    {
+        magic_bishop_attacks(sq, occupied) | magic_rook_attacks(sq, occupied)
+    }
 }
 
 /// Squares strictly between `s1` and `s2` (plus `s2` itself) along a rank, file,
@@ -705,7 +829,7 @@ pub fn attackers_to_color(sq: Square, c: Color, occupied: u64, pieces: &[u64; 12
 // Magic numbers (plain magics: shift = 64 - popcount(mask), exhaustively validated)
 // ============================================================
 
-#[cfg(not(target_feature = "avx2"))]
+#[cfg(all(not(target_feature = "avx2"), not(target_arch = "aarch64")))]
 #[rustfmt::skip]
 const ROOK_MAGICS: [MagicEntry; 64] = [
     MagicEntry { mask: 0x000101010101017E, magic: 0x6280008040002210, shift: 52, offset: 0 },
@@ -774,7 +898,7 @@ const ROOK_MAGICS: [MagicEntry; 64] = [
     MagicEntry { mask: 0x7E80808080808000, magic: 0x0210005020810402, shift: 52, offset: 98304 },
 ];
 
-#[cfg(not(target_feature = "avx2"))]
+#[cfg(all(not(target_feature = "avx2"), not(target_arch = "aarch64")))]
 #[rustfmt::skip]
 const BISHOP_MAGICS: [MagicEntry; 64] = [
     MagicEntry { mask: 0x0040201008040200, magic: 0x0110101000808810, shift: 58, offset: 0 },
@@ -912,6 +1036,40 @@ mod tests {
         assert_eq!(popcount(attacks), 13);
     }
 
+    /// Hyperbola Quintessence must agree for every blocker subset that can
+    /// affect a slider ray. This runs on every host; production selects it only
+    /// on AArch64, where `reverse_bits` lowers to the `rbit` instruction.
+    #[test]
+    fn aarch64_hyperbola_agrees_with_the_ray_walker() {
+        for sq in 0..64u8 {
+            let square = Square(sq);
+            for (deltas, hq) in [
+                (
+                    &BISHOP_DELTAS,
+                    aarch64_hq::bishop_attacks as fn(Square, u64) -> u64,
+                ),
+                (
+                    &ROOK_DELTAS,
+                    aarch64_hq::rook_attacks as fn(Square, u64) -> u64,
+                ),
+            ] {
+                let mask = sliding_attack_otf(sq, 0, deltas);
+                let mut occupied = 0u64;
+                loop {
+                    assert_eq!(
+                        hq(square, occupied),
+                        sliding_attack_otf(sq, occupied, deltas),
+                        "square {sq}, occupied {occupied:#018x}",
+                    );
+                    occupied = occupied.wrapping_sub(mask) & mask;
+                    if occupied == 0 {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn test_between_bb() {
         // Between A1 and H8 (long diagonal) should include A1-H8 intermediate squares
@@ -980,10 +1138,21 @@ mod tests {
                 let square = Square(sq);
                 // SAFETY: the test only runs on a build target that has BMI2.
                 let (rook, bishop) = unsafe {
-                    (super::pext::rook_attacks(square, occ), super::pext::bishop_attacks(square, occ))
+                    (
+                        super::pext::rook_attacks(square, occ),
+                        super::pext::bishop_attacks(square, occ),
+                    )
                 };
-                assert_eq!(rook, sliding_attack_otf(sq, occ, &ROOK_DELTAS), "rook from {sq} on {occ:#x}");
-                assert_eq!(bishop, sliding_attack_otf(sq, occ, &BISHOP_DELTAS), "bishop from {sq} on {occ:#x}");
+                assert_eq!(
+                    rook,
+                    sliding_attack_otf(sq, occ, &ROOK_DELTAS),
+                    "rook from {sq} on {occ:#x}"
+                );
+                assert_eq!(
+                    bishop,
+                    sliding_attack_otf(sq, occ, &BISHOP_DELTAS),
+                    "bishop from {sq} on {occ:#x}"
+                );
             }
         }
     }

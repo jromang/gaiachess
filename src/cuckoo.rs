@@ -6,9 +6,10 @@
 //! to detect draws one ply before they appear in the search tree.
 
 use crate::bitboard::{
-    between_bb, init_king_attacks, init_knight_attacks, sliding_attack_otf, BISHOP_DELTAS,
-    ROOK_DELTAS,
+    BISHOP_DELTAS, ROOK_DELTAS, between_bb, init_king_attacks, init_knight_attacks,
+    sliding_attack_otf,
 };
+use crate::position::StateHistory;
 use crate::types::Square;
 use crate::zobrist::ZOBRIST;
 
@@ -125,18 +126,25 @@ static CUCKOO: CuckooTables = init_cuckoo();
 /// Uses the van Kervinck cuckoo algorithm to detect repetitions one ply before
 /// they appear. Called from search when `alpha < 0` to raise alpha to draw score.
 ///
-/// `history_keys` = slice of historical Zobrist keys, most recent last.
+/// `history` = the saved states of the previous positions, most recent last; each
+/// carries the key of that position and its own incremental repetition flag.
 /// `current_key` = key of current position.
 /// `occupied` = current occupancy bitboard.
-/// `hmc` = halfmove clock, `pfn` = plies_from_null, `repetition` = incremental rep field.
+/// `hmc` = halfmove clock, `pfn` = plies_from_null.
 /// `search_ply` = distance from root.
+///
+/// A candidate move is one that recreates the position `d` plies back. Inside the
+/// search tree that is a second occurrence and counts as a draw. Before the root it
+/// must produce a third occurrence: the position it recreates has to be a repetition
+/// itself, which is what that position's own flag says. The flag of the current
+/// position says nothing about it — testing it would take a second occurrence for a
+/// draw, as in the reported game where a queen check was scored 0 at every depth.
 pub fn upcoming_repetition(
-    history_keys: &[u64],
+    history: &[StateHistory],
     current_key: u64,
     occupied: u64,
     hmc: usize,
     pfn: usize,
-    repetition: i32,
     search_ply: usize,
 ) -> bool {
     let end = hmc.min(pfn);
@@ -144,7 +152,7 @@ pub fn upcoming_repetition(
         return false;
     }
 
-    let len = history_keys.len();
+    let len = history.len();
     debug_assert!(
         len >= end,
         "upcoming_repetition: history too short len={} end={}",
@@ -155,13 +163,7 @@ pub fn upcoming_repetition(
     // s(v) = key of position v half-moves ago
     // history_keys[len-1] = key saved 1 ply ago (before last move)
     // history_keys[len-v] = key saved v plies ago
-    let s = |v: usize| -> u64 {
-        if v <= len {
-            history_keys[len - v]
-        } else {
-            0
-        }
-    };
+    let s = |v: usize| -> u64 { if v <= len { history[len - v].key } else { 0 } };
 
     let s0 = current_key;
     let mut other = s0 ^ s(1) ^ ZOBRIST.side;
@@ -203,8 +205,9 @@ pub fn upcoming_repetition(
             return true;
         }
 
-        // Before root: need prior repetition to confirm
-        if repetition != 0 {
+        // Before root: the position the move would recreate must already be a
+        // repetition, so that reaching it again makes a third occurrence.
+        if history[len - d].repetition != 0 {
             return true;
         }
 
@@ -222,11 +225,7 @@ mod tests {
     fn test_cuckoo_table_populated() {
         // The table should have a significant number of non-zero entries.
         // Standard chess produces ~3668 entries.
-        let count = CUCKOO
-            .keys
-            .iter()
-            .filter(|&&k| k != 0)
-            .count();
+        let count = CUCKOO.keys.iter().filter(|&&k| k != 0).count();
         assert!(
             count > 3000 && count < 4000,
             "cuckoo table has {count} entries, expected ~3668"

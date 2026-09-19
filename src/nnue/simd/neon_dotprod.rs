@@ -15,6 +15,9 @@ pub use super::neon::{
     splat_i16, splat_i32, sub_i16, zero_f32, zeroed_i16, zeroed_i32,
 };
 
+/// Native `sdot` latency: three chains, same idea as VNNI.
+pub const DPBUSD_CHAINS: usize = 3;
+
 use std::arch::aarch64::*;
 
 /// Native `sdot`: four s8×s8 products per i32 lane, accumulated.

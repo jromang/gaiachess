@@ -51,7 +51,7 @@ use viriformat::dataformat::Game;
 
 use crate::position::Position;
 use crate::search;
-use crate::threads::{SharedState, ThreadData, STOP};
+use crate::threads::{STOP, SharedState, ThreadData};
 use crate::timeman::SearchLimits;
 use crate::types::*;
 
@@ -136,8 +136,11 @@ pub fn run(input: &Path, output: &Path, nodes: u64, threads: usize, max_position
         input.display(),
         output.display(),
         nodes,
-        if max_positions > 0 { format!(" · stopping at {max_positions} positions") }
-        else { String::new() },
+        if max_positions > 0 {
+            format!(" · stopping at {max_positions} positions")
+        } else {
+            String::new()
+        },
     );
 
     let reader = Mutex::new(Reader {
@@ -212,7 +215,10 @@ fn worker(id: usize, reader: &Mutex<Reader>, part: &Path, nodes: u64, max_positi
     let mut out = match File::create(part) {
         Ok(file) => BufWriter::with_capacity(1 << 20, file),
         Err(error) => {
-            eprintln!("relabel: worker {id} cannot write {}: {error}", part.display());
+            eprintln!(
+                "relabel: worker {id} cannot write {}: {error}",
+                part.display()
+            );
             return;
         }
     };
@@ -261,7 +267,12 @@ fn worker(id: usize, reader: &Mutex<Reader>, part: &Path, nodes: u64, max_positi
                 };
                 STOP.store(false, Ordering::Relaxed);
                 td.prepare_search(&pos, &limits);
-                td.tm = crate::timeman::TimeManager::new(&limits);
+                let game_ply = td.pos.game_ply();
+                td.tm = crate::timeman::TimeManager::new(
+                    &limits,
+                    game_ply,
+                    &mut td.original_time_adjust,
+                );
                 td.search_deadline = SEARCH_DEADLINE_MS;
                 td.datagen_mode = true;
                 search::search(&mut td, &shared);
@@ -270,8 +281,11 @@ fn worker(id: usize, reader: &Mutex<Reader>, part: &Path, nodes: u64, max_positi
                 if td.stopped || score == SCORE_NONE || score.abs() > SCORE_INFINITE {
                     continue;
                 }
-                let white_score =
-                    if pos.side_to_move == Color::White { score } else { -score };
+                let white_score = if pos.side_to_move == Color::White {
+                    score
+                } else {
+                    -score
+                };
                 debug_assert!(white_score.abs() <= SCORE_INFINITE);
 
                 // Compare with the label already in the file, which is white-relative by
@@ -284,8 +298,10 @@ fn worker(id: usize, reader: &Mutex<Reader>, part: &Path, nodes: u64, max_positi
                     if old_eval.signum() == white_score.signum() {
                         AGREE_SAME_SIGN.fetch_add(1, Ordering::Relaxed);
                     }
-                    AGREE_ABS_DIFF
-                        .fetch_add((white_score - old_eval).unsigned_abs() as u64, Ordering::Relaxed);
+                    AGREE_ABS_DIFF.fetch_add(
+                        (white_score - old_eval).unsigned_abs() as u64,
+                        Ordering::Relaxed,
+                    );
                 }
                 let _ = out.write_all(line(fen, white_score, white_result).as_bytes());
                 POSITIONS_DONE.fetch_add(1, Ordering::Relaxed);
@@ -359,10 +375,14 @@ mod tests {
     /// Black to move, engine says +200 for black: the file must hold −200.
     #[test]
     fn a_score_from_blacks_point_of_view_is_negated() {
-        let pos = Position::from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR b KQkq - 0 1")
-            .unwrap();
+        let pos =
+            Position::from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR b KQkq - 0 1").unwrap();
         let score = 200;
-        let white_score = if pos.side_to_move == Color::White { score } else { -score };
+        let white_score = if pos.side_to_move == Color::White {
+            score
+        } else {
+            -score
+        };
         assert_eq!(white_score, -200);
     }
 }

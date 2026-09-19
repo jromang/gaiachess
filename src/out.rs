@@ -27,31 +27,56 @@ macro_rules! outerr {
 
 #[cfg(not(target_arch = "wasm32"))]
 mod imp {
-    use std::fs::File;
+    use std::fs::{File, OpenOptions};
     use std::io::Write;
     use std::sync::Mutex;
+    use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-    static LOG_FILE: Mutex<Option<File>> = Mutex::new(None);
+    struct DebugLog {
+        file: File,
+        start: Instant,
+    }
+
+    static LOG_FILE: Mutex<Option<DebugLog>> = Mutex::new(None);
 
     /// `Debug Log File`: empty path closes the log. The option GUIs expect under
     /// this name, so a GUI session (Fritz especially) can be dumped without a rebuild.
+    ///
+    /// Each line is `{seconds}.{ms} >>|<< {text}`: elapsed since this process opened
+    /// the file, millisecond resolution, so a one-second stall between `info` lines
+    /// is readable without a wall clock. Opening appends (Fritz re-sends the option
+    /// on every module reset; truncating would drop the game that just flagged).
     pub fn set_debug_log(path: &str) -> Result<(), String> {
         let mut slot = LOG_FILE.lock().map_err(|e| e.to_string())?;
         if path.is_empty() {
             *slot = None;
             return Ok(());
         }
-        let f = File::create(path).map_err(|e| e.to_string())?;
-        *slot = Some(f);
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .map_err(|e| e.to_string())?;
+        let epoch_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let _ = writeln!(file, "# session {epoch_ms}");
+        let _ = file.flush();
+        *slot = Some(DebugLog {
+            file,
+            start: Instant::now(),
+        });
         Ok(())
     }
 
     fn log_line(prefix: &str, s: &str) {
         if let Ok(mut slot) = LOG_FILE.lock()
-            && let Some(f) = slot.as_mut()
+            && let Some(log) = slot.as_mut()
         {
-            let _ = writeln!(f, "{prefix} {s}");
-            let _ = f.flush();
+            let ms = log.start.elapsed().as_millis();
+            let _ = writeln!(log.file, "{}.{:03} {prefix} {s}", ms / 1000, ms % 1000);
+            let _ = log.file.flush();
         }
     }
 
@@ -72,6 +97,19 @@ mod imp {
         // Windows pipes are block-buffered; a GUI reads UCI a line at a time and
         // will sit on an unflushed `info` until the 8 KiB buffer fills.
         let _ = std::io::stdout().flush();
+    }
+
+    /// Write a group of protocol lines without allowing another producer to interleave.
+    pub fn lines(lines: &[String]) {
+        for line in lines {
+            log_line("<<", line);
+        }
+        let _guard = STDOUT.lock().unwrap_or_else(|e| e.into_inner());
+        let mut stdout = std::io::stdout().lock();
+        for line in lines {
+            let _ = writeln!(stdout, "{line}");
+        }
+        let _ = stdout.flush();
     }
     pub fn diagnostic(s: String) {
         log_line("<<", &s);
@@ -99,6 +137,10 @@ mod imp {
         BUFFER.with(|b| b.borrow_mut().push(s));
     }
 
+    pub fn lines(lines: &[String]) {
+        BUFFER.with(|b| b.borrow_mut().extend_from_slice(lines));
+    }
+
     /// Diagnostics share the buffer: a browser has no second stream to send them down,
     /// and `info string` is legal UCI that any reader is free to skip.
     pub fn diagnostic(s: String) {
@@ -115,7 +157,7 @@ mod imp {
     }
 }
 
-pub use imp::{diagnostic, line, log_input, set_debug_log};
+pub use imp::{diagnostic, line, lines, log_input, set_debug_log};
 
 #[cfg(target_arch = "wasm32")]
 pub use imp::drain;

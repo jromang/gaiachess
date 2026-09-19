@@ -8,8 +8,9 @@ use crate::progress::{ProgressBar, ProgressStyle};
 
 use crate::position::Position;
 use crate::search;
-use crate::threads::{SharedState, ThreadData, ThreadPool, NODES_SEARCHED, STOP,
-    close_node_meter, open_node_meter};
+use crate::threads::{
+    NODES_SEARCHED, STOP, SharedState, ThreadData, ThreadPool, close_node_meter, open_node_meter,
+};
 use crate::timeman::SearchLimits;
 /// 27 unique positions from gaia3.0's profile() function (gaia3.0/src/util.c:328).
 pub(crate) const POSITIONS: [&str; 27] = [
@@ -90,7 +91,8 @@ pub fn run(depth_override: Option<i32>, threads: Option<usize>) {
         // Prepare search — override tm since prepare_search gives infinite
         // limits to id!=0 (same pattern as datagen.rs:prepare_datagen_search)
         td.prepare_search(&pos, &limits);
-        td.tm = crate::timeman::TimeManager::new(&limits);
+        let game_ply = td.pos.game_ply();
+        td.tm = crate::timeman::TimeManager::new(&limits, game_ply, &mut td.original_time_adjust);
 
         let start = Instant::now();
 
@@ -256,7 +258,9 @@ pub fn run_stats(depth_override: Option<i32>, num_runs: u32, verbose: bool) {
             NODES_SEARCHED.store(0, Ordering::Relaxed);
 
             td.prepare_search(&pos, &limits);
-            td.tm = crate::timeman::TimeManager::new(&limits);
+            let game_ply = td.pos.game_ply();
+            td.tm =
+                crate::timeman::TimeManager::new(&limits, game_ply, &mut td.original_time_adjust);
 
             let start = Instant::now();
             search::search(&mut td, &shared);
@@ -310,8 +314,14 @@ pub fn run_stats(depth_override: Option<i32>, num_runs: u32, verbose: bool) {
 
     // Print report
     println!("\n  === Bench Statistics ({num_runs} runs, depth {depth}) ===\n");
-    println!("  Median NPS:       {}", format_number(overall.median as u64));
-    println!("  Trimmed Mean:     {}", format_number(overall.trimmed_mean as u64));
+    println!(
+        "  Median NPS:       {}",
+        format_number(overall.median as u64)
+    );
+    println!(
+        "  Trimmed Mean:     {}",
+        format_number(overall.trimmed_mean as u64)
+    );
     println!(
         "  95% CI:           [{} -- {}]",
         format_number(overall.ci_lo as u64),

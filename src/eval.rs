@@ -179,12 +179,20 @@ const EG_KING_TABLE: [i32; 64] = [
 
 const fn build_tables() -> ([[i32; 64]; 12], [[i32; 64]; 12]) {
     let mg_raw: [[i32; 64]; 6] = [
-        MG_PAWN_TABLE, MG_KNIGHT_TABLE, MG_BISHOP_TABLE,
-        MG_ROOK_TABLE, MG_QUEEN_TABLE, MG_KING_TABLE,
+        MG_PAWN_TABLE,
+        MG_KNIGHT_TABLE,
+        MG_BISHOP_TABLE,
+        MG_ROOK_TABLE,
+        MG_QUEEN_TABLE,
+        MG_KING_TABLE,
     ];
     let eg_raw: [[i32; 64]; 6] = [
-        EG_PAWN_TABLE, EG_KNIGHT_TABLE, EG_BISHOP_TABLE,
-        EG_ROOK_TABLE, EG_QUEEN_TABLE, EG_KING_TABLE,
+        EG_PAWN_TABLE,
+        EG_KNIGHT_TABLE,
+        EG_BISHOP_TABLE,
+        EG_ROOK_TABLE,
+        EG_QUEEN_TABLE,
+        EG_KING_TABLE,
     ];
 
     let mut mg = [[0i32; 64]; 12];
@@ -192,7 +200,7 @@ const fn build_tables() -> ([[i32; 64]; 12], [[i32; 64]; 12]) {
 
     let mut pt = 0;
     while pt < 6 {
-        let white_pc = pt * 2;     // Piece::new(pt, White)
+        let white_pc = pt * 2; // Piece::new(pt, White)
         let black_pc = pt * 2 + 1; // Piece::new(pt, Black)
         let mut sq = 0;
         while sq < 64 {
@@ -256,25 +264,20 @@ const DARK_SQUARES: u64 = 0xAA55_AA55_AA55_AA55;
 /// KRvKNN.
 pub fn is_material_draw(pos: &Position) -> bool {
     debug_assert!(
-        pos.pieces[Piece::WHITE_PAWN.index()] == 0
-            && pos.pieces[Piece::BLACK_PAWN.index()] == 0,
+        pos.pieces[Piece::WHITE_PAWN.index()] == 0 && pos.pieces[Piece::BLACK_PAWN.index()] == 0,
         "is_material_draw called with pawns on the board"
     );
 
-    let queens = pos.pieces[Piece::WHITE_QUEEN.index()]
-        | pos.pieces[Piece::BLACK_QUEEN.index()];
+    let queens = pos.pieces[Piece::WHITE_QUEEN.index()] | pos.pieces[Piece::BLACK_QUEEN.index()];
     if queens != 0 {
         return false;
     }
 
     let white = pos.occupancies[0];
     let black = pos.occupancies[1];
-    let bishops = pos.pieces[Piece::WHITE_BISHOP.index()]
-        | pos.pieces[Piece::BLACK_BISHOP.index()];
-    let knights = pos.pieces[Piece::WHITE_KNIGHT.index()]
-        | pos.pieces[Piece::BLACK_KNIGHT.index()];
-    let rooks = pos.pieces[Piece::WHITE_ROOK.index()]
-        | pos.pieces[Piece::BLACK_ROOK.index()];
+    let bishops = pos.pieces[Piece::WHITE_BISHOP.index()] | pos.pieces[Piece::BLACK_BISHOP.index()];
+    let knights = pos.pieces[Piece::WHITE_KNIGHT.index()] | pos.pieces[Piece::BLACK_KNIGHT.index()];
+    let rooks = pos.pieces[Piece::WHITE_ROOK.index()] | pos.pieces[Piece::BLACK_ROOK.index()];
     let wb = bishops & white;
     let bb = bishops & black;
     let wn = knights & white;
@@ -349,7 +352,13 @@ pub fn is_material_draw(pos: &Position) -> bool {
 /// having the move is exactly the sort of thing this level of play does not know.
 pub fn material_eval(pos: &Position) -> i32 {
     let (mut mg, mut eg) = (0, 0);
-    for pt in [PieceType::Pawn, PieceType::Knight, PieceType::Bishop, PieceType::Rook, PieceType::Queen] {
+    for pt in [
+        PieceType::Pawn,
+        PieceType::Knight,
+        PieceType::Bishop,
+        PieceType::Rook,
+        PieceType::Queen,
+    ] {
         let count = pos.piece_type_bb(pt, Color::White).count_ones() as i32
             - pos.piece_type_bb(pt, Color::Black).count_ones() as i32;
         mg += MG_VALUE[pt as usize] * count;
@@ -358,9 +367,16 @@ pub fn material_eval(pos: &Position) -> i32 {
 
     let mg_phase = pos.game_phase.min(TOTAL_PHASE);
     let eg_phase = TOTAL_PHASE - mg_phase;
-    debug_assert!(mg_phase >= 0 && eg_phase >= 0, "phase {mg_phase} out of range");
+    debug_assert!(
+        mg_phase >= 0 && eg_phase >= 0,
+        "phase {mg_phase} out of range"
+    );
     let score = (mg * mg_phase + eg * eg_phase) / TOTAL_PHASE;
-    if pos.side_to_move == Color::White { score } else { -score }
+    if pos.side_to_move == Color::White {
+        score
+    } else {
+        -score
+    }
 }
 
 /// Evaluate the position from the side-to-move's perspective.
@@ -368,11 +384,16 @@ pub fn material_eval(pos: &Position) -> i32 {
 /// Returns a score in centipawns using tapered evaluation between middlegame
 /// and endgame piece-square table values.
 pub fn evaluate(pos: &Position) -> i32 {
-    debug_assert!(crate::bitboard::popcount(pos.occupied()) >= 2,
-        "eval: less than 2 pieces on board");
+    debug_assert!(
+        crate::bitboard::popcount(pos.occupied()) >= 2,
+        "eval: less than 2 pieces on board"
+    );
     // Eval is never called when in check
-    debug_assert!(pos.checkers == 0,
-        "eval: called while in check (checkers=0x{:016x})", pos.checkers);
+    debug_assert!(
+        pos.checkers == 0,
+        "eval: called while in check (checkers=0x{:016x})",
+        pos.checkers
+    );
     let mut mg = [0i32; 2]; // [White, Black]
     let mut eg = [0i32; 2];
     let mut phase = 0i32;
@@ -396,7 +417,11 @@ pub fn evaluate(pos: &Position) -> i32 {
     let mg_score = mg[Color::White.index()] - mg[Color::Black.index()];
     let eg_score = eg[Color::White.index()] - eg[Color::Black.index()];
 
-    let mg_phase = if phase > TOTAL_PHASE { TOTAL_PHASE } else { phase };
+    let mg_phase = if phase > TOTAL_PHASE {
+        TOTAL_PHASE
+    } else {
+        phase
+    };
     let eg_phase = TOTAL_PHASE - mg_phase;
     let score = (mg_score * mg_phase + eg_score * eg_phase) / TOTAL_PHASE;
 
@@ -404,7 +429,11 @@ pub fn evaluate(pos: &Position) -> i32 {
     let tempo = (TEMPO_MG * mg_phase + TEMPO_EG * eg_phase) / TOTAL_PHASE;
 
     // Return from side-to-move's perspective
-    if pos.side_to_move == Color::White { score + tempo } else { -score + tempo }
+    if pos.side_to_move == Color::White {
+        score + tempo
+    } else {
+        -score + tempo
+    }
 }
 
 #[cfg(test)]
@@ -415,18 +444,35 @@ mod tests {
     /// Material only: even at the start, blind to the tempo the full eval sees.
     #[test]
     fn material_eval_counts_pieces_and_nothing_else() {
-        let start = Position::from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1").unwrap();
-        assert_eq!(material_eval(&start), 0, "an even position is even, tempo included");
+        let start =
+            Position::from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1").unwrap();
+        assert_eq!(
+            material_eval(&start),
+            0,
+            "an even position is even, tempo included"
+        );
 
         // A move that the full eval rewards for its piece square is worth nothing here.
-        let developed = Position::from_fen("rnbqkbnr/pppppppp/8/8/8/4PN2/PPPP1PPP/RNBQKB1R b KQkq - 0 1").unwrap();
-        assert_eq!(material_eval(&developed), 0, "piece squares must not leak in");
+        let developed =
+            Position::from_fen("rnbqkbnr/pppppppp/8/8/8/4PN2/PPPP1PPP/RNBQKB1R b KQkq - 0 1")
+                .unwrap();
+        assert_eq!(
+            material_eval(&developed),
+            0,
+            "piece squares must not leak in"
+        );
 
-        let up_a_queen = Position::from_fen("rnb1kbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1").unwrap();
-        assert!(material_eval(&up_a_queen) > 800, "{}", material_eval(&up_a_queen));
+        let up_a_queen =
+            Position::from_fen("rnb1kbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1").unwrap();
+        assert!(
+            material_eval(&up_a_queen) > 800,
+            "{}",
+            material_eval(&up_a_queen)
+        );
 
         // The same board seen from the other side is the same score, negated.
-        let same_from_black = Position::from_fen("rnb1kbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR b KQkq - 0 1").unwrap();
+        let same_from_black =
+            Position::from_fen("rnb1kbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR b KQkq - 0 1").unwrap();
         assert_eq!(material_eval(&same_from_black), -material_eval(&up_a_queen));
     }
 
@@ -439,39 +485,56 @@ mod tests {
         assert_eq!(material_eval(&bare), EG_VALUE[PieceType::Pawn as usize]);
 
         // The same pawn with a full board around it is worth its middlegame value.
-        let opening = Position::from_fen("rnbqkbnr/1ppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1").unwrap();
+        let opening =
+            Position::from_fen("rnbqkbnr/1ppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1").unwrap();
         let full_phase = material_eval(&opening);
         assert_eq!(full_phase, MG_VALUE[PieceType::Pawn as usize]);
-        assert!(full_phase < EG_VALUE[PieceType::Pawn as usize], "a pawn grows as pieces come off");
+        assert!(
+            full_phase < EG_VALUE[PieceType::Pawn as usize],
+            "a pawn grows as pieces come off"
+        );
     }
 
     #[test]
     fn test_startpos_eval_symmetric() {
         // Starting position should evaluate to ~0 (symmetric)
-        let pos = Position::from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1").unwrap();
+        let pos =
+            Position::from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1").unwrap();
         let score = evaluate(&pos);
         // Symmetric material + PST, but tempo bonus gives side-to-move a small edge
-        assert!(score > 0 && score <= 20, "Start position should be small positive (tempo), got {score}");
+        assert!(
+            score > 0 && score <= 20,
+            "Start position should be small positive (tempo), got {score}"
+        );
     }
 
     #[test]
     fn test_white_up_material() {
         // White up a queen
-        let pos = Position::from_fen("rnb1kbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1").unwrap();
+        let pos =
+            Position::from_fen("rnb1kbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1").unwrap();
         let score = evaluate(&pos);
-        assert!(score > 800, "White up a queen should score > 800, got {score}");
+        assert!(
+            score > 800,
+            "White up a queen should score > 800, got {score}"
+        );
     }
 
     #[test]
     fn test_eval_side_to_move() {
         // Same position, different side: material+PST is negated, but both get tempo bonus
-        let w = Position::from_fen("rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq - 0 1").unwrap();
-        let b = Position::from_fen("rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR w KQkq - 0 1").unwrap();
+        let w = Position::from_fen("rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq - 0 1")
+            .unwrap();
+        let b = Position::from_fen("rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR w KQkq - 0 1")
+            .unwrap();
         let score_b = evaluate(&w); // from black's perspective
         let score_w = evaluate(&b); // from white's perspective
         // They differ by 2*tempo (each side gets +tempo from its own perspective)
         let diff = (score_w + score_b).abs();
-        assert!(diff == 2 * TEMPO_MG, "Scores should differ by 2*tempo, got diff={diff}");
+        assert!(
+            diff == 2 * TEMPO_MG,
+            "Scores should differ by 2*tempo, got diff={diff}"
+        );
     }
 
     #[test]
@@ -488,10 +551,12 @@ mod tests {
     // ============================================================
 
     fn check_material_draw(fen: &str, expected: bool) {
-        let pos = Position::from_fen(fen)
-            .unwrap_or_else(|e| panic!("Bad FEN '{fen}': {e}"));
+        let pos = Position::from_fen(fen).unwrap_or_else(|e| panic!("Bad FEN '{fen}': {e}"));
         let result = is_material_draw(&pos);
-        assert_eq!(result, expected, "is_material_draw(\"{fen}\") = {result}, expected {expected}");
+        assert_eq!(
+            result, expected,
+            "is_material_draw(\"{fen}\") = {result}, expected {expected}"
+        );
     }
 
     #[test]
@@ -616,7 +681,7 @@ mod tests {
     // ============================================================
 
     use crate::movegen;
-    use crate::types::{Move, ArrayBuf, MAX_MOVES};
+    use crate::types::{ArrayBuf, MAX_MOVES, Move};
 
     /// Apply a UCI move string to a position (same as position.rs test helper).
     fn make_uci(pos: &mut Position, uci: &str) {
@@ -643,22 +708,25 @@ mod tests {
     fn assert_lazy_matches_full(pos: &Position, context: &str) {
         let lazy = pos.lazy_eval();
         let full = evaluate(pos);
-        assert_eq!(lazy, full,
+        assert_eq!(
+            lazy,
+            full,
             "lazy_eval mismatch in {context}: lazy={lazy}, full={full}, fen={}",
-            pos.to_fen());
+            pos.to_fen()
+        );
     }
 
     #[test]
     fn test_lazy_eval_startpos() {
-        let pos = Position::from_fen(
-            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1").unwrap();
+        let pos =
+            Position::from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1").unwrap();
         assert_lazy_matches_full(&pos, "startpos");
     }
 
     #[test]
     fn test_lazy_eval_after_e4() {
-        let mut pos = Position::from_fen(
-            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1").unwrap();
+        let mut pos =
+            Position::from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1").unwrap();
         make_uci(&mut pos, "e2e4");
         assert_lazy_matches_full(&pos, "after 1.e4");
     }
@@ -666,8 +734,8 @@ mod tests {
     #[test]
     fn test_lazy_eval_captures() {
         // Scandinavian: 1.e4 d5 2.exd5
-        let mut pos = Position::from_fen(
-            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1").unwrap();
+        let mut pos =
+            Position::from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1").unwrap();
         for uci in &["e2e4", "d7d5", "e4d5"] {
             make_uci(&mut pos, uci);
             assert_lazy_matches_full(&pos, &format!("after {uci}"));
@@ -678,7 +746,9 @@ mod tests {
     fn test_lazy_eval_castling() {
         // Position where White can castle kingside
         let mut pos = Position::from_fen(
-            "r1bqk2r/pppp1ppp/2n2n2/2b1p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 4 4").unwrap();
+            "r1bqk2r/pppp1ppp/2n2n2/2b1p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 4 4",
+        )
+        .unwrap();
         assert_lazy_matches_full(&pos, "before castling");
         make_uci(&mut pos, "e1g1"); // O-O
         assert_lazy_matches_full(&pos, "after O-O");
@@ -687,8 +757,7 @@ mod tests {
     #[test]
     fn test_lazy_eval_promotion() {
         // White pawn on a7, promotes without giving check
-        let mut pos = Position::from_fen(
-            "8/P3k3/8/8/8/8/8/4K3 w - - 0 1").unwrap();
+        let mut pos = Position::from_fen("8/P3k3/8/8/8/8/8/4K3 w - - 0 1").unwrap();
         assert_lazy_matches_full(&pos, "before promotion");
         make_uci(&mut pos, "a7a8q");
         assert_lazy_matches_full(&pos, "after a8=Q");
@@ -697,8 +766,7 @@ mod tests {
     #[test]
     fn test_lazy_eval_promotion_capture() {
         // White pawn on b7, capture-promote on a8 (not giving check)
-        let mut pos = Position::from_fen(
-            "r7/1P2k3/8/8/8/8/8/4K3 w - - 0 1").unwrap();
+        let mut pos = Position::from_fen("r7/1P2k3/8/8/8/8/8/4K3 w - - 0 1").unwrap();
         assert_lazy_matches_full(&pos, "before promo-capture");
         make_uci(&mut pos, "b7a8q");
         assert_lazy_matches_full(&pos, "after bxa8=Q");
@@ -707,8 +775,9 @@ mod tests {
     #[test]
     fn test_lazy_eval_en_passant() {
         // En passant capture
-        let mut pos = Position::from_fen(
-            "rnbqkbnr/pppp1ppp/8/4pP2/8/8/PPPPP1PP/RNBQKBNR w KQkq e6 0 3").unwrap();
+        let mut pos =
+            Position::from_fen("rnbqkbnr/pppp1ppp/8/4pP2/8/8/PPPPP1PP/RNBQKBNR w KQkq e6 0 3")
+                .unwrap();
         assert_lazy_matches_full(&pos, "before EP");
         make_uci(&mut pos, "f5e6");
         assert_lazy_matches_full(&pos, "after fxe6 EP");
@@ -717,8 +786,8 @@ mod tests {
     #[test]
     fn test_lazy_eval_unmake_restores() {
         // Make + unmake should restore lazy eval to original
-        let mut pos = Position::from_fen(
-            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1").unwrap();
+        let mut pos =
+            Position::from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1").unwrap();
         let orig_mg = pos.psq_mg;
         let orig_eg = pos.psq_eg;
         let orig_phase = pos.game_phase;
@@ -729,14 +798,18 @@ mod tests {
         pos.unmake_move(m);
         assert_eq!(pos.psq_mg, orig_mg, "psq_mg not restored after unmake");
         assert_eq!(pos.psq_eg, orig_eg, "psq_eg not restored after unmake");
-        assert_eq!(pos.game_phase, orig_phase, "game_phase not restored after unmake");
+        assert_eq!(
+            pos.game_phase, orig_phase,
+            "game_phase not restored after unmake"
+        );
     }
 
     #[test]
     fn test_lazy_eval_null_move_preserves() {
         // Null move should not change psq scores
-        let mut pos = Position::from_fen(
-            "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq - 0 1").unwrap();
+        let mut pos =
+            Position::from_fen("rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq - 0 1")
+                .unwrap();
         let mg_before = pos.psq_mg;
         let eg_before = pos.psq_eg;
         let phase_before = pos.game_phase;
@@ -744,7 +817,10 @@ mod tests {
         pos.make_null_move();
         assert_eq!(pos.psq_mg, mg_before, "psq_mg changed after null move");
         assert_eq!(pos.psq_eg, eg_before, "psq_eg changed after null move");
-        assert_eq!(pos.game_phase, phase_before, "game_phase changed after null move");
+        assert_eq!(
+            pos.game_phase, phase_before,
+            "game_phase changed after null move"
+        );
 
         pos.unmake_null_move();
         assert_eq!(pos.psq_mg, mg_before, "psq_mg changed after unmake null");
@@ -753,11 +829,10 @@ mod tests {
     #[test]
     fn test_lazy_eval_game_sequence() {
         // Play a Ruy Lopez with varied move types and verify at each step
-        let mut pos = Position::from_fen(
-            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1").unwrap();
+        let mut pos =
+            Position::from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1").unwrap();
         let moves = [
-            "e2e4", "e7e5", "g1f3", "b8c6", "f1b5", "a7a6",
-            "b5a4", "g8f6", "e1g1", // O-O
+            "e2e4", "e7e5", "g1f3", "b8c6", "f1b5", "a7a6", "b5a4", "g8f6", "e1g1", // O-O
             "f6e4", // Nxe4 capture
             "d2d4", "e5d4", // exd4 capture
             "f1e1", // Re1
@@ -773,11 +848,20 @@ mod tests {
         for m in played.iter().rev() {
             pos.unmake_move(*m);
         }
-        let startpos = Position::from_fen(
-            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1").unwrap();
-        assert_eq!(pos.psq_mg, startpos.psq_mg, "psq_mg not restored after full unmake");
-        assert_eq!(pos.psq_eg, startpos.psq_eg, "psq_eg not restored after full unmake");
-        assert_eq!(pos.game_phase, startpos.game_phase, "game_phase not restored");
+        let startpos =
+            Position::from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1").unwrap();
+        assert_eq!(
+            pos.psq_mg, startpos.psq_mg,
+            "psq_mg not restored after full unmake"
+        );
+        assert_eq!(
+            pos.psq_eg, startpos.psq_eg,
+            "psq_eg not restored after full unmake"
+        );
+        assert_eq!(
+            pos.game_phase, startpos.game_phase,
+            "game_phase not restored"
+        );
     }
 
     #[test]
@@ -790,8 +874,9 @@ mod tests {
 
     #[test]
     fn test_lazy_eval_queenside_castling() {
-        let mut pos = Position::from_fen(
-            "r3kbnr/pppqpppp/2n5/3p1b2/3P1B2/2N5/PPPQPPPP/R3KBNR w KQkq - 6 5").unwrap();
+        let mut pos =
+            Position::from_fen("r3kbnr/pppqpppp/2n5/3p1b2/3P1B2/2N5/PPPQPPPP/R3KBNR w KQkq - 6 5")
+                .unwrap();
         assert_lazy_matches_full(&pos, "before O-O-O");
         make_uci(&mut pos, "e1c1"); // O-O-O
         assert_lazy_matches_full(&pos, "after O-O-O");
@@ -800,8 +885,7 @@ mod tests {
     #[test]
     fn test_lazy_eval_underpromotion() {
         // Promote to knight (not giving check)
-        let mut pos = Position::from_fen(
-            "8/P3k3/8/8/8/8/8/4K3 w - - 0 1").unwrap();
+        let mut pos = Position::from_fen("8/P3k3/8/8/8/8/8/4K3 w - - 0 1").unwrap();
         make_uci(&mut pos, "a7a8n");
         assert_lazy_matches_full(&pos, "after a8=N");
     }
@@ -821,7 +905,9 @@ mod tests {
         ];
         for fen in &fens {
             let pos = Position::from_fen(fen).unwrap();
-            if pos.checkers != 0 { continue; } // skip in-check positions
+            if pos.checkers != 0 {
+                continue;
+            } // skip in-check positions
             assert_lazy_matches_full(&pos, &format!("FEN: {fen}"));
         }
     }

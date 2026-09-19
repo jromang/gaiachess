@@ -213,7 +213,11 @@ impl MenuScene {
         }
 
         if input.dir(Dir::Down) || input.dir(Dir::Up) {
-            let step = if input.dir(Dir::Down) { 1 } else { Row::ALL.len() - 1 };
+            let step = if input.dir(Dir::Down) {
+                1
+            } else {
+                Row::ALL.len() - 1
+            };
             self.row = (self.row + step) % Row::ALL.len();
             sfx.push(Sfx::Cursor);
         }
@@ -343,7 +347,9 @@ impl MenuScene {
             // Its own name rather than a translation of it: a language nobody in the
             // room reads is exactly the one whose name has to be recognisable.
             Row::Language => self.config.lang.autonym().to_string(),
-            Row::Sound => self.say(if self.config.sound { Key::On } else { Key::Off }).to_string(),
+            Row::Sound => self
+                .say(if self.config.sound { Key::On } else { Key::Off })
+                .to_string(),
             Row::About | Row::Play => String::new(),
         }
     }
@@ -440,9 +446,27 @@ impl MenuScene {
         if h <= 2 {
             return;
         }
-        fb.rectfill(x + 2, PANEL_TOP + 3, x + PANEL_W + 1, PANEL_TOP + h + 2, rgba(0x000000, 90));
-        fb.rectfill(x, PANEL_TOP, x + PANEL_W - 1, PANEL_TOP + h - 1, scheme.panel);
-        fb.rect(x, PANEL_TOP, x + PANEL_W - 1, PANEL_TOP + h - 1, scheme.panel_edge);
+        fb.rectfill(
+            x + 2,
+            PANEL_TOP + 3,
+            x + PANEL_W + 1,
+            PANEL_TOP + h + 2,
+            rgba(0x000000, 90),
+        );
+        fb.rectfill(
+            x,
+            PANEL_TOP,
+            x + PANEL_W - 1,
+            PANEL_TOP + h - 1,
+            scheme.panel,
+        );
+        fb.rect(
+            x,
+            PANEL_TOP,
+            x + PANEL_W - 1,
+            PANEL_TOP + h - 1,
+            scheme.panel_edge,
+        );
 
         // The rows are revealed as the panel grows, so nothing spills outside it.
         let clip = fb.clip(x, PANEL_TOP, PANEL_W, h);
@@ -450,9 +474,19 @@ impl MenuScene {
             let y = PANEL_TOP + 3 + Row::top_of(i);
             let selected = i == self.row;
             if selected {
-                fb.rectfill(x + 3, y - 1, x + PANEL_W - 4, y + row.height() - 3, scheme.accent);
+                fb.rectfill(
+                    x + 3,
+                    y - 1,
+                    x + PANEL_W - 4,
+                    y + row.height() - 3,
+                    scheme.accent,
+                );
             }
-            let ink = if selected { scheme.panel_edge } else { scheme.text };
+            let ink = if selected {
+                scheme.panel_edge
+            } else {
+                scheme.text
+            };
             let label = self.say(row.label());
             if row.is_action() {
                 font::print_centered(fb, label, x + PANEL_W / 2, y + 1, ink);
@@ -460,14 +494,30 @@ impl MenuScene {
             }
             font::print(fb, label, x + 8, y + 1, ink);
             let value = self.value(*row);
-            font::print(fb, &value, x + PANEL_W - 8 - font::width(&value), y + 1, ink);
+            font::print(
+                fb,
+                &value,
+                x + PANEL_W - 8 - font::width(&value),
+                y + 1,
+                ink,
+            );
 
             // The second line of the level row: who that rating plays like. Quieter than
             // the line above it, because it explains the setting rather than being it.
             if *row == Row::Level {
                 let player = lang::level_player(self.config.level as i32, self.config.lang);
-                let quiet = if selected { scheme.panel_edge } else { scheme.accent };
-                font::print(fb, player, x + PANEL_W - 8 - font::width(player), y + 9, quiet);
+                let quiet = if selected {
+                    scheme.panel_edge
+                } else {
+                    scheme.accent
+                };
+                font::print(
+                    fb,
+                    player,
+                    x + PANEL_W - 8 - font::width(player),
+                    y + 9,
+                    quiet,
+                );
             }
         }
         fb.set_clip(clip);
@@ -521,13 +571,20 @@ mod tests {
         for lang in Lang::ALL {
             for level in 1..=MAX_LEVEL {
                 let player = lang::level_player(level as i32, lang);
-                assert!(!player.is_empty(), "{lang:?}: level {level} describes nobody");
+                assert!(
+                    !player.is_empty(),
+                    "{lang:?}: level {level} describes nobody"
+                );
                 assert!(
                     font::width(player) <= FB_W as i32 - 8,
-                    "{lang:?}: level {level}: {player:?} is {} wide", font::width(player)
+                    "{lang:?}: level {level}: {player:?} is {} wide",
+                    font::width(player)
                 );
                 for c in player.chars() {
-                    assert!(font::has_glyph(c), "{lang:?}: level {level}: no glyph for {c:?}");
+                    assert!(
+                        font::has_glyph(c),
+                        "{lang:?}: level {level}: no glyph for {c:?}"
+                    );
                 }
             }
         }
@@ -536,10 +593,17 @@ mod tests {
         let mut previous = 0;
         for level in 1..MAX_LEVEL {
             let elo = skill::rating_for(level as i32).elo;
-            assert!(elo > previous, "level {level} is rated no higher than the one below");
+            assert!(
+                elo > previous,
+                "level {level} is rated no higher than the one below"
+            );
             previous = elo;
         }
-        assert_eq!(skill::rating_for(MAX_LEVEL as i32).elo, 0, "full strength is not a rating");
+        assert_eq!(
+            skill::rating_for(MAX_LEVEL as i32).elo,
+            0,
+            "full strength is not a rating"
+        );
     }
 
     /// The level row carries the number and its rating on one line and the kind of
@@ -552,14 +616,20 @@ mod tests {
             for level in 1..=MAX_LEVEL {
                 menu.config.level = level;
                 let value = menu.value(Row::Level);
-                assert!(value.starts_with(&format!("{level}")), "{value:?} hides the level");
+                assert!(
+                    value.starts_with(&format!("{level}")),
+                    "{value:?} hides the level"
+                );
                 let beside_label = PANEL_W - 16 - font::width(menu.say(Row::Level.label()));
                 assert!(
                     font::width(&value) <= beside_label,
                     "{lang:?}: {value:?} crowds its label"
                 );
                 if level < MAX_LEVEL {
-                    assert!(value.contains("elo"), "{value:?} does not say it is a rating");
+                    assert!(
+                        value.contains("elo"),
+                        "{value:?} does not say it is a rating"
+                    );
                 }
                 let player = lang::level_player(level as i32, lang);
                 assert!(
@@ -630,11 +700,23 @@ mod tests {
         let top = PANEL_TOP + 3;
         for (i, row) in Row::ALL.iter().enumerate() {
             let y = top + Row::top_of(i);
-            assert_eq!(menu.row_at(y), Some(i), "the top of row {i} points elsewhere");
-            assert_eq!(menu.row_at(y + row.height() - 1), Some(i), "row {i} ends early");
+            assert_eq!(
+                menu.row_at(y),
+                Some(i),
+                "the top of row {i} points elsewhere"
+            );
+            assert_eq!(
+                menu.row_at(y + row.height() - 1),
+                Some(i),
+                "row {i} ends early"
+            );
         }
         assert_eq!(menu.row_at(top - 1), None, "a row above the panel");
-        assert_eq!(menu.row_at(top + Row::top_of(Row::ALL.len())), None, "a row below the panel");
+        assert_eq!(
+            menu.row_at(top + Row::top_of(Row::ALL.len())),
+            None,
+            "a row below the panel"
+        );
         assert!(
             PANEL_TOP + Row::panel_height() < FB_H as i32 - 16,
             "the panel reaches the hint at the foot of the screen"
@@ -647,7 +729,10 @@ mod tests {
     #[test]
     fn the_menu_opens_on_a_level_that_can_be_beaten() {
         let level = MatchConfig::default().level;
-        assert!(level < MAX_LEVEL, "the title screen offers full strength by default");
+        assert!(
+            level < MAX_LEVEL,
+            "the title screen offers full strength by default"
+        );
         assert!(
             skill::rating_for(level as i32).elo > 0,
             "level {level} names no rating to play against"
@@ -711,7 +796,11 @@ mod tests {
         // Worst case the drift has pushed the grid a whole tile off centre.
         let first = -(REACH as f32) * TILE - TILE;
         let last = REACH as f32 * TILE + TILE + TILE;
-        assert!(first <= -needed, "grid starts at {first}, must reach {}", -needed);
+        assert!(
+            first <= -needed,
+            "grid starts at {first}, must reach {}",
+            -needed
+        );
         assert!(last >= needed, "grid ends at {last}, must reach {needed}");
     }
 
@@ -738,7 +827,10 @@ mod tests {
         let mut click = Input::default();
         click.point_at(4, 4);
         click.press = true;
-        assert!(!scene.update(&click, &mut Queue::default()), "and does not start a game");
+        assert!(
+            !scene.update(&click, &mut Queue::default()),
+            "and does not start a game"
+        );
         assert_eq!(scene.config, before);
     }
 
@@ -754,7 +846,10 @@ mod tests {
         assert!(!press(&mut scene, |i| i.fire(Dir::Down)));
         assert_eq!(scene.row, row, "a row moved behind the window");
 
-        assert!(!press(&mut scene, |i| i.cancel = true), "and no game started");
+        assert!(
+            !press(&mut scene, |i| i.cancel = true),
+            "and no game started"
+        );
         assert!(scene.about.is_none(), "esc closes it");
         assert!(!press(&mut scene, |i| i.fire(Dir::Down)));
         assert_ne!(scene.row, row, "the menu takes the keys back");
@@ -773,12 +868,27 @@ mod tests {
         for _ in 0..Lang::ALL.len() {
             assert_eq!(scene.value(Row::Language), scene.config.lang.autonym());
             seen.push(scene.config.lang);
-            assert!(!press(&mut scene, |i| i.fire(Dir::Right)), "and no game started");
+            assert!(
+                !press(&mut scene, |i| i.fire(Dir::Right)),
+                "and no game started"
+            );
         }
-        assert_eq!(seen, Lang::ALL.to_vec(), "a language is missing from the walk");
-        assert_eq!(scene.config.lang, Lang::En, "a full turn must come back round");
+        assert_eq!(
+            seen,
+            Lang::ALL.to_vec(),
+            "a language is missing from the walk"
+        );
+        assert_eq!(
+            scene.config.lang,
+            Lang::En,
+            "a full turn must come back round"
+        );
         press(&mut scene, |i| i.fire(Dir::Left));
-        assert_eq!(scene.config.lang, Lang::Pt, "the other arrow goes the other way");
+        assert_eq!(
+            scene.config.lang,
+            Lang::Pt,
+            "the other arrow goes the other way"
+        );
     }
 
     #[test]
@@ -786,10 +896,16 @@ mod tests {
         let mut scene = MenuScene::new(MatchConfig::default());
         let row = Row::ALL.iter().position(|r| *r == Row::Sound);
         scene.row = row.expect("the sound row has gone from the panel");
-        assert!(scene.config.sound, "a game with no sound is not the one to start with");
+        assert!(
+            scene.config.sound,
+            "a game with no sound is not the one to start with"
+        );
         assert_eq!(scene.value(Row::Sound), "on");
 
-        assert!(!press(&mut scene, |i| i.confirm = true), "and no game started");
+        assert!(
+            !press(&mut scene, |i| i.confirm = true),
+            "and no game started"
+        );
         assert!(!scene.config.sound);
         assert_eq!(scene.value(Row::Sound), "off", "the row says so");
         // And it says it in whatever language the panel is in.

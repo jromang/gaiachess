@@ -329,7 +329,10 @@ mod tests {
             assert!(!text.is_empty(), "{lang:?} says nothing somewhere");
             for c in text.chars() {
                 assert!(c.is_ascii(), "{lang:?}: {c:?} is not ascii, in {text:?}");
-                assert!(font::has_glyph(c), "{lang:?}: no glyph for {c:?} in {text:?}");
+                assert!(
+                    font::has_glyph(c),
+                    "{lang:?}: no glyph for {c:?} in {text:?}"
+                );
             }
         }
     }
@@ -371,7 +374,11 @@ mod tests {
 
     #[test]
     fn the_ladder_is_described_in_every_language() {
-        assert_eq!(LEVEL_PLAYERS.len(), FULL_STRENGTH as usize, "the ladder changed length");
+        assert_eq!(
+            LEVEL_PLAYERS.len(),
+            FULL_STRENGTH as usize,
+            "the ladder changed length"
+        );
         for lang in Lang::ALL {
             // Off either end of the ladder is a clamp rather than a panic: the level row
             // is walked by the player, and the search clamps the same way.

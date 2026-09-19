@@ -56,6 +56,12 @@ static NORMALIZE_SCORE: AtomicBool = AtomicBool::new(true);
 /// `UCI_ShowWDL`: append ` wdl W D L` (per mille) to every `info` line carrying a score.
 static SHOW_WDL: AtomicBool = AtomicBool::new(false);
 
+/// `UCI_ShowCurrLine`: publish lock-free snapshots of the lines being searched.
+static SHOW_CURR_LINE: AtomicBool = AtomicBool::new(false);
+
+/// `UCI_ShowRefutations`: publish the replies found for non-best root moves.
+static SHOW_REFUTATIONS: AtomicBool = AtomicBool::new(false);
+
 fn debug_on() -> bool {
     DEBUG.load(Ordering::Relaxed)
 }
@@ -73,6 +79,16 @@ pub fn normalize_score() -> bool {
 /// `UCI_ShowWDL`: whether `info` lines carry win/draw/loss probabilities.
 pub fn show_wdl() -> bool {
     SHOW_WDL.load(Ordering::Relaxed)
+}
+
+/// Whether search threads should publish their current root line snapshots.
+pub fn show_curr_line() -> bool {
+    SHOW_CURR_LINE.load(Ordering::Relaxed)
+}
+
+/// Whether completed iterations should report root-move refutations.
+pub fn show_refutations() -> bool {
+    SHOW_REFUTATIONS.load(Ordering::Relaxed)
 }
 
 /// Commands the protocol (and our debug extras) recognise as the start of a line.
@@ -235,7 +251,8 @@ impl UciSession {
 
             ["go", rest @ ..] => {
                 self.ensure_ready();
-                if rest.contains(&"ponder") {
+                let ponder_requested = rest.contains(&"ponder");
+                if ponder_requested {
                     PONDER.store(true, Ordering::Relaxed);
                 }
                 #[cfg(feature = "online-tb")]
@@ -246,6 +263,8 @@ impl UciSession {
                 let (best, ponder_move) =
                     self.pool
                         .start_search_filtered(&self.pos, limits, &search_moves);
+                wait_for_ponder_release(ponder_requested);
+                self.pool.print_final_uci_info();
                 if !best.is_ok() {
                     // No legal move (mate or stalemate). The protocol's nullmove is 0000.
                     out!("bestmove 0000");
@@ -320,15 +339,18 @@ impl UciSession {
 
     fn identify(&self) {
         out!("id name Gaia {}", env!("CARGO_PKG_VERSION"));
-        out!("id author Jean-Francois Romang");
+        out!("id author Jean-Francois Romang, David Rabel");
         out!("option name Hash type spin default 16 min 1 max 1048576");
         out!("option name Threads type spin default 1 min 1 max 256");
         out!("option name EvalFile type string default <internal>");
         out!("option name Ponder type check default true");
         out!("option name OwnBook type check default true");
         out!("option name MultiPV type spin default 1 min 1 max 256");
+        #[cfg(not(target_arch = "wasm32"))]
+        out!("option name UCI_ShowCurrLine type check default false");
+        out!("option name UCI_ShowRefutations type check default false");
         out!("option name NormalizeScore type check default true");
-        out!("option name Move Overhead type spin default 100 min 0 max 5000");
+        out!("option name Move Overhead type spin default 40 min 0 max 5000");
         out!("option name UseSoftNodes type check default false");
         out!("option name Debug Log File type string default");
         out!("option name Clear Hash type button");
@@ -336,7 +358,7 @@ impl UciSession {
         out!("option name SharedNetwork type check default true");
         out!("option name UCI_Chess960 type check default false");
         out!(
-            "option name UCI_EngineAbout type string default Gaia {} by Jean-Francois Romang, GPL-3.0-or-later, https://github.com/jromang/gaiachess",
+            "option name UCI_EngineAbout type string default Gaia {} by Jean-Francois Romang, David Rabel, GPL-3.0-or-later, https://github.com/jromang/gaiachess",
             env!("CARGO_PKG_VERSION")
         );
         out!("option name UCI_AnalyseMode type check default false");
@@ -368,6 +390,23 @@ impl UciSession {
         #[cfg(feature = "spsa")]
         crate::tune::print_uci_options();
         out!("uciok");
+    }
+}
+
+/// A ponder search must not hand a move to the GUI before `ponderhit` or `stop`,
+/// even when an independent depth limit or a terminal position ended its work.
+fn wait_for_ponder_release(ponder_requested: bool) {
+    if !ponder_requested {
+        return;
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        crate::threads::SEARCHING.store(true, Ordering::Relaxed);
+        while PONDER.load(Ordering::Relaxed) && !STOP.load(Ordering::Relaxed) {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        crate::threads::SEARCHING.store(false, Ordering::Relaxed);
     }
 }
 
@@ -475,9 +514,14 @@ fn parse_go(tokens: &[&str], pos: &Position) -> (SearchLimits, Vec<Move>) {
             "winc" => incs[Color::White as usize] = next_val(&mut iter).unwrap_or(0),
             "binc" => incs[Color::Black as usize] = next_val(&mut iter).unwrap_or(0),
             "movestogo" => limits.movestogo = next_val(&mut iter),
-            // UCI: searchmoves is last on the line; consume the rest as UCI moves.
+            // Move tokens have a fixed shape, so the next recognised go keyword
+            // unambiguously ends the list. GUIs are free to put other limits after it.
             "searchmoves" => {
-                for &mv in iter.by_ref() {
+                while let Some(&mv) = iter.as_slice().first() {
+                    if GO_KEYWORDS.contains(&mv) {
+                        break;
+                    }
+                    iter.next();
                     if let Some(m) = parse_uci_move(pos, mv) {
                         search_moves.push(m);
                     }
@@ -516,6 +560,22 @@ fn parse_go(tokens: &[&str], pos: &Position) -> (SearchLimits, Vec<Move>) {
 
     (limits, search_moves)
 }
+
+const GO_KEYWORDS: &[&str] = &[
+    "searchmoves",
+    "ponder",
+    "wtime",
+    "btime",
+    "winc",
+    "binc",
+    "movestogo",
+    "depth",
+    "nodes",
+    "softnodes",
+    "mate",
+    "movetime",
+    "infinite",
+];
 
 /// Parse `setoption name <N...> [value <V...>]`.
 /// Supports multi-word option names (e.g. "Move Overhead") and button options
@@ -647,7 +707,7 @@ fn parse_setoption(
             #[cfg(feature = "nalimov")]
             {
                 if value == "<empty>" {
-                    // OnceLock doesn't support reset — ignore
+                    crate::nalimov::free();
                 } else if !crate::nalimov::init(&value) {
                     outerr!("info string Failed to load Nalimov tablebases from {value}");
                 } else {
@@ -671,6 +731,13 @@ fn parse_setoption(
         }
         "uci_showwdl" => {
             SHOW_WDL.store(value.eq_ignore_ascii_case("true"), Ordering::Relaxed);
+        }
+        "uci_showcurrline" => {
+            #[cfg(not(target_arch = "wasm32"))]
+            SHOW_CURR_LINE.store(value.eq_ignore_ascii_case("true"), Ordering::Relaxed);
+        }
+        "uci_showrefutations" => {
+            SHOW_REFUTATIONS.store(value.eq_ignore_ascii_case("true"), Ordering::Relaxed);
         }
         "uci_limitstrength" => {
             let on = value.eq_ignore_ascii_case("true");
@@ -701,9 +768,13 @@ fn parse_setoption(
         "nalimovcache" => {
             #[cfg(feature = "nalimov")]
             {
-                if let Ok(mb) = value.parse::<i32>() {
-                    debug_assert!((1..=1024).contains(&mb), "NalimovCache {mb} out of range");
-                    let _ = mb.clamp(1, 1024);
+                if let Ok(mb) = value.parse::<u32>() {
+                    let mb = mb.clamp(1, 1024);
+                    if crate::nalimov::set_cache_size_mb(mb) {
+                        outerr!("info string Nalimov cache set to {mb} MiB");
+                    } else {
+                        outerr!("info string Failed to resize Nalimov cache to {mb} MiB");
+                    }
                 }
             }
         }
@@ -827,6 +898,27 @@ mod tests {
     }
 
     #[test]
+    fn go_options_after_searchmoves_are_still_parsed() {
+        let pos = Position::from_fen(STARTPOS).unwrap();
+        let (limits, moves) = parse_go(
+            &[
+                "searchmoves",
+                "e2e4",
+                "d2d4",
+                "movetime",
+                "150",
+                "depth",
+                "12",
+            ],
+            &pos,
+        );
+        assert_eq!(moves.len(), 2);
+        assert_eq!(limits.movetime, Some(150));
+        assert_eq!(limits.depth, Some(12));
+        assert!(!limits.infinite);
+    }
+
+    #[test]
     fn debug_log_file_records_input_and_output() {
         let _guard = lock_transcript();
         let path = std::env::temp_dir().join("gaiachess-uci-log-test.txt");
@@ -838,6 +930,42 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         assert!(text.contains(">> isready"), "log missing input: {text}");
         assert!(text.contains("<< readyok"), "log missing output: {text}");
+        for needle in [">> isready", "<< readyok"] {
+            let line = text
+                .lines()
+                .find(|l| l.contains(needle))
+                .unwrap_or_else(|| panic!("missing {needle} in: {text}"));
+            let stamp = line.split_whitespace().next().expect("timestamp token");
+            let (secs, millis) = stamp
+                .split_once('.')
+                .unwrap_or_else(|| panic!("stamp {stamp}"));
+            assert!(
+                secs.chars().all(|c| c.is_ascii_digit())
+                    && millis.len() == 3
+                    && millis.chars().all(|c| c.is_ascii_digit()),
+                "expected s.mmm, got {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn debug_log_file_appends_across_reopen() {
+        let _guard = lock_transcript();
+        let path = std::env::temp_dir().join("gaiachess-uci-log-append-test.txt");
+        let _ = std::fs::remove_file(&path);
+        let p = path.to_str().expect("utf-8 temp path");
+        crate::out::set_debug_log(p).unwrap();
+        crate::out::log_input("first");
+        crate::out::set_debug_log("").unwrap();
+        crate::out::set_debug_log(p).unwrap();
+        crate::out::log_input("second");
+        crate::out::set_debug_log("").unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(text.contains(">> first"), "truncated first session: {text}");
+        assert!(text.contains(">> second"), "missing second session: {text}");
+        let sessions = text.lines().filter(|l| l.starts_with("# session ")).count();
+        assert_eq!(sessions, 2, "expected two session markers: {text}");
     }
 
     /// The debug log and the display options are one set of globals for the whole
@@ -856,10 +984,8 @@ mod tests {
     ///
     /// The caller must hold [`lock_transcript`].
     fn transcript(name: &str, commands: &[&str]) -> String {
-        let path = std::env::temp_dir().join(format!(
-            "gaiachess-uci-{name}-{}.txt",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("gaiachess-uci-{name}-{}.txt", std::process::id()));
         crate::out::set_debug_log(path.to_str().expect("utf-8 temp path")).unwrap();
         let mut session = UciSession::new();
         for command in commands {
@@ -889,7 +1015,12 @@ mod tests {
         let mut ponder = true;
         let mut chess960 = false;
         let mut set = |name: &str, value: &str| {
-            parse_setoption(&["name", name, "value", value], &mut pool, &mut ponder, &mut chess960);
+            parse_setoption(
+                &["name", name, "value", value],
+                &mut pool,
+                &mut ponder,
+                &mut chess960,
+            );
         };
 
         set("NormalizeScore", "true");
@@ -905,20 +1036,72 @@ mod tests {
     }
 
     #[test]
+    fn optional_search_line_options_are_read_back() {
+        let _guard = lock_transcript();
+        let mut pool = crate::threads::ThreadPool::new(1, 16);
+        let mut ponder = true;
+        let mut chess960 = false;
+        let mut set = |name: &str, value: &str| {
+            parse_setoption(
+                &["name", name, "value", value],
+                &mut pool,
+                &mut ponder,
+                &mut chess960,
+            );
+        };
+
+        set("UCI_ShowCurrLine", "true");
+        set("UCI_ShowRefutations", "true");
+        assert!(show_curr_line());
+        assert!(show_refutations());
+
+        set("UCI_ShowCurrLine", "false");
+        set("UCI_ShowRefutations", "false");
+        assert!(!show_curr_line());
+        assert!(!show_refutations());
+    }
+
+    #[cfg(feature = "nalimov")]
+    #[test]
+    fn nalimov_cache_option_changes_the_configured_size() {
+        let _guard = lock_transcript();
+        let mut pool = crate::threads::ThreadPool::new(1, 16);
+        let mut ponder = true;
+        let mut chess960 = false;
+
+        parse_setoption(
+            &["name", "NalimovCache", "value", "64"],
+            &mut pool,
+            &mut ponder,
+            &mut chess960,
+        );
+        assert_eq!(crate::nalimov::cache_size_mb(), 64);
+
+        // Process-global option: restore the advertised default for the other tests.
+        assert!(crate::nalimov::set_cache_size_mb(256));
+    }
+
+    #[test]
     fn show_wdl_adds_three_probabilities_before_the_node_count() {
         let _guard = lock_transcript();
-        let text = transcript("wdl", &[
-            "setoption name UCI_ShowWDL value true",
-            "position fen rnbqkbnr/ppp1pppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
-            "go depth 4",
-            "setoption name UCI_ShowWDL value false",
-        ]);
+        let text = transcript(
+            "wdl",
+            &[
+                "setoption name UCI_ShowWDL value true",
+                "position fen rnbqkbnr/ppp1pppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+                "go depth 4",
+                "setoption name UCI_ShowWDL value false",
+            ],
+        );
         let line = text
             .lines()
             .find(|line| line.contains(" score cp "))
             .unwrap_or_else(|| panic!("no info line in: {text}"));
 
-        let wdl = line.split(" wdl ").nth(1).unwrap_or_else(|| panic!("no wdl in: {line}"));
+        let wdl = line
+            .split(" wdl ")
+            .nth(1)
+            .unwrap_or_else(|| panic!("no wdl in: {line}"));
         let parts: Vec<i32> = wdl
             .split_whitespace()
             .take(3)
@@ -929,7 +1112,35 @@ mod tests {
             line.find(" wdl ").unwrap() < line.find(" nodes ").unwrap(),
             "wdl must come before nodes: {line}"
         );
-        assert!(!show_wdl(), "the option must be back off for the other tests");
+        assert!(
+            !show_wdl(),
+            "the option must be back off for the other tests"
+        );
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn native_search_info_reports_cpu_load() {
+        let _guard = lock_transcript();
+        let text = transcript(
+            "cpuload",
+            &[
+                "position fen rnbqkbnr/ppp1pppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+                "go depth 4",
+            ],
+        );
+        let line = text
+            .lines()
+            .find(|line| line.contains(" cpuload "))
+            .unwrap_or_else(|| panic!("no cpuload in: {text}"));
+        let load: u32 = line
+            .split(" cpuload ")
+            .nth(1)
+            .and_then(|tail| tail.split_whitespace().next())
+            .expect("cpuload value")
+            .parse()
+            .expect("cpuload integer");
+        assert!(load <= 1000, "line: {line}");
     }
 
     /// The option is display only: the same search prints two different numbers for one
@@ -940,23 +1151,30 @@ mod tests {
         let position = "position fen rnbqkbnr/ppp1pppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
         // Both sides are set explicitly, so the test says what it means whichever way the
         // default happens to point.
-        let raw = last_score(&transcript("raw", &[
-            "setoption name NormalizeScore value false",
-            position,
-            "go depth 4",
-        ]));
-        let normalized = last_score(&transcript("norm", &[
-            "setoption name NormalizeScore value true",
-            position,
-            "go depth 4",
-        ]));
+        let raw = last_score(&transcript(
+            "raw",
+            &[
+                "setoption name NormalizeScore value false",
+                position,
+                "go depth 4",
+            ],
+        ));
+        let normalized = last_score(&transcript(
+            "norm",
+            &[
+                "setoption name NormalizeScore value true",
+                position,
+                "go depth 4",
+            ],
+        ));
 
-        let pos = Position::from_fen(
-            "rnbqkbnr/ppp1pppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
-        )
-        .unwrap();
+        let pos =
+            Position::from_fen("rnbqkbnr/ppp1pppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1").unwrap();
         assert_eq!(normalized, crate::wdl::to_cp(raw, &pos));
-        assert_ne!(normalized, raw, "the two scales must not coincide on this position");
+        assert_ne!(
+            normalized, raw,
+            "the two scales must not coincide on this position"
+        );
     }
 
     #[test]
@@ -1030,5 +1248,136 @@ mod tests {
         let mut session = UciSession::new();
         assert!(session.command("uci foobar"));
         assert!(session.command("joho isready"));
+    }
+
+    /// A long iteration used to be silent from one PV line to the next — seconds
+    /// and tens of millions of nodes in the reported analysis sessions, which the
+    /// interface showed as a frozen engine. With the tolerated silence cut to a
+    /// millisecond, a short fixed-node search must show progress lines between its
+    /// PV lines: depth and counters, no score, no PV.
+    #[test]
+    fn a_silent_iteration_reports_its_progress() {
+        let _guard = lock_transcript();
+        crate::threads::HEARTBEAT_MS.store(1, std::sync::atomic::Ordering::Relaxed);
+        let text = transcript("heartbeat", &["position startpos", "go nodes 300000"]);
+        crate::threads::HEARTBEAT_MS.store(1000, std::sync::atomic::Ordering::Relaxed);
+        let output: Vec<&str> = text
+            .lines()
+            .filter_map(|line| line.split_once(" << ").map(|(_, rest)| rest))
+            .collect();
+        let heartbeats: Vec<&&str> = output
+            .iter()
+            .filter(|line| {
+                line.starts_with("info depth ")
+                    && !line.contains(" score ")
+                    && !line.contains(" pv ")
+                    && line.contains(" nodes ")
+                    && line.contains(" time ")
+            })
+            .collect();
+        assert!(!heartbeats.is_empty(), "no progress line in: {text}");
+        for line in heartbeats {
+            let depth: i32 = line
+                .split_whitespace()
+                .nth(2)
+                .and_then(|d| d.parse().ok())
+                .unwrap_or_else(|| panic!("no depth in {line}"));
+            assert!(
+                depth >= 1,
+                "progress line before the first iteration: {line}"
+            );
+        }
+        let final_info = output
+            .iter()
+            .rev()
+            .find(|line| line.starts_with("info depth "))
+            .expect("final info");
+        assert!(
+            final_info.contains(" pv "),
+            "the last line before bestmove must still be the PV snapshot: {text}"
+        );
+    }
+
+    #[test]
+    fn interrupted_aspiration_is_followed_by_exact_final_info() {
+        let _guard = lock_transcript();
+        // David's queen endgames exposed this protocol bug: if the node limit landed
+        // during an aspiration re-search, the old engine left a transient bound as the
+        // last line before bestmove.  This position/budget deterministically interrupts
+        // such a re-search, so the penultimate search line must be a bound while the
+        // final snapshot must restore the last completed PV.
+        let text = transcript(
+            "final-info",
+            &[
+                "position fen 4K3/3Q4/2k5/2p5/1pPb4/1P6/8/8 b - - 7 70",
+                "go nodes 100000",
+            ],
+        );
+        let output: Vec<&str> = text
+            .lines()
+            .filter_map(|line| line.split_once(" << ").map(|(_, rest)| rest))
+            .collect();
+        let best_idx = output
+            .iter()
+            .position(|line| line.starts_with("bestmove "))
+            .unwrap_or_else(|| panic!("no bestmove in: {text}"));
+        assert!(best_idx > 0, "bestmove was the first output: {text}");
+        assert!(
+            output[best_idx - 1].starts_with("info "),
+            "bestmove was not preceded by info: {text}"
+        );
+        let final_info = output[best_idx - 1];
+        assert!(
+            final_info.contains(" score ") && final_info.contains(" pv "),
+            "final info did not contain a score and a complete PV: {text}"
+        );
+        assert!(
+            !final_info.contains("lowerbound") && !final_info.contains("upperbound"),
+            "final info repeated a transient aspiration bound: {text}"
+        );
+
+        let search_info = &output[..best_idx - 1];
+        assert!(
+            search_info
+                .iter()
+                .any(|line| line.contains("lowerbound") || line.contains("upperbound")),
+            "test did not actually interrupt an aspiration re-search: {text}"
+        );
+
+        let pv_move = final_info
+            .split(" pv ")
+            .nth(1)
+            .and_then(|pv| pv.split_whitespace().next())
+            .expect("final PV move");
+        let best_move = output[best_idx]
+            .split_whitespace()
+            .nth(1)
+            .expect("bestmove move");
+        assert_eq!(pv_move, best_move, "final PV and bestmove disagree: {text}");
+
+        // And it is the deepest iteration that was completed: never a shallower
+        // line dug up from an earlier iteration (a real game was lost that way).
+        let depth_of = |line: &str| -> i32 {
+            line.split_whitespace()
+                .nth(2)
+                .and_then(|d| d.parse().ok())
+                .unwrap_or(0)
+        };
+        let deepest_exact = search_info
+            .iter()
+            .filter(|line| {
+                line.starts_with("info depth ")
+                    && line.contains(" pv ")
+                    && !line.contains("lowerbound")
+                    && !line.contains("upperbound")
+            })
+            .map(|line| depth_of(line))
+            .max()
+            .expect("an exact iteration");
+        assert_eq!(
+            depth_of(final_info),
+            deepest_exact,
+            "final info is not the deepest completed iteration: {text}"
+        );
     }
 }

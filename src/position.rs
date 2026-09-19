@@ -61,7 +61,11 @@ pub enum FenParseError {
     /// Each side can have at most 16 pieces total.
     TooManyPieces { color: &'static str, count: u32 },
     /// Extra pieces beyond starting material exceed missing pawns.
-    TooManyPromotions { color: &'static str, extra: u32, missing_pawns: u32 },
+    TooManyPromotions {
+        color: &'static str,
+        extra: u32,
+        missing_pawns: u32,
+    },
     /// Castling rights require the king and rook on their starting squares.
     /// Still produced by the coherence check; the FEN parser itself drops a
     /// right that cannot apply rather than failing the whole string.
@@ -71,38 +75,51 @@ pub enum FenParseError {
 impl std::fmt::Display for FenParseError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::WrongFieldCount { found } =>
-                write!(f, "expected at least 4 FEN fields, found {found}"),
-            Self::WrongRankCount { found } =>
-                write!(f, "expected 8 ranks in placement, found {found}"),
-            Self::RankLengthMismatch { rank, count } =>
-                write!(f, "rank {rank} sums to {count} squares, expected 8"),
-            Self::InvalidPieceChar { ch } =>
-                write!(f, "invalid piece character '{ch}'"),
-            Self::InvalidSideToMove { found } =>
-                write!(f, "invalid side to move '{found}', expected 'w' or 'b'"),
-            Self::InvalidCastlingChar { ch } =>
-                write!(f, "invalid castling character '{ch}'"),
-            Self::TooLong { len } =>
-                write!(f, "FEN string too long ({len} chars, max {MAX_FEN_LEN})"),
-            Self::InvalidChars =>
-                write!(f, "FEN contains non-ASCII or non-printable characters"),
-            Self::AdjacentDigits { rank } =>
-                write!(f, "adjacent digits in rank {rank} (invalid FEN)"),
-            Self::InvalidKingCount { color, count } =>
-                write!(f, "{color} has {count} king(s), expected exactly 1"),
-            Self::OpponentKingInCheck =>
-                write!(f, "opponent's king is in check (illegal position)"),
-            Self::PawnsOnBackRank =>
-                write!(f, "pawns on rank 1 or 8 (illegal position)"),
-            Self::TooManyPawns { color, count } =>
-                write!(f, "{color} has {count} pawns, maximum is 8"),
-            Self::TooManyPieces { color, count } =>
-                write!(f, "{color} has {count} pieces, maximum is 16"),
-            Self::TooManyPromotions { color, extra, missing_pawns } =>
-                write!(f, "{color} has {extra} extra piece(s) but only {missing_pawns} missing pawn(s)"),
-            Self::CastlingRightsIncoherent { detail } =>
-                write!(f, "castling rights incoherent: {detail}"),
+            Self::WrongFieldCount { found } => {
+                write!(f, "expected at least 4 FEN fields, found {found}")
+            }
+            Self::WrongRankCount { found } => {
+                write!(f, "expected 8 ranks in placement, found {found}")
+            }
+            Self::RankLengthMismatch { rank, count } => {
+                write!(f, "rank {rank} sums to {count} squares, expected 8")
+            }
+            Self::InvalidPieceChar { ch } => write!(f, "invalid piece character '{ch}'"),
+            Self::InvalidSideToMove { found } => {
+                write!(f, "invalid side to move '{found}', expected 'w' or 'b'")
+            }
+            Self::InvalidCastlingChar { ch } => write!(f, "invalid castling character '{ch}'"),
+            Self::TooLong { len } => {
+                write!(f, "FEN string too long ({len} chars, max {MAX_FEN_LEN})")
+            }
+            Self::InvalidChars => write!(f, "FEN contains non-ASCII or non-printable characters"),
+            Self::AdjacentDigits { rank } => {
+                write!(f, "adjacent digits in rank {rank} (invalid FEN)")
+            }
+            Self::InvalidKingCount { color, count } => {
+                write!(f, "{color} has {count} king(s), expected exactly 1")
+            }
+            Self::OpponentKingInCheck => {
+                write!(f, "opponent's king is in check (illegal position)")
+            }
+            Self::PawnsOnBackRank => write!(f, "pawns on rank 1 or 8 (illegal position)"),
+            Self::TooManyPawns { color, count } => {
+                write!(f, "{color} has {count} pawns, maximum is 8")
+            }
+            Self::TooManyPieces { color, count } => {
+                write!(f, "{color} has {count} pieces, maximum is 16")
+            }
+            Self::TooManyPromotions {
+                color,
+                extra,
+                missing_pawns,
+            } => write!(
+                f,
+                "{color} has {extra} extra piece(s) but only {missing_pawns} missing pawn(s)"
+            ),
+            Self::CastlingRightsIncoherent { detail } => {
+                write!(f, "castling rights incoherent: {detail}")
+            }
         }
     }
 }
@@ -264,7 +281,9 @@ impl Position {
 
     #[inline(always)]
     pub fn castle_rook_sq(&self, right: u8) -> Square {
-        debug_assert!(right == WHITE_OO || right == WHITE_OOO || right == BLACK_OO || right == BLACK_OOO);
+        debug_assert!(
+            right == WHITE_OO || right == WHITE_OOO || right == BLACK_OO || right == BLACK_OOO
+        );
         self.castling_rook[castling_idx(right)]
     }
 
@@ -275,9 +294,7 @@ impl Position {
         }
     }
 
-    fn set_castling_from_token(
-        &mut self, us: Color, kingside: bool, rook_file: Option<u8>,
-    ) {
+    fn set_castling_from_token(&mut self, us: Color, kingside: bool, rook_file: Option<u8>) {
         // Drop a right that cannot apply rather than rejecting the FEN: ChessBase
         // position-setup often leaves KQkq ticked after the king or rook has moved.
         let king_bb = self.pieces[Piece::new(PieceType::King, us).index()];
@@ -383,13 +400,20 @@ impl Position {
     #[inline]
     pub fn material(&self) -> i32 {
         320 * (self.piece_type_bb(PieceType::Knight, Color::White)
-             | self.piece_type_bb(PieceType::Knight, Color::Black)).count_ones() as i32
-        + 330 * (self.piece_type_bb(PieceType::Bishop, Color::White)
-               | self.piece_type_bb(PieceType::Bishop, Color::Black)).count_ones() as i32
-        + 500 * (self.piece_type_bb(PieceType::Rook, Color::White)
-               | self.piece_type_bb(PieceType::Rook, Color::Black)).count_ones() as i32
-        + 900 * (self.piece_type_bb(PieceType::Queen, Color::White)
-               | self.piece_type_bb(PieceType::Queen, Color::Black)).count_ones() as i32
+            | self.piece_type_bb(PieceType::Knight, Color::Black))
+        .count_ones() as i32
+            + 330
+                * (self.piece_type_bb(PieceType::Bishop, Color::White)
+                    | self.piece_type_bb(PieceType::Bishop, Color::Black))
+                .count_ones() as i32
+            + 500
+                * (self.piece_type_bb(PieceType::Rook, Color::White)
+                    | self.piece_type_bb(PieceType::Rook, Color::Black))
+                .count_ones() as i32
+            + 900
+                * (self.piece_type_bb(PieceType::Queen, Color::White)
+                    | self.piece_type_bb(PieceType::Queen, Color::Black))
+                .count_ones() as i32
     }
 
     /// Returns true if `c` has any piece besides pawns and king.
@@ -409,10 +433,17 @@ impl Position {
     fn put_piece(&mut self, sq: Square, pc: Piece) {
         debug_assert!(sq.0 < 64, "put_piece: sq {} invalid", sq.0);
         debug_assert!(pc.0 < 12, "put_piece: piece {} invalid", pc.0);
-        debug_assert!(self.board[sq.index()] == Piece::NONE,
-            "put_piece: sq {} already has {:?}", sq.0, self.board[sq.index()]);
-        debug_assert!(self.pieces[pc.index()] & sq.bb() == 0,
-            "put_piece: piece bitboard already has sq {}", sq.0);
+        debug_assert!(
+            self.board[sq.index()] == Piece::NONE,
+            "put_piece: sq {} already has {:?}",
+            sq.0,
+            self.board[sq.index()]
+        );
+        debug_assert!(
+            self.pieces[pc.index()] & sq.bb() == 0,
+            "put_piece: piece bitboard already has sq {}",
+            sq.0
+        );
         let bb = sq.bb();
         self.pieces[pc.index()] |= bb;
         self.occupancies[pc.color().index()] |= bb;
@@ -435,10 +466,18 @@ impl Position {
     fn remove_piece(&mut self, sq: Square, pc: Piece) {
         debug_assert!(sq.0 < 64, "remove_piece: sq {} invalid", sq.0);
         debug_assert!(pc.0 < 12, "remove_piece: piece {} invalid", pc.0);
-        debug_assert!(self.board[sq.index()] == pc,
-            "remove_piece: sq {} has {:?}, expected {:?}", sq.0, self.board[sq.index()], pc);
-        debug_assert!(self.pieces[pc.index()] & sq.bb() != 0,
-            "remove_piece: piece bitboard missing sq {}", sq.0);
+        debug_assert!(
+            self.board[sq.index()] == pc,
+            "remove_piece: sq {} has {:?}, expected {:?}",
+            sq.0,
+            self.board[sq.index()],
+            pc
+        );
+        debug_assert!(
+            self.pieces[pc.index()] & sq.bb() != 0,
+            "remove_piece: piece bitboard missing sq {}",
+            sq.0
+        );
         let bb = sq.bb();
         self.pieces[pc.index()] ^= bb;
         self.occupancies[pc.color().index()] ^= bb;
@@ -459,27 +498,41 @@ impl Position {
 
     #[inline(always)]
     fn move_piece(&mut self, from: Square, to: Square, pc: Piece) {
-        debug_assert!(from.0 < 64 && to.0 < 64, "move_piece: from {} to {}", from.0, to.0);
+        debug_assert!(
+            from.0 < 64 && to.0 < 64,
+            "move_piece: from {} to {}",
+            from.0,
+            to.0
+        );
         debug_assert!(pc.0 < 12, "move_piece: piece {} invalid", pc.0);
-        debug_assert!(self.board[from.index()] == pc,
-            "move_piece: from {} has {:?}, expected {:?}", from.0, self.board[from.index()], pc);
-        debug_assert!(self.board[to.index()] == Piece::NONE,
-            "move_piece: to {} not empty, has {:?}", to.0, self.board[to.index()]);
+        debug_assert!(
+            self.board[from.index()] == pc,
+            "move_piece: from {} has {:?}, expected {:?}",
+            from.0,
+            self.board[from.index()],
+            pc
+        );
+        debug_assert!(
+            self.board[to.index()] == Piece::NONE,
+            "move_piece: to {} not empty, has {:?}",
+            to.0,
+            self.board[to.index()]
+        );
         let from_to_bb = from.bb() ^ to.bb();
         self.pieces[pc.index()] ^= from_to_bb;
         self.occupancies[pc.color().index()] ^= from_to_bb;
         self.occupancies[2] ^= from_to_bb;
         self.board[from.index()] = Piece::NONE;
         self.board[to.index()] = pc;
-        self.key ^= ZOBRIST.pieces[pc.index()][from.index()]
-            ^ ZOBRIST.pieces[pc.index()][to.index()];
+        self.key ^=
+            ZOBRIST.pieces[pc.index()][from.index()] ^ ZOBRIST.pieces[pc.index()][to.index()];
         self.psq_move(pc, from, to);
         if pc.piece_type() == PieceType::Pawn {
-            self.pawn_key ^= ZOBRIST.pieces[pc.index()][from.index()]
-                ^ ZOBRIST.pieces[pc.index()][to.index()];
+            self.pawn_key ^=
+                ZOBRIST.pieces[pc.index()][from.index()] ^ ZOBRIST.pieces[pc.index()][to.index()];
         } else {
-            self.non_pawn_key[pc.color().index()] ^= ZOBRIST.pieces[pc.index()][from.index()]
-                ^ ZOBRIST.pieces[pc.index()][to.index()];
+            self.non_pawn_key[pc.color().index()] ^=
+                ZOBRIST.pieces[pc.index()][from.index()] ^ ZOBRIST.pieces[pc.index()][to.index()];
             let pt = pc.piece_type();
             if pt == PieceType::Knight || pt == PieceType::Bishop || pt == PieceType::King {
                 self.minor_key ^= ZOBRIST.pieces[pc.index()][from.index()]
@@ -493,8 +546,12 @@ impl Position {
     fn put_piece_nz(&mut self, sq: Square, pc: Piece) {
         debug_assert!(sq.0 < 64, "put_piece_nz: sq {} invalid", sq.0);
         debug_assert!(pc.0 < 12, "put_piece_nz: piece {} invalid", pc.0);
-        debug_assert!(self.board[sq.index()] == Piece::NONE,
-            "put_piece_nz: sq {} already has {:?}", sq.0, self.board[sq.index()]);
+        debug_assert!(
+            self.board[sq.index()] == Piece::NONE,
+            "put_piece_nz: sq {} already has {:?}",
+            sq.0,
+            self.board[sq.index()]
+        );
         let bb = sq.bb();
         self.pieces[pc.index()] |= bb;
         self.occupancies[pc.color().index()] |= bb;
@@ -506,10 +563,18 @@ impl Position {
     fn remove_piece_nz(&mut self, sq: Square, pc: Piece) {
         debug_assert!(sq.0 < 64, "remove_piece_nz: sq {} invalid", sq.0);
         debug_assert!(pc.0 < 12, "remove_piece_nz: piece {} invalid", pc.0);
-        debug_assert!(self.board[sq.index()] == pc,
-            "remove_piece_nz: sq {} has {:?}, expected {:?}", sq.0, self.board[sq.index()], pc);
-        debug_assert!(self.pieces[pc.index()] & sq.bb() != 0,
-            "remove_piece_nz: piece bitboard missing sq {}", sq.0);
+        debug_assert!(
+            self.board[sq.index()] == pc,
+            "remove_piece_nz: sq {} has {:?}, expected {:?}",
+            sq.0,
+            self.board[sq.index()],
+            pc
+        );
+        debug_assert!(
+            self.pieces[pc.index()] & sq.bb() != 0,
+            "remove_piece_nz: piece bitboard missing sq {}",
+            sq.0
+        );
         let bb = sq.bb();
         self.pieces[pc.index()] ^= bb;
         self.occupancies[pc.color().index()] ^= bb;
@@ -519,12 +584,26 @@ impl Position {
 
     #[inline(always)]
     fn move_piece_nz(&mut self, from: Square, to: Square, pc: Piece) {
-        debug_assert!(from.0 < 64 && to.0 < 64, "move_piece_nz: from {} to {}", from.0, to.0);
+        debug_assert!(
+            from.0 < 64 && to.0 < 64,
+            "move_piece_nz: from {} to {}",
+            from.0,
+            to.0
+        );
         debug_assert!(pc.0 < 12, "move_piece_nz: piece {} invalid", pc.0);
-        debug_assert!(self.board[from.index()] == pc,
-            "move_piece_nz: from {} has {:?}, expected {:?}", from.0, self.board[from.index()], pc);
-        debug_assert!(self.board[to.index()] == Piece::NONE,
-            "move_piece_nz: to {} not empty, has {:?}", to.0, self.board[to.index()]);
+        debug_assert!(
+            self.board[from.index()] == pc,
+            "move_piece_nz: from {} has {:?}, expected {:?}",
+            from.0,
+            self.board[from.index()],
+            pc
+        );
+        debug_assert!(
+            self.board[to.index()] == Piece::NONE,
+            "move_piece_nz: to {} not empty, has {:?}",
+            to.0,
+            self.board[to.index()]
+        );
         let from_to_bb = from.bb() ^ to.bb();
         self.pieces[pc.index()] ^= from_to_bb;
         self.occupancies[pc.color().index()] ^= from_to_bb;
@@ -553,8 +632,8 @@ impl Position {
         let mut pinned = 0u64;
         let their_bishops_queens = self.piece_type_bb(PieceType::Bishop, them)
             | self.piece_type_bb(PieceType::Queen, them);
-        let their_rooks_queens = self.piece_type_bb(PieceType::Rook, them)
-            | self.piece_type_bb(PieceType::Queen, them);
+        let their_rooks_queens =
+            self.piece_type_bb(PieceType::Rook, them) | self.piece_type_bb(PieceType::Queen, them);
 
         // Diagonal snipers
         let mut snipers = bishop_attacks(ksq, self.color_bb(them)) & their_bishops_queens;
@@ -698,7 +777,11 @@ impl Position {
         let eg_phase = eval::TOTAL_PHASE - mg_phase;
         let score = (self.psq_mg * mg_phase + self.psq_eg * eg_phase) / eval::TOTAL_PHASE;
         let tempo = (eval::TEMPO_MG * mg_phase + eval::TEMPO_EG * eg_phase) / eval::TOTAL_PHASE;
-        if self.side_to_move == Color::White { score + tempo } else { -score + tempo }
+        if self.side_to_move == Color::White {
+            score + tempo
+        } else {
+            -score + tempo
+        }
     }
 
     // ============================================================
@@ -794,7 +877,10 @@ impl Position {
                 }
             }
             if file != 8 {
-                return Err(FenParseError::RankLengthMismatch { rank: 8 - i, count: file });
+                return Err(FenParseError::RankLengthMismatch {
+                    rank: 8 - i,
+                    count: file,
+                });
             }
         }
 
@@ -802,7 +888,11 @@ impl Position {
         pos.side_to_move = match parts[1] {
             "w" => Color::White,
             "b" => Color::Black,
-            _ => return Err(FenParseError::InvalidSideToMove { found: parts[1].to_string() }),
+            _ => {
+                return Err(FenParseError::InvalidSideToMove {
+                    found: parts[1].to_string(),
+                });
+            }
         };
 
         // 3. Castling rights (KQkq = outermost rook, A-H/a-h = Shredder file).
@@ -811,7 +901,9 @@ impl Position {
         pos.chess960 = chess960;
         if parts[2] != "-" && parts[2] != "0" {
             if parts[2].len() > 4 {
-                return Err(FenParseError::InvalidCastlingChar { ch: parts[2].chars().next().unwrap_or('?') });
+                return Err(FenParseError::InvalidCastlingChar {
+                    ch: parts[2].chars().next().unwrap_or('?'),
+                });
             }
             for ch in parts[2].chars() {
                 match ch {
@@ -843,11 +935,13 @@ impl Position {
 
         // 5–6. Halfmove clock and fullmove number. Optional, and skipped when
         // the token is an EPD opcode (`bm`, `id`, …) rather than a number.
-        pos.halfmove_clock = parts.get(4)
+        pos.halfmove_clock = parts
+            .get(4)
             .and_then(|s| s.parse::<u32>().ok())
             .map(|n| n.min(u8::MAX as u32) as u8)
             .unwrap_or(0);
-        pos.fullmove_number = parts.get(5)
+        pos.fullmove_number = parts
+            .get(5)
             .and_then(|s| s.parse::<u32>().ok())
             .map(|n| n.clamp(1, u16::MAX as u32) as u16)
             .unwrap_or(1);
@@ -902,6 +996,18 @@ impl Position {
         Ok(pos)
     }
 
+    /// Half-moves played since the start of the game.
+    ///
+    /// Not the search ply, and not the distance from the root: time management
+    /// asks how far into the *game* the position is, so it reads the FEN's move
+    /// counter. A FEN that omits the counters starts at one, so a position handed
+    /// over without them looks like an opening — which is the safe direction, an
+    /// opening being the cheaper move to allocate for.
+    pub fn game_ply(&self) -> i32 {
+        // Cast before doubling: the FEN parser clamps the counter to u16::MAX.
+        2 * (self.fullmove_number as i32 - 1) + (self.side_to_move == Color::Black) as i32
+    }
+
     /// Serialize the position back to a FEN string.
     pub fn to_fen(&self) -> String {
         let mut fen = String::new();
@@ -932,7 +1038,11 @@ impl Position {
 
         // 2. Side to move
         fen.push(' ');
-        fen.push(if self.side_to_move == Color::White { 'w' } else { 'b' });
+        fen.push(if self.side_to_move == Color::White {
+            'w'
+        } else {
+            'b'
+        });
 
         // 3. Castling rights
         fen.push(' ');
@@ -952,10 +1062,18 @@ impl Position {
                 fen.push((b'a' + self.castle_rook_sq(BLACK_OOO).file()) as char);
             }
         } else {
-            if self.castling_rights & WHITE_OO != 0 { fen.push('K'); }
-            if self.castling_rights & WHITE_OOO != 0 { fen.push('Q'); }
-            if self.castling_rights & BLACK_OO != 0 { fen.push('k'); }
-            if self.castling_rights & BLACK_OOO != 0 { fen.push('q'); }
+            if self.castling_rights & WHITE_OO != 0 {
+                fen.push('K');
+            }
+            if self.castling_rights & WHITE_OOO != 0 {
+                fen.push('Q');
+            }
+            if self.castling_rights & BLACK_OO != 0 {
+                fen.push('k');
+            }
+            if self.castling_rights & BLACK_OOO != 0 {
+                fen.push('q');
+            }
         }
 
         // 4. En passant
@@ -967,7 +1085,10 @@ impl Position {
         }
 
         // 5-6. Halfmove clock and fullmove number
-        fen.push_str(&format!(" {} {}", self.halfmove_clock, self.fullmove_number));
+        fen.push_str(&format!(
+            " {} {}",
+            self.halfmove_clock, self.fullmove_number
+        ));
 
         fen
     }
@@ -1011,8 +1132,13 @@ impl Position {
     fn compute_non_pawn_key(&self) -> [u64; 2] {
         let mut keys = [0u64; 2];
         for c in [Color::White, Color::Black] {
-            for pt in [PieceType::Knight, PieceType::Bishop, PieceType::Rook,
-                       PieceType::Queen, PieceType::King] {
+            for pt in [
+                PieceType::Knight,
+                PieceType::Bishop,
+                PieceType::Rook,
+                PieceType::Queen,
+                PieceType::King,
+            ] {
                 let pc = Piece::new(pt, c);
                 let mut bb = self.pieces[pc.index()];
                 while bb != 0 {
@@ -1046,17 +1172,33 @@ impl Position {
     /// Apply a move to the position: save state, update bitboards/mailbox/Zobrist,
     /// switch side, then recompute check info and threats.
     pub fn make_move(&mut self, m: Move) {
-        debug_assert!(m != Move::NONE && m != Move::NULL,
-            "make_move: invalid move {:?}", m);
-        debug_assert!(m.from_sq().0 < 64 && m.to_sq().0 < 64,
-            "make_move: squares OOB from={} to={}", m.from_sq().0, m.to_sq().0);
-        debug_assert!(self.ply < 1023,
-            "make_move: ply {} overflow (BUG 4)", self.ply);
-        debug_assert!(self.board[m.from_sq().index()] != Piece::NONE,
-            "make_move: source sq {} empty", m.from_sq().0);
-        debug_assert!(self.board[m.from_sq().index()].color() == self.side_to_move,
+        debug_assert!(
+            m != Move::NONE && m != Move::NULL,
+            "make_move: invalid move {:?}",
+            m
+        );
+        debug_assert!(
+            m.from_sq().0 < 64 && m.to_sq().0 < 64,
+            "make_move: squares OOB from={} to={}",
+            m.from_sq().0,
+            m.to_sq().0
+        );
+        debug_assert!(
+            self.ply < 1023,
+            "make_move: ply {} overflow (BUG 4)",
+            self.ply
+        );
+        debug_assert!(
+            self.board[m.from_sq().index()] != Piece::NONE,
+            "make_move: source sq {} empty",
+            m.from_sq().0
+        );
+        debug_assert!(
+            self.board[m.from_sq().index()].color() == self.side_to_move,
             "make_move: piece {:?} != stm {:?}",
-            self.board[m.from_sq().index()], self.side_to_move);
+            self.board[m.from_sq().index()],
+            self.side_to_move
+        );
 
         // Save state
         self.history[self.ply] = StateHistory {
@@ -1093,10 +1235,18 @@ impl Position {
         // Capture validation (BUG 3: TT king capture). Castling is encoded as
         // king-captures-own-rook, so the destination holds a friendly rook.
         if mt != MT_CASTLING && captured != Piece::NONE {
-            debug_assert!(captured.piece_type() != PieceType::King,
-                "make_move: KING CAPTURE on {} (move={}, BUG 3)", to.0, m.to_uci());
-            debug_assert!(captured.color() == them,
-                "make_move: capturing own piece {:?} on {}", captured, to.0);
+            debug_assert!(
+                captured.piece_type() != PieceType::King,
+                "make_move: KING CAPTURE on {} (move={}, BUG 3)",
+                to.0,
+                m.to_uci()
+            );
+            debug_assert!(
+                captured.color() == them,
+                "make_move: capturing own piece {:?} on {}",
+                captured,
+                to.0
+            );
         }
 
         // Clear old EP from hash
@@ -1138,20 +1288,35 @@ impl Position {
                 }
             }
             MT_PROMOTION => {
-                debug_assert!(moving_piece.piece_type() == PieceType::Pawn,
-                    "make_move promo: not a pawn {:?}", moving_piece);
+                debug_assert!(
+                    moving_piece.piece_type() == PieceType::Pawn,
+                    "make_move promo: not a pawn {:?}",
+                    moving_piece
+                );
                 let promo_rank = if us == Color::White { 7u8 } else { 0u8 };
-                debug_assert!(to.rank() == promo_rank,
-                    "make_move promo: to rank {} != {}", to.rank(), promo_rank);
+                debug_assert!(
+                    to.rank() == promo_rank,
+                    "make_move promo: to rank {} != {}",
+                    to.rank(),
+                    promo_rank
+                );
                 let from_rank = if us == Color::White { 6u8 } else { 1u8 };
-                debug_assert!(from.rank() == from_rank,
-                    "make_move promo: from rank {} != {}", from.rank(), from_rank);
+                debug_assert!(
+                    from.rank() == from_rank,
+                    "make_move promo: from rank {} != {}",
+                    from.rank(),
+                    from_rank
+                );
                 let promo_type = m.promo_type();
                 // Promotion piece must be Knight/Bishop/Rook/Queen
                 debug_assert!(
-                    promo_type == PieceType::Knight || promo_type == PieceType::Bishop
-                    || promo_type == PieceType::Rook || promo_type == PieceType::Queen,
-                    "make_move promo: invalid promo type {:?}", promo_type);
+                    promo_type == PieceType::Knight
+                        || promo_type == PieceType::Bishop
+                        || promo_type == PieceType::Rook
+                        || promo_type == PieceType::Queen,
+                    "make_move promo: invalid promo type {:?}",
+                    promo_type
+                );
                 let promo_piece = Piece::new(promo_type, us);
 
                 if captured != Piece::NONE {
@@ -1162,29 +1327,50 @@ impl Position {
                 self.put_piece(to, promo_piece);
             }
             MT_EN_PASSANT => {
-                debug_assert!(moving_piece.piece_type() == PieceType::Pawn,
-                    "make_move EP: not a pawn {:?}", moving_piece);
-                debug_assert!(self.history[self.ply].ep_square != Square::NONE,
-                    "make_move EP: no EP square was active");
-                debug_assert!(to == self.history[self.ply].ep_square,
-                    "make_move EP: to {} != saved ep {}", to.0, self.history[self.ply].ep_square.0);
+                debug_assert!(
+                    moving_piece.piece_type() == PieceType::Pawn,
+                    "make_move EP: not a pawn {:?}",
+                    moving_piece
+                );
+                debug_assert!(
+                    self.history[self.ply].ep_square != Square::NONE,
+                    "make_move EP: no EP square was active"
+                );
+                debug_assert!(
+                    to == self.history[self.ply].ep_square,
+                    "make_move EP: to {} != saved ep {}",
+                    to.0,
+                    self.history[self.ply].ep_square.0
+                );
                 let cap_sq = Square((to.0 as i8 - pawn_push(us)) as u8);
-                debug_assert!(self.board[cap_sq.index()] == Piece::new(PieceType::Pawn, them),
-                    "make_move EP: no enemy pawn on cap_sq {}", cap_sq.0);
+                debug_assert!(
+                    self.board[cap_sq.index()] == Piece::new(PieceType::Pawn, them),
+                    "make_move EP: no enemy pawn on cap_sq {}",
+                    cap_sq.0
+                );
                 let cap_pawn = Piece::new(PieceType::Pawn, them);
                 self.history[self.ply].captured_piece = cap_pawn;
                 self.remove_piece(cap_sq, cap_pawn);
                 self.move_piece(from, to, moving_piece);
             }
             MT_CASTLING => {
-                debug_assert!(moving_piece.piece_type() == PieceType::King,
-                    "make_move castle: not a king {:?}", moving_piece);
-                debug_assert!(from != to, "make_move castle: king and rook on the same square");
+                debug_assert!(
+                    moving_piece.piece_type() == PieceType::King,
+                    "make_move castle: not a king {:?}",
+                    moving_piece
+                );
+                debug_assert!(
+                    from != to,
+                    "make_move castle: king and rook on the same square"
+                );
                 let king_to = m.castle_king_to();
                 let rook_from = to;
                 let rook_to = m.castle_rook_to();
-                debug_assert!(self.board[rook_from.index()] == Piece::new(PieceType::Rook, us),
-                    "make_move castle: no friendly rook on {}", rook_from.0);
+                debug_assert!(
+                    self.board[rook_from.index()] == Piece::new(PieceType::Rook, us),
+                    "make_move castle: no friendly rook on {}",
+                    rook_from.0
+                );
                 let king = Piece::new(PieceType::King, us);
                 let rook = Piece::new(PieceType::Rook, us);
                 // Remove both first: in Chess960 the four squares can overlap.
@@ -1247,8 +1433,12 @@ impl Position {
     /// Undo a move: restore pieces and saved state (Zobrist, castling, EP, etc.).
     pub fn unmake_move(&mut self, m: Move) {
         debug_assert!(self.ply > 0, "unmake_move: ply underflow");
-        debug_assert!(m.from_sq().0 < 64 && m.to_sq().0 < 64,
-            "unmake_move: squares OOB from={} to={}", m.from_sq().0, m.to_sq().0);
+        debug_assert!(
+            m.from_sq().0 < 64 && m.to_sq().0 < 64,
+            "unmake_move: squares OOB from={} to={}",
+            m.from_sq().0,
+            m.to_sq().0
+        );
         self.ply -= 1;
         let saved = self.history[self.ply];
 
@@ -1458,7 +1648,11 @@ impl Position {
         }
         // Our sliders, minus the ones this move displaces: what those attack from where
         // they land is the direct check already answered above.
-        let moved = if mt == MT_CASTLING { from.bb() | to.bb() } else { from.bb() };
+        let moved = if mt == MT_CASTLING {
+            from.bb() | to.bb()
+        } else {
+            from.bb()
+        };
         let queens = self.piece_type_bb(PieceType::Queen, us);
         let rooks_queens = (self.piece_type_bb(PieceType::Rook, us) | queens) & !moved;
         let bishops_queens = (self.piece_type_bb(PieceType::Bishop, us) | queens) & !moved;
@@ -1506,9 +1700,9 @@ impl Position {
     /// position (van Kervinck cuckoo algorithm). Called from search when
     /// `alpha < 0` to raise alpha to draw score before the draw materializes.
     pub fn upcoming_repetition(&self, search_ply: usize) -> bool {
-        // Build a view of historical keys for the cuckoo algorithm.
-        // history[i].key = key of position at ply i (saved before move at ply i).
-        // We need keys from ply-1 back to ply-end.
+        // The cuckoo scan looks back over the reversible plies since the last
+        // irreversible move or null move; `history[self.ply - v]` is the state saved
+        // v plies ago, key and repetition flag included.
         let hmc = self.halfmove_clock as usize;
         let pfn = self.plies_from_null as usize;
         let end = hmc.min(pfn);
@@ -1516,28 +1710,12 @@ impl Position {
             return false;
         }
 
-        // Pass a slice of historical keys. The cuckoo function expects
-        // s(v) = key at v plies ago, accessible via history_keys[len-v].
-        // history[self.ply - v].key is the key v plies ago.
-        // We create a slice from history[self.ply - end .. self.ply].
-        let start = self.ply - end;
-        // Safety: we need the keys as a contiguous slice. StateHistory has key
-        // at a known offset. Build a temporary array of just the keys.
-        let mut keys = [0u64; 128]; // MAX_PLY should suffice
-        let key_count = end.min(128);
-        let mut i = 0;
-        while i < key_count {
-            keys[i] = self.history[start + i].key;
-            i += 1;
-        }
-
         crate::cuckoo::upcoming_repetition(
-            &keys[..key_count],
+            &self.history[self.ply - end..self.ply],
             self.key,
             self.occupied(),
             hmc,
             pfn,
-            self.repetition,
             search_ply,
         )
     }
@@ -1601,7 +1779,11 @@ impl Position {
             let missing_pawns = 8 - pawns;
             if extra > missing_pawns {
                 let color = if c == Color::White { "white" } else { "black" };
-                return Err(FenParseError::TooManyPromotions { color, extra, missing_pawns });
+                return Err(FenParseError::TooManyPromotions {
+                    color,
+                    extra,
+                    missing_pawns,
+                });
             }
         }
 
@@ -1615,16 +1797,40 @@ impl Position {
         }
 
         // 7. Castling rights coherence (king on back rank, rook on its recorded square)
-        self.check_castling_coherence(WHITE_OO, Color::White, Piece::WHITE_KING, Piece::WHITE_ROOK)?;
-        self.check_castling_coherence(WHITE_OOO, Color::White, Piece::WHITE_KING, Piece::WHITE_ROOK)?;
-        self.check_castling_coherence(BLACK_OO, Color::Black, Piece::BLACK_KING, Piece::BLACK_ROOK)?;
-        self.check_castling_coherence(BLACK_OOO, Color::Black, Piece::BLACK_KING, Piece::BLACK_ROOK)?;
+        self.check_castling_coherence(
+            WHITE_OO,
+            Color::White,
+            Piece::WHITE_KING,
+            Piece::WHITE_ROOK,
+        )?;
+        self.check_castling_coherence(
+            WHITE_OOO,
+            Color::White,
+            Piece::WHITE_KING,
+            Piece::WHITE_ROOK,
+        )?;
+        self.check_castling_coherence(
+            BLACK_OO,
+            Color::Black,
+            Piece::BLACK_KING,
+            Piece::BLACK_ROOK,
+        )?;
+        self.check_castling_coherence(
+            BLACK_OOO,
+            Color::Black,
+            Piece::BLACK_KING,
+            Piece::BLACK_ROOK,
+        )?;
 
         Ok(())
     }
 
     fn check_castling_coherence(
-        &self, right: u8, us: Color, king: Piece, rook: Piece,
+        &self,
+        right: u8,
+        us: Color,
+        king: Piece,
+        rook: Piece,
     ) -> Result<(), FenParseError> {
         if self.castling_rights & right == 0 {
             return Ok(());
@@ -1659,16 +1865,27 @@ impl Position {
             let sq = Square::from_index(sq_idx as u8);
             let pc = self.board[sq_idx];
             if pc != Piece::NONE {
-                debug_assert!(pc.0 < 12,
-                    "check_validity: board[{}] = Piece({}), invalid", sq_idx, pc.0);
-                debug_assert!(self.pieces[pc.index()] & sq.bb() != 0,
-                    "check_validity: board[{}] = {:?} but not in pieces bitboard", sq_idx, pc);
+                debug_assert!(
+                    pc.0 < 12,
+                    "check_validity: board[{}] = Piece({}), invalid",
+                    sq_idx,
+                    pc.0
+                );
+                debug_assert!(
+                    self.pieces[pc.index()] & sq.bb() != 0,
+                    "check_validity: board[{}] = {:?} but not in pieces bitboard",
+                    sq_idx,
+                    pc
+                );
             } else {
                 // No piece bitboard should contain this square
                 for pi in 0..12 {
-                    debug_assert!(self.pieces[pi] & sq.bb() == 0,
+                    debug_assert!(
+                        self.pieces[pi] & sq.bb() == 0,
                         "check_validity: board[{}] = NONE but pieces[{}] has it set",
-                        sq_idx, pi);
+                        sq_idx,
+                        pi
+                    );
                 }
             }
         }
@@ -1678,18 +1895,26 @@ impl Position {
             let mut bb = self.pieces[pi];
             while bb != 0 {
                 let sq = pop_lsb(&mut bb);
-                debug_assert!(self.board[sq.index()] == Piece(pi as u8),
+                debug_assert!(
+                    self.board[sq.index()] == Piece(pi as u8),
                     "check_validity: pieces[{}] has sq {} but board says {:?}",
-                    pi, sq.0, self.board[sq.index()]);
+                    pi,
+                    sq.0,
+                    self.board[sq.index()]
+                );
             }
         }
 
         // 2. Piece bitboard no overlap
         for i in 0..12 {
             for j in (i + 1)..12 {
-                debug_assert!(self.pieces[i] & self.pieces[j] == 0,
+                debug_assert!(
+                    self.pieces[i] & self.pieces[j] == 0,
                     "check_validity: pieces[{}] & pieces[{}] overlap: 0x{:016x}",
-                    i, j, self.pieces[i] & self.pieces[j]);
+                    i,
+                    j,
+                    self.pieces[i] & self.pieces[j]
+                );
             }
         }
 
@@ -1697,33 +1922,56 @@ impl Position {
         let mut white_occ = 0u64;
         let mut black_occ = 0u64;
         for pt_idx in 0..6 {
-            white_occ |= self.pieces[pt_idx * 2];     // white pieces at even indices
+            white_occ |= self.pieces[pt_idx * 2]; // white pieces at even indices
             black_occ |= self.pieces[pt_idx * 2 + 1]; // black pieces at odd indices
         }
-        debug_assert!(self.occupancies[0] == white_occ,
+        debug_assert!(
+            self.occupancies[0] == white_occ,
             "check_validity: occ[WHITE] 0x{:016x} != computed 0x{:016x}",
-            self.occupancies[0], white_occ);
-        debug_assert!(self.occupancies[1] == black_occ,
+            self.occupancies[0],
+            white_occ
+        );
+        debug_assert!(
+            self.occupancies[1] == black_occ,
             "check_validity: occ[BLACK] 0x{:016x} != computed 0x{:016x}",
-            self.occupancies[1], black_occ);
-        debug_assert!(self.occupancies[2] == white_occ | black_occ,
+            self.occupancies[1],
+            black_occ
+        );
+        debug_assert!(
+            self.occupancies[2] == white_occ | black_occ,
             "check_validity: occ[BOTH] 0x{:016x} != WHITE|BLACK 0x{:016x}",
-            self.occupancies[2], white_occ | black_occ);
-        debug_assert!(self.occupancies[0] & self.occupancies[1] == 0,
+            self.occupancies[2],
+            white_occ | black_occ
+        );
+        debug_assert!(
+            self.occupancies[0] & self.occupancies[1] == 0,
             "check_validity: WHITE & BLACK overlap: 0x{:016x}",
-            self.occupancies[0] & self.occupancies[1]);
+            self.occupancies[0] & self.occupancies[1]
+        );
 
         // 4. Kings: exactly one per side, valid square
         for c in [Color::White, Color::Black] {
             let king_bb = self.piece_type_bb(PieceType::King, c);
-            debug_assert!(popcount(king_bb) == 1,
-                "check_validity: {:?} has {} kings", c, popcount(king_bb));
+            debug_assert!(
+                popcount(king_bb) == 1,
+                "check_validity: {:?} has {} kings",
+                c,
+                popcount(king_bb)
+            );
             let ksq = self.king_sq(c);
-            debug_assert!(ksq.0 < 64,
-                "check_validity: {:?} king_sq = {} (BUG 3: Square(64))", c, ksq.0);
-            debug_assert!(self.board[ksq.index()] == Piece::new(PieceType::King, c),
+            debug_assert!(
+                ksq.0 < 64,
+                "check_validity: {:?} king_sq = {} (BUG 3: Square(64))",
+                c,
+                ksq.0
+            );
+            debug_assert!(
+                self.board[ksq.index()] == Piece::new(PieceType::King, c),
                 "check_validity: {:?} king_sq {} but board says {:?}",
-                c, ksq.0, self.board[ksq.index()]);
+                c,
+                ksq.0,
+                self.board[ksq.index()]
+            );
         }
 
         // 5. Opponent king NOT in check (position would be illegal)
@@ -1731,93 +1979,164 @@ impl Position {
         let them = !us;
         let their_king = self.king_sq(them);
         let attackers = attackers_to_color(their_king, us, self.occupied(), &self.pieces);
-        debug_assert!(attackers == 0,
+        debug_assert!(
+            attackers == 0,
             "check_validity: {:?} king on {} is in check by {:?} (illegal position, BUG 2)",
-            them, their_king.0, us);
+            them,
+            their_king.0,
+            us
+        );
 
         // 6. Pawns: none on rank 1 or rank 8, max 8 per side
         for c in [Color::White, Color::Black] {
             let pawns = self.piece_type_bb(PieceType::Pawn, c);
-            debug_assert!(pawns & (RANK_1 | RANK_8) == 0,
-                "check_validity: {:?} pawn on rank 1/8: 0x{:016x}", c, pawns & (RANK_1 | RANK_8));
-            debug_assert!(popcount(pawns) <= 8,
-                "check_validity: {:?} has {} pawns", c, popcount(pawns));
+            debug_assert!(
+                pawns & (RANK_1 | RANK_8) == 0,
+                "check_validity: {:?} pawn on rank 1/8: 0x{:016x}",
+                c,
+                pawns & (RANK_1 | RANK_8)
+            );
+            debug_assert!(
+                popcount(pawns) <= 8,
+                "check_validity: {:?} has {} pawns",
+                c,
+                popcount(pawns)
+            );
         }
 
         // 7. Max 16 pieces per side
         for c in [Color::White, Color::Black] {
             let count = popcount(self.color_bb(c));
-            debug_assert!(count <= 16,
-                "check_validity: {:?} has {} pieces (max 16)", c, count);
+            debug_assert!(
+                count <= 16,
+                "check_validity: {:?} has {} pieces (max 16)",
+                c,
+                count
+            );
         }
 
         // 8. EP square validity
         if self.ep_square != Square::NONE {
             let ep = self.ep_square;
-            debug_assert!(ep.0 < 64,
-                "check_validity: ep_square {} out of range", ep.0);
+            debug_assert!(ep.0 < 64, "check_validity: ep_square {} out of range", ep.0);
             let expected_rank = if us == Color::White { 5u8 } else { 2u8 };
-            debug_assert!(ep.rank() == expected_rank,
+            debug_assert!(
+                ep.rank() == expected_rank,
                 "check_validity: ep_square {} on rank {}, expected {} (stm={:?})",
-                ep.0, ep.rank(), expected_rank, us);
+                ep.0,
+                ep.rank(),
+                expected_rank,
+                us
+            );
             // Enemy pawn must be on the square behind EP
             let cap_sq = Square((ep.0 as i8 - pawn_push(us)) as u8);
-            debug_assert!(self.board[cap_sq.index()] == Piece::new(PieceType::Pawn, them),
+            debug_assert!(
+                self.board[cap_sq.index()] == Piece::new(PieceType::Pawn, them),
                 "check_validity: no {:?} pawn behind EP {} (cap_sq={})",
-                them, ep.0, cap_sq.0);
+                them,
+                ep.0,
+                cap_sq.0
+            );
         }
 
         // 9. Castling rights coherence
         for &(right, us, king, rook) in &[
             (WHITE_OO, Color::White, Piece::WHITE_KING, Piece::WHITE_ROOK),
-            (WHITE_OOO, Color::White, Piece::WHITE_KING, Piece::WHITE_ROOK),
+            (
+                WHITE_OOO,
+                Color::White,
+                Piece::WHITE_KING,
+                Piece::WHITE_ROOK,
+            ),
             (BLACK_OO, Color::Black, Piece::BLACK_KING, Piece::BLACK_ROOK),
-            (BLACK_OOO, Color::Black, Piece::BLACK_KING, Piece::BLACK_ROOK),
+            (
+                BLACK_OOO,
+                Color::Black,
+                Piece::BLACK_KING,
+                Piece::BLACK_ROOK,
+            ),
         ] {
             if self.castling_rights & right == 0 {
                 continue;
             }
             let ksq = self.king_sq(us);
             let rsq = self.castle_rook_sq(right);
-            debug_assert!(ksq.rank() == Self::back_rank(us) && self.board[ksq.index()] == king,
-                "check_validity: right {right} but king not on back rank (ksq={})", ksq.0);
-            debug_assert!(rsq.0 < 64 && self.board[rsq.index()] == rook && rsq.rank() == ksq.rank(),
-                "check_validity: right {right} but rook missing on {}", rsq.0);
+            debug_assert!(
+                ksq.rank() == Self::back_rank(us) && self.board[ksq.index()] == king,
+                "check_validity: right {right} but king not on back rank (ksq={})",
+                ksq.0
+            );
+            debug_assert!(
+                rsq.0 < 64 && self.board[rsq.index()] == rook && rsq.rank() == ksq.rank(),
+                "check_validity: right {right} but rook missing on {}",
+                rsq.0
+            );
         }
 
         // 10. Zobrist hash integrity (catches any incremental drift)
-        debug_assert!(self.key == self.compute_key(),
+        debug_assert!(
+            self.key == self.compute_key(),
             "check_validity: Zobrist key 0x{:016x} != computed 0x{:016x}",
-            self.key, self.compute_key());
-        debug_assert!(self.pawn_key == self.compute_pawn_key(),
+            self.key,
+            self.compute_key()
+        );
+        debug_assert!(
+            self.pawn_key == self.compute_pawn_key(),
             "check_validity: pawn_key 0x{:016x} != computed 0x{:016x}",
-            self.pawn_key, self.compute_pawn_key());
-        debug_assert!(self.non_pawn_key == self.compute_non_pawn_key(),
+            self.pawn_key,
+            self.compute_pawn_key()
+        );
+        debug_assert!(
+            self.non_pawn_key == self.compute_non_pawn_key(),
             "check_validity: non_pawn_key [{:016x}, {:016x}] != computed [{:016x}, {:016x}]",
-            self.non_pawn_key[0], self.non_pawn_key[1],
-            self.compute_non_pawn_key()[0], self.compute_non_pawn_key()[1]);
-        debug_assert!(self.minor_key == self.compute_minor_key(),
+            self.non_pawn_key[0],
+            self.non_pawn_key[1],
+            self.compute_non_pawn_key()[0],
+            self.compute_non_pawn_key()[1]
+        );
+        debug_assert!(
+            self.minor_key == self.compute_minor_key(),
             "check_validity: minor_key {:016x} != computed {:016x}",
-            self.minor_key, self.compute_minor_key());
+            self.minor_key,
+            self.compute_minor_key()
+        );
 
         // 10b. Incremental PeSTO integrity
         {
             let (mg, eg, phase) = self.compute_psq();
-            debug_assert!(self.psq_mg == mg,
-                "check_validity: psq_mg {} != computed {}", self.psq_mg, mg);
-            debug_assert!(self.psq_eg == eg,
-                "check_validity: psq_eg {} != computed {}", self.psq_eg, eg);
-            debug_assert!(self.game_phase == phase,
-                "check_validity: game_phase {} != computed {}", self.game_phase, phase);
+            debug_assert!(
+                self.psq_mg == mg,
+                "check_validity: psq_mg {} != computed {}",
+                self.psq_mg,
+                mg
+            );
+            debug_assert!(
+                self.psq_eg == eg,
+                "check_validity: psq_eg {} != computed {}",
+                self.psq_eg,
+                eg
+            );
+            debug_assert!(
+                self.game_phase == phase,
+                "check_validity: game_phase {} != computed {}",
+                self.game_phase,
+                phase
+            );
         }
 
         // 11. Halfmove clock
-        debug_assert!(self.halfmove_clock <= 100,
-            "check_validity: halfmove_clock {} > 100", self.halfmove_clock);
+        debug_assert!(
+            self.halfmove_clock <= 100,
+            "check_validity: halfmove_clock {} > 100",
+            self.halfmove_clock
+        );
 
         // 12. Ply bound (catches BUG 4: history overflow)
-        debug_assert!(self.ply < 1024,
-            "check_validity: ply {} >= 1024 (history overflow)", self.ply);
+        debug_assert!(
+            self.ply < 1024,
+            "check_validity: ply {} >= 1024 (history overflow)",
+            self.ply
+        );
 
         // 13. Checkers coherence: recompute and compare
         {
@@ -1826,11 +2145,11 @@ impl Position {
             let mut recomputed_checkers = 0u64;
 
             // Knight checks
-            recomputed_checkers |= knight_attacks(ksq)
-                & self.piece_type_bb(PieceType::Knight, them);
+            recomputed_checkers |=
+                knight_attacks(ksq) & self.piece_type_bb(PieceType::Knight, them);
             // Pawn checks
-            recomputed_checkers |= pawn_attacks(ksq, us)
-                & self.piece_type_bb(PieceType::Pawn, them);
+            recomputed_checkers |=
+                pawn_attacks(ksq, us) & self.piece_type_bb(PieceType::Pawn, them);
             // Bishop/Queen diagonal checks
             recomputed_checkers |= bishop_attacks(ksq, occ)
                 & (self.piece_type_bb(PieceType::Bishop, them)
@@ -1840,19 +2159,28 @@ impl Position {
                 & (self.piece_type_bb(PieceType::Rook, them)
                     | self.piece_type_bb(PieceType::Queen, them));
 
-            debug_assert!(self.checkers == recomputed_checkers,
+            debug_assert!(
+                self.checkers == recomputed_checkers,
                 "check_validity: checkers 0x{:016x} != recomputed 0x{:016x}",
-                self.checkers, recomputed_checkers);
+                self.checkers,
+                recomputed_checkers
+            );
 
             // Max 2 checkers
-            debug_assert!(popcount(self.checkers) <= 2,
-                "check_validity: {} checkers (max 2)", popcount(self.checkers));
+            debug_assert!(
+                popcount(self.checkers) <= 2,
+                "check_validity: {} checkers (max 2)",
+                popcount(self.checkers)
+            );
         }
 
         // 14. Pinned coherence: pinned pieces must be our pieces
-        debug_assert!(self.pinned & !self.color_bb(us) == 0,
+        debug_assert!(
+            self.pinned & !self.color_bb(us) == 0,
             "check_validity: pinned contains non-{:?} pieces: 0x{:016x}",
-            us, self.pinned & !self.color_bb(us));
+            us,
+            self.pinned & !self.color_bb(us)
+        );
     }
 }
 
@@ -1880,12 +2208,30 @@ mod tests {
         assert!(!pos.chess960);
 
         // Check piece counts
-        assert_eq!(popcount(pos.piece_type_bb(PieceType::Pawn, Color::White)), 8);
-        assert_eq!(popcount(pos.piece_type_bb(PieceType::Pawn, Color::Black)), 8);
-        assert_eq!(popcount(pos.piece_type_bb(PieceType::Rook, Color::White)), 2);
-        assert_eq!(popcount(pos.piece_type_bb(PieceType::Knight, Color::White)), 2);
-        assert_eq!(popcount(pos.piece_type_bb(PieceType::King, Color::White)), 1);
-        assert_eq!(popcount(pos.piece_type_bb(PieceType::King, Color::Black)), 1);
+        assert_eq!(
+            popcount(pos.piece_type_bb(PieceType::Pawn, Color::White)),
+            8
+        );
+        assert_eq!(
+            popcount(pos.piece_type_bb(PieceType::Pawn, Color::Black)),
+            8
+        );
+        assert_eq!(
+            popcount(pos.piece_type_bb(PieceType::Rook, Color::White)),
+            2
+        );
+        assert_eq!(
+            popcount(pos.piece_type_bb(PieceType::Knight, Color::White)),
+            2
+        );
+        assert_eq!(
+            popcount(pos.piece_type_bb(PieceType::King, Color::White)),
+            1
+        );
+        assert_eq!(
+            popcount(pos.piece_type_bb(PieceType::King, Color::Black)),
+            1
+        );
 
         // King squares
         assert_eq!(pos.king_sq(Color::White), Square::E1);
@@ -1900,9 +2246,8 @@ mod tests {
     #[test]
     fn test_fen_shredder_startpos() {
         let kq = Position::from_fen(STARTPOS).unwrap();
-        let ah = Position::from_fen(
-            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w AHah - 0 1",
-        ).unwrap();
+        let ah =
+            Position::from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w AHah - 0 1").unwrap();
         assert_eq!(kq.castling_rights, ah.castling_rights);
         assert_eq!(kq.castle_rook_sq(WHITE_OO), ah.castle_rook_sq(WHITE_OO));
         assert_eq!(kq.castle_rook_sq(WHITE_OOO), ah.castle_rook_sq(WHITE_OOO));
@@ -1921,26 +2266,33 @@ mod tests {
 
     #[test]
     fn test_fen_chess324() {
-        let pos = Position::from_fen(
-            "rnqbknbr/pppppppp/8/8/8/8/PPPPPPPP/RNBBKNQR w KQkq - 0 1",
-        ).unwrap();
+        let pos =
+            Position::from_fen("rnqbknbr/pppppppp/8/8/8/8/PPPPPPPP/RNBBKNQR w KQkq - 0 1").unwrap();
         assert_eq!(pos.king_sq(Color::White), Square::E1);
         assert_eq!(pos.castle_rook_sq(WHITE_OO), Square::H1);
         assert_eq!(pos.castle_rook_sq(WHITE_OOO), Square::A1);
-        assert_eq!(pos.board[Square::C1.index()].piece_type(), PieceType::Bishop);
-        assert_eq!(pos.board[Square::D1.index()].piece_type(), PieceType::Bishop);
+        assert_eq!(
+            pos.board[Square::C1.index()].piece_type(),
+            PieceType::Bishop
+        );
+        assert_eq!(
+            pos.board[Square::D1.index()].piece_type(),
+            PieceType::Bishop
+        );
     }
 
     #[test]
     fn test_fen_dfrc_asymmetric() {
-        let pos = Position::from_fen(
-            "nrkbnqbr/pppppppp/8/8/8/8/PPPPPPPP/BBNRKQNR w HDhb - 0 1",
-        ).unwrap();
+        let pos =
+            Position::from_fen("nrkbnqbr/pppppppp/8/8/8/8/PPPPPPPP/BBNRKQNR w HDhb - 0 1").unwrap();
         assert_eq!(pos.castle_rook_sq(WHITE_OO), Square::H1);
         assert_eq!(pos.castle_rook_sq(WHITE_OOO), Square::D1);
         assert_eq!(pos.castle_rook_sq(BLACK_OO), Square::H8);
         assert_eq!(pos.castle_rook_sq(BLACK_OOO), Square::B8);
-        assert_ne!(pos.king_sq(Color::White).file(), pos.king_sq(Color::Black).file());
+        assert_ne!(
+            pos.king_sq(Color::White).file(),
+            pos.king_sq(Color::Black).file()
+        );
     }
 
     /// `gives_check` is consulted before the move is made, and pruning trusts it, so
@@ -1975,15 +2327,27 @@ mod tests {
         let suite = [
             (STARTPOS, 4),
             // Kiwipete: castling both sides, pins, a board full of sliders.
-            ("r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1", 3),
+            (
+                "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+                3,
+            ),
             // The classic en passant position: captures that empty two squares on the
             // rank a rook already eyes, which is where discovered checks hide.
             ("8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1", 4),
             // Promotions on both wings, checking as knight, bishop, rook or queen.
-            ("r3k2r/Pppp1ppp/1b3nbN/nP6/BBP1P3/q4N2/Pp1P2PP/R2Q1RK1 w kq - 0 1", 3),
+            (
+                "r3k2r/Pppp1ppp/1b3nbN/nP6/BBP1P3/q4N2/Pp1P2PP/R2Q1RK1 w kq - 0 1",
+                3,
+            ),
             // Chess960, where the castling rook can land anywhere on the back rank.
-            ("rqnkbrnb/1pppp1pp/8/5p2/p1P5/3P1N2/PP2PPPP/RQNKBR1B w KQkq - 0 4", 3),
-            ("1r1qnbkr/ppp1pppp/1n1p4/5b2/2PP4/3N4/PP2PPPP/NRBQ1BKR w KQkq - 3 4", 3),
+            (
+                "rqnkbrnb/1pppp1pp/8/5p2/p1P5/3P1N2/PP2PPPP/RQNKBR1B w KQkq - 0 4",
+                3,
+            ),
+            (
+                "1r1qnbkr/ppp1pppp/1n1p4/5b2/2PP4/3N4/PP2PPPP/NRBQ1BKR w KQkq - 3 4",
+                3,
+            ),
             // A castle that checks, and a Chess960 one whose king does not move.
             ("5k2/8/8/8/8/8/8/4K2R w K - 0 1", 4),
             ("3k4/8/8/8/8/8/8/1RK5 w Q - 0 1", 4),
@@ -2024,7 +2388,6 @@ mod tests {
 
     #[test]
     fn test_fen_roundtrip() {
-
         let fens = [
             STARTPOS,
             // An en passant square a pawn can take on survives the round trip; one
@@ -2058,7 +2421,11 @@ mod tests {
         pos.make_move(m);
         assert_ne!(pos.key, original_key);
         assert_eq!(pos.side_to_move, Color::Black);
-        assert_eq!(pos.key, pos.compute_key(), "Key inconsistency after make_move");
+        assert_eq!(
+            pos.key,
+            pos.compute_key(),
+            "Key inconsistency after make_move"
+        );
 
         pos.unmake_move(m);
         assert_eq!(pos.key, original_key);
@@ -2149,8 +2516,9 @@ mod tests {
     #[test]
     fn test_fen_epd_opcodes_are_not_clocks() {
         // Non-numeric tokens after the EP square are EPD opcodes, not parse errors.
-        let pos = Position::from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - bm e2e4;")
-            .expect("EPD opcodes ignored");
+        let pos =
+            Position::from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - bm e2e4;")
+                .expect("EPD opcodes ignored");
         assert_eq!(pos.halfmove_clock, 0);
         assert_eq!(pos.fullmove_number, 1);
     }
@@ -2193,31 +2561,136 @@ mod tests {
         }
     }
 
+    /// Before the root, a move that merely recreates a position seen once is not a
+    /// draw: the second occurrence of the game position was taken for a third one when
+    /// the flag of the current position was consulted instead of the flag of the
+    /// position the move would recreate, and a queen check in a lost position came out
+    /// as 0.00 at every depth.
+    #[test]
+    fn a_second_occurrence_before_the_root_is_not_an_upcoming_repetition() {
+        let mut pos = Position::from_fen(STARTPOS).unwrap();
+        for uci in ["g1f3", "g8f6", "f3g1", "f6g8", "g1f3"] {
+            make_uci(&mut pos, uci);
+        }
+        // The position is itself a second occurrence (the one after 1.Nf3), and
+        // 1...Nf6 would recreate the position after 1...Nf6 — seen once.
+        assert_ne!(
+            pos.repetition, 0,
+            "the position after 3.Nf3 is a second occurrence"
+        );
+        for search_ply in 0..=3 {
+            assert!(
+                !pos.upcoming_repetition(search_ply),
+                "search_ply {search_ply}: a second occurrence is not a draw claim"
+            );
+        }
+    }
+
+    #[test]
+    fn a_third_occurrence_before_the_root_is_an_upcoming_repetition() {
+        let mut pos = Position::from_fen(STARTPOS).unwrap();
+        for uci in [
+            "g1f3", "g8f6", "f3g1", "f6g8", "g1f3", "g8f6", "f3g1", "f6g8", "g1f3",
+        ] {
+            make_uci(&mut pos, uci);
+        }
+        // 5...Nf6 recreates the position after 3...Nf6, already a repetition: a
+        // third occurrence, claimable from any ply.
+        for search_ply in 0..=3 {
+            assert!(
+                pos.upcoming_repetition(search_ply),
+                "search_ply {search_ply}: a third occurrence is a draw claim"
+            );
+        }
+    }
+
+    #[test]
+    fn a_second_occurrence_inside_the_tree_is_an_upcoming_repetition() {
+        let mut pos = Position::from_fen(STARTPOS).unwrap();
+        for uci in ["g1f3", "g8f6", "f3g1", "f6g8", "g1f3"] {
+            make_uci(&mut pos, uci);
+        }
+        // The same move, with the recreated position inside the search tree (four
+        // plies back, the tree starting five plies ago).
+        assert!(pos.upcoming_repetition(5));
+        assert!(!pos.upcoming_repetition(3));
+    }
+
+    /// The cuckoo scan must agree with the plain definition: an upcoming repetition
+    /// exists exactly when some legal move lands on a position the search would score
+    /// as a draw by repetition one ply deeper.
+    #[test]
+    fn upcoming_repetition_matches_draw_by_repetition_over_legal_moves() {
+        let lines: [&[&str]; 3] = [
+            &[
+                "g1f3", "g8f6", "f3g1", "f6g8", "g1f3", "g8f6", "f3g1", "f6g8", "g1f3", "g8f6",
+            ],
+            &[
+                "e2e4", "e7e5", "g1f3", "b8c6", "f3g1", "c6b8", "g1f3", "b8c6", "f3g1", "c6b8",
+                "g1f3",
+            ],
+            &[
+                "f4d2", "h3g2", "d2h6", "h2g1", "h6c1", "g1h2", "c1h6", "h2g1", "h6c1", "g1h2",
+                "c1h6",
+            ],
+        ];
+        let starts = [
+            STARTPOS,
+            STARTPOS,
+            "8/2P2pkp/p2P2p1/p3p3/P4q2/6PQ/7K/8 b - - 0 40",
+        ];
+        for (start, line) in starts.iter().zip(lines) {
+            let mut pos = Position::from_fen(start).unwrap();
+            for (i, uci) in line.iter().enumerate() {
+                make_uci(&mut pos, uci);
+                for search_ply in 0..=6usize {
+                    let mut buf = ArrayBuf::<Move, MAX_MOVES>::new();
+                    let count = crate::movegen::generate_legal_moves(&pos, &mut buf);
+                    let expected = (0..count).any(|k| {
+                        let mut child = pos.clone();
+                        child.make_move(buf[k]);
+                        child.draw_by_repetition(search_ply as i32 + 1)
+                    });
+                    assert_eq!(
+                        pos.upcoming_repetition(search_ply),
+                        expected,
+                        "line {start} after ply {} ({uci}), search_ply {search_ply}",
+                        i + 1
+                    );
+                }
+            }
+        }
+    }
+
     /// make_move records an en passant square only where a pawn can take on it, and
     /// hashes it on the same condition. A FEN naming one nobody can take must not give
     /// the position a different key from the one the moves would have built.
     #[test]
     fn a_fen_en_passant_square_nobody_can_take_is_dropped() {
-        let spurious = Position::from_fen(
-            "rnbqkbnr/pp1ppppp/8/2p5/4P3/8/PPPP1PPP/RNBQKBNR w KQkq c6 0 2",
-        )
-        .unwrap();
-        let plain = Position::from_fen(
-            "rnbqkbnr/pp1ppppp/8/2p5/4P3/8/PPPP1PPP/RNBQKBNR w KQkq - 0 2",
-        )
-        .unwrap();
+        let spurious =
+            Position::from_fen("rnbqkbnr/pp1ppppp/8/2p5/4P3/8/PPPP1PPP/RNBQKBNR w KQkq c6 0 2")
+                .unwrap();
+        let plain =
+            Position::from_fen("rnbqkbnr/pp1ppppp/8/2p5/4P3/8/PPPP1PPP/RNBQKBNR w KQkq - 0 2")
+                .unwrap();
         assert_eq!(spurious.ep_square, Square::NONE);
         assert_eq!(spurious.key, plain.key);
-        assert_eq!(spurious.to_fen(), plain.to_fen(), "the FEN reads back normalised");
+        assert_eq!(
+            spurious.to_fen(),
+            plain.to_fen(),
+            "the FEN reads back normalised"
+        );
         let mut played = Position::from_fen(STARTPOS).unwrap();
         make_uci(&mut played, "e2e4");
         make_uci(&mut played, "c7c5");
-        assert_eq!(played.key, plain.key, "the FEN and the moves must agree on the key");
+        assert_eq!(
+            played.key, plain.key,
+            "the FEN and the moves must agree on the key"
+        );
         // Where the capture exists, the square stays.
-        let live = Position::from_fen(
-            "rnbqkbnr/ppp1p1pp/8/3pPp2/8/8/PPPP1PPP/RNBQKBNR w KQkq f6 0 3",
-        )
-        .unwrap();
+        let live =
+            Position::from_fen("rnbqkbnr/ppp1p1pp/8/3pPp2/8/8/PPPP1PPP/RNBQKBNR w KQkq f6 0 3")
+                .unwrap();
         assert_eq!(live.ep_square, Square::F6);
     }
 
@@ -2235,7 +2708,10 @@ mod tests {
         // Within search tree (ply=5 > distance=4)
         assert!(pos.is_draw(5), "twofold: is_draw(5) should be true");
         // Before root (ply=3 < distance=4)
-        assert!(!pos.is_draw(3), "twofold: is_draw(3) should be false (game history)");
+        assert!(
+            !pos.is_draw(3),
+            "twofold: is_draw(3) should be false (game history)"
+        );
     }
 
     #[test]
@@ -2248,7 +2724,10 @@ mod tests {
             make_uci(&mut pos, "f3g1");
             make_uci(&mut pos, "f6g8");
         }
-        assert!(pos.repetition < 0, "threefold: repetition should be negative");
+        assert!(
+            pos.repetition < 0,
+            "threefold: repetition should be negative"
+        );
         // Threefold is always detected (negative < any positive ply)
         assert!(pos.is_draw(1), "threefold: is_draw(1) should be true");
     }
@@ -2293,14 +2772,16 @@ mod tests {
         make_uci(&mut pos, "f3g1"); // hmc=3, pfn=3
         make_uci(&mut pos, "f6g8"); // hmc=4, pfn=4
         // Position matches startpos, but pfn=4 and hmc=4 → both >= 4 → should detect
-        assert!(pos.repetition > 0, "should detect repetition (pfn >= 4, hmc >= 4)");
+        assert!(
+            pos.repetition > 0,
+            "should detect repetition (pfn >= 4, hmc >= 4)"
+        );
     }
 
     #[test]
     fn test_50_move_rule() {
         // Position with halfmove_clock = 100 and not in check → draw
-        let pos =
-            Position::from_fen("4k3/8/8/8/8/8/8/4K3 w - - 100 1").unwrap();
+        let pos = Position::from_fen("4k3/8/8/8/8/8/8/4K3 w - - 100 1").unwrap();
         assert_eq!(pos.halfmove_clock, 100);
         assert!(pos.is_draw(0), "hmc=100, not in check → draw");
     }
@@ -2333,8 +2814,14 @@ mod tests {
         let m = buf2[0];
         pos2.make_move(m);
         pos2.unmake_move(m);
-        assert_eq!(pos2.repetition, rep_before, "repetition not restored after unmake");
-        assert_eq!(pos2.plies_from_null, pfn_before, "plies_from_null not restored");
+        assert_eq!(
+            pos2.repetition, rep_before,
+            "repetition not restored after unmake"
+        );
+        assert_eq!(
+            pos2.plies_from_null, pfn_before,
+            "plies_from_null not restored"
+        );
         assert_eq!(pos2.key, key_before, "key not restored after unmake");
     }
 
@@ -2344,8 +2831,14 @@ mod tests {
 
     #[test]
     fn test_fen_too_long() {
-        let long = format!("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1{}", "x".repeat(MAX_FEN_LEN));
-        assert!(matches!(Position::from_fen(&long), Err(FenParseError::TooLong { .. })));
+        let long = format!(
+            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1{}",
+            "x".repeat(MAX_FEN_LEN)
+        );
+        assert!(matches!(
+            Position::from_fen(&long),
+            Err(FenParseError::TooLong { .. })
+        ));
     }
 
     #[test]
@@ -2382,17 +2875,19 @@ mod tests {
         let pos = Position::from_fen("rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR w KQkq e4 0 1")
             .expect("wrong-rank EP is dropped");
         assert_eq!(pos.ep_square, Square::NONE);
-        let pos = Position::from_fen("rnbqkbnr/ppp1pppp/8/3pP3/8/8/PPPP1PPP/RNBQKBNR b KQkq e6 0 1")
-            .expect("wrong-rank EP is dropped");
+        let pos =
+            Position::from_fen("rnbqkbnr/ppp1pppp/8/3pP3/8/8/PPPP1PPP/RNBQKBNR b KQkq e6 0 1")
+                .expect("wrong-rank EP is dropped");
         assert_eq!(pos.ep_square, Square::NONE);
     }
 
     #[test]
     fn test_fen_ep_valid_rank() {
         // Valid: black to move, EP on e3 (rank 3), white pawn on e4
-        assert!(Position::from_fen(
-            "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq e3 0 1"
-        ).is_ok());
+        assert!(
+            Position::from_fen("rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq e3 0 1")
+                .is_ok()
+        );
     }
 
     #[test]
@@ -2404,9 +2899,9 @@ mod tests {
 
     #[test]
     fn test_fen_four_fields() {
-        let pos = Position::from_fen(
-            "rnbqkb1r/pppp1ppp/5n2/4p3/4P3/5N2/PPPP1PPP/RNBQKB1R b KQkq -",
-        ).expect("4-field FEN (EPD) is what GUIs send");
+        let pos =
+            Position::from_fen("rnbqkb1r/pppp1ppp/5n2/4p3/4P3/5N2/PPPP1PPP/RNBQKB1R b KQkq -")
+                .expect("4-field FEN (EPD) is what GUIs send");
         assert_eq!(pos.side_to_move, Color::Black);
         assert_eq!(pos.halfmove_clock, 0);
         assert_eq!(pos.fullmove_number, 1);
@@ -2420,7 +2915,10 @@ mod tests {
     fn test_fen_no_white_king() {
         assert!(matches!(
             Position::from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQ1BNR w - - 0 1"),
-            Err(FenParseError::InvalidKingCount { color: "white", count: 0 })
+            Err(FenParseError::InvalidKingCount {
+                color: "white",
+                count: 0
+            })
         ));
     }
 
@@ -2428,7 +2926,10 @@ mod tests {
     fn test_fen_no_black_king() {
         assert!(matches!(
             Position::from_fen("rnbq1bnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w - - 0 1"),
-            Err(FenParseError::InvalidKingCount { color: "black", count: 0 })
+            Err(FenParseError::InvalidKingCount {
+                color: "black",
+                count: 0
+            })
         ));
     }
 
@@ -2436,7 +2937,10 @@ mod tests {
     fn test_fen_two_white_kings() {
         assert!(matches!(
             Position::from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBKKBNR w - - 0 1"),
-            Err(FenParseError::InvalidKingCount { color: "white", count: 2 })
+            Err(FenParseError::InvalidKingCount {
+                color: "white",
+                count: 2
+            })
         ));
     }
 
@@ -2479,7 +2983,10 @@ mod tests {
         // 9 white pawns
         assert!(matches!(
             Position::from_fen("4k3/8/8/8/P7/PPPPPPPP/8/4K3 w - - 0 1"),
-            Err(FenParseError::TooManyPawns { color: "white", count: 9 })
+            Err(FenParseError::TooManyPawns {
+                color: "white",
+                count: 9
+            })
         ));
     }
 
@@ -2488,16 +2995,18 @@ mod tests {
         // 3 white queens + 8 white pawns = 2 extra queens, 0 missing pawns
         assert!(matches!(
             Position::from_fen("4k3/8/8/8/8/QQQ5/PPPPPPPP/4K3 w - - 0 1"),
-            Err(FenParseError::TooManyPromotions { color: "white", extra: 2, missing_pawns: 0 })
+            Err(FenParseError::TooManyPromotions {
+                color: "white",
+                extra: 2,
+                missing_pawns: 0
+            })
         ));
     }
 
     #[test]
     fn test_fen_promotions_valid() {
         // 3 white queens + 6 white pawns = 2 extra queens, 2 missing pawns → OK
-        assert!(Position::from_fen(
-            "4k3/8/8/8/8/QQQ5/PPPPPP2/4K3 w - - 0 1"
-        ).is_ok());
+        assert!(Position::from_fen("4k3/8/8/8/8/QQQ5/PPPPPP2/4K3 w - - 0 1").is_ok());
     }
 
     #[test]
@@ -2514,7 +3023,10 @@ mod tests {
         // White O-O but king not on e1
         assert!(matches!(
             Position::from_fen("r3k2r/pppppppp/8/8/8/8/PPPPPPPP/RNBQ1BNR w Kkq - 0 1"),
-            Err(FenParseError::InvalidKingCount { color: "white", count: 0 })
+            Err(FenParseError::InvalidKingCount {
+                color: "white",
+                count: 0
+            })
         ));
     }
 
@@ -2541,13 +3053,43 @@ mod tests {
         let valid_fens = [
             "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
             "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq e3 0 1",
-            "4k3/8/8/8/8/8/8/4K3 w - - 0 1",           // bare kings
-            "4k3/8/8/8/8/8/8/4K3 w - - 100 1",         // halfmove 100
+            "4k3/8/8/8/8/8/8/4K3 w - - 0 1",   // bare kings
+            "4k3/8/8/8/8/8/8/4K3 w - - 100 1", // halfmove 100
             "r3k2r/Pppp1ppp/1b3nbN/nP6/BBP1P3/q4N2/Pp1P2PP/R2Q1RK1 w kq - 0 1",
-            "4k3/8/8/8/8/QQ6/PPPPPP2/4K3 w - - 0 1",   // 2 queens + 6 pawns (valid promotion)
+            "4k3/8/8/8/8/QQ6/PPPPPP2/4K3 w - - 0 1", // 2 queens + 6 pawns (valid promotion)
         ];
         for fen in valid_fens {
             assert!(Position::from_fen(fen).is_ok(), "valid FEN rejected: {fen}");
         }
+    }
+
+    #[test]
+    fn game_ply_counts_half_moves_from_the_start_of_the_game() {
+        // The start of a game is ply zero, and Black to move on move one is ply one.
+        assert_eq!(Position::from_fen(STARTPOS).unwrap().game_ply(), 0);
+        let after_e4 =
+            Position::from_fen("rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq e3 0 1")
+                .unwrap();
+        assert_eq!(after_e4.game_ply(), 1);
+        // Move forty, White to move: thirty-nine full moves are behind us.
+        let midgame = Position::from_fen("4k3/8/8/8/8/8/8/4K3 w - - 0 40").unwrap();
+        assert_eq!(midgame.game_ply(), 78);
+
+        // Playing a move advances it, and so does the FEN it round-trips through.
+        let mut pos = Position::from_fen(STARTPOS).unwrap();
+        let mut buf: ArrayBuf<Move, MAX_MOVES> = ArrayBuf::new();
+        crate::movegen::generate_legal_moves(&pos, &mut buf);
+        pos.make_move(buf[0]);
+        assert_eq!(pos.game_ply(), 1);
+        assert_eq!(Position::from_fen(&pos.to_fen()).unwrap().game_ply(), 1);
+
+        // A FEN without move counters looks like the start of a game, which is the
+        // safe direction: an opening is the cheaper move to allocate time for.
+        assert_eq!(
+            Position::from_fen("4k3/8/8/8/8/8/8/4K3 w - -")
+                .unwrap()
+                .game_ply(),
+            0
+        );
     }
 }

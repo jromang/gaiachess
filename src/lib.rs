@@ -9,59 +9,61 @@
 #[macro_use]
 pub mod out;
 
-pub mod time;
-pub mod types;
 pub mod bitboard;
+pub mod book;
 #[cfg(target_arch = "x86_64")]
 pub mod cpu;
-pub mod zobrist;
-pub mod position;
-pub mod movegen;
-pub mod perft;
-pub mod progress;
-pub mod simd_attacks;
-pub mod eval;
-pub mod tt;
-pub mod movepick;
-pub mod timeman;
-pub mod history;
-pub mod nnue;
-pub mod see;
-pub mod skill;
-pub mod book;
-pub mod tune;
+mod cpuload;
 pub mod cuckoo;
-pub mod wdl;
+pub mod eval;
+pub mod history;
+pub mod lmr_factorized;
+pub mod movegen;
+pub mod movepick;
+pub mod nnue;
+pub mod perft;
+pub mod position;
+pub mod progress;
 pub mod search;
+pub mod see;
+pub mod simd_attacks;
+pub mod skill;
 pub mod stats;
+pub mod time;
+pub mod timeman;
+pub mod tt;
+pub mod tune;
+pub mod types;
+pub mod wdl;
+pub mod zobrist;
 // The module is always compiled, because it is where the recording macros live and
 // they have to expand to nothing in an ordinary build. Its wire protocol is then
 // unused, which is the point: the table is a contract with the Python parser and stays
 // complete whether or not this build records anything.
-#[cfg_attr(not(feature = "tree"), allow(dead_code))]
-pub mod tree;
-#[cfg(any(feature = "stats", feature = "tree"))]
-pub mod dump;
-pub mod threads;
-pub mod shm;
 pub mod bench;
 pub mod bench_stats;
 #[cfg(feature = "datagen")]
 pub mod datagen;
-#[cfg(feature = "datagen")]
-pub mod relabel;
-pub mod tb;
 #[cfg(feature = "gaiatb")]
 pub mod dtm;
+#[cfg(any(feature = "stats", feature = "tree"))]
+pub mod dump;
+#[cfg(feature = "gui-core")]
+pub mod gui;
 #[cfg(feature = "nalimov")]
 pub mod nalimov;
 #[cfg(feature = "online-tb")]
 pub mod online_tb;
-#[cfg(feature = "gui-core")]
-pub mod gui;
+#[cfg(feature = "datagen")]
+pub mod relabel;
+pub mod shm;
+pub mod tb;
+pub mod threads;
+#[cfg_attr(not(feature = "tree"), allow(dead_code))]
+pub mod tree;
+pub mod uci;
 #[cfg(all(windows, feature = "gui"))]
 pub mod win_console;
-pub mod uci;
 
 /// Selects the runtime SIMD and slider implementations. Must run before any search.
 ///

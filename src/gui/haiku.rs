@@ -103,9 +103,7 @@ pub fn view_size() -> (f32, f32) {
 /// one blit per frame, sounds drained once a frame.
 pub fn run_window() {
     let title = c"GaiaChess";
-    let ok = unsafe {
-        gaia_shim_init(title.as_ptr(), FB_W as i32, FB_H as i32, INITIAL_SCALE)
-    };
+    let ok = unsafe { gaia_shim_init(title.as_ptr(), FB_W as i32, FB_H as i32, INITIAL_SCALE) };
     if ok == 0 {
         eprintln!("no window: app_server refused us");
         return;

@@ -7,8 +7,8 @@
 use crate::movegen;
 use crate::position::Position;
 use crate::types::{
-    ArrayBuf, Color, MAX_MOVES, MT_CASTLING,
-    MT_EN_PASSANT, MT_PROMOTION, Move, Piece, PieceType, Square,
+    ArrayBuf, Color, MAX_MOVES, MT_CASTLING, MT_EN_PASSANT, MT_PROMOTION, Move, Piece, PieceType,
+    Square,
 };
 
 pub const STARTPOS: &str = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
@@ -49,7 +49,11 @@ impl GameState {
 
     /// Plays a move that must come from [`GameState::legal`].
     pub fn play(&mut self, m: Move) {
-        debug_assert!(self.legal.contains(&m), "move must be legal: {}", m.to_uci());
+        debug_assert!(
+            self.legal.contains(&m),
+            "move must be legal: {}",
+            m.to_uci()
+        );
         self.pos.make_move(m);
         self.moves.push(m);
         self.refresh();
@@ -102,7 +106,10 @@ impl GameState {
 
     /// Legal moves leaving `sq`, in generation order.
     pub fn moves_from(&self, sq: Square) -> impl Iterator<Item = Move> + '_ {
-        self.legal.iter().copied().filter(move |m| m.from_sq() == sq)
+        self.legal
+            .iter()
+            .copied()
+            .filter(move |m| m.from_sq() == sq)
     }
 
     /// The legal move from `from` to `to`, if there is exactly one. Promotions are
@@ -142,7 +149,11 @@ pub fn is_legal(pos: &Position, m: Move) -> bool {
 pub fn captured_square(pos: &Position, m: Move) -> Option<Square> {
     let to = m.to_sq();
     if m.move_type() == MT_EN_PASSANT {
-        let back = if pos.side_to_move == Color::White { -8 } else { 8 };
+        let back = if pos.side_to_move == Color::White {
+            -8
+        } else {
+            8
+        };
         return Some(Square((to.0 as i32 + back) as u8));
     }
     if m.move_type() == MT_CASTLING {
@@ -229,10 +240,30 @@ mod tests {
     #[test]
     fn castling_reports_the_rooks_journey() {
         for (fen, king_to, rook_from, rook_to) in [
-            ("r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1", Square::G1, Square::H1, Square::F1),
-            ("r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1", Square::C1, Square::A1, Square::D1),
-            ("r3k2r/8/8/8/8/8/8/R3K2R b KQkq - 0 1", Square::G8, Square::H8, Square::F8),
-            ("r3k2r/8/8/8/8/8/8/R3K2R b KQkq - 0 1", Square::C8, Square::A8, Square::D8),
+            (
+                "r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1",
+                Square::G1,
+                Square::H1,
+                Square::F1,
+            ),
+            (
+                "r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1",
+                Square::C1,
+                Square::A1,
+                Square::D1,
+            ),
+            (
+                "r3k2r/8/8/8/8/8/8/R3K2R b KQkq - 0 1",
+                Square::G8,
+                Square::H8,
+                Square::F8,
+            ),
+            (
+                "r3k2r/8/8/8/8/8/8/R3K2R b KQkq - 0 1",
+                Square::C8,
+                Square::A8,
+                Square::D8,
+            ),
         ] {
             let pos = Position::from_fen(fen).unwrap();
             let mut buf = ArrayBuf::<Move, MAX_MOVES>::new();

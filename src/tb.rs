@@ -108,23 +108,45 @@ mod ffi {
         pub fn tb_init(path: *const std::ffi::c_char) -> bool;
         pub fn tb_free();
         pub fn tb_probe_wdl(
-            white: u64, black: u64,
-            kings: u64, queens: u64, rooks: u64,
-            bishops: u64, knights: u64, pawns: u64,
-            ep: u32, turn: bool,
+            white: u64,
+            black: u64,
+            kings: u64,
+            queens: u64,
+            rooks: u64,
+            bishops: u64,
+            knights: u64,
+            pawns: u64,
+            ep: u32,
+            turn: bool,
         ) -> u32;
         pub fn tb_probe_root_dtz(
-            white: u64, black: u64,
-            kings: u64, queens: u64, rooks: u64,
-            bishops: u64, knights: u64, pawns: u64,
-            rule50: u32, ep: u32, turn: bool, has_repeated: bool,
+            white: u64,
+            black: u64,
+            kings: u64,
+            queens: u64,
+            rooks: u64,
+            bishops: u64,
+            knights: u64,
+            pawns: u64,
+            rule50: u32,
+            ep: u32,
+            turn: bool,
+            has_repeated: bool,
             results: *mut TbRootMoves,
         ) -> i32;
         pub fn tb_probe_root_wdl(
-            white: u64, black: u64,
-            kings: u64, queens: u64, rooks: u64,
-            bishops: u64, knights: u64, pawns: u64,
-            rule50: u32, ep: u32, turn: bool, use_rule50: bool,
+            white: u64,
+            black: u64,
+            kings: u64,
+            queens: u64,
+            rooks: u64,
+            bishops: u64,
+            knights: u64,
+            pawns: u64,
+            rule50: u32,
+            ep: u32,
+            turn: bool,
+            use_rule50: bool,
             results: *mut TbRootMoves,
         ) -> i32;
         pub static TB_LARGEST: i32;
@@ -169,10 +191,16 @@ pub fn max_pieces() -> u32 {
 /// Extract the 10 Pyrrhic arguments from a Position.
 #[cfg(feature = "syzygy")]
 struct PyrrhicArgs {
-    white: u64, black: u64,
-    kings: u64, queens: u64, rooks: u64,
-    bishops: u64, knights: u64, pawns: u64,
-    ep: u32, turn: bool,
+    white: u64,
+    black: u64,
+    kings: u64,
+    queens: u64,
+    rooks: u64,
+    bishops: u64,
+    knights: u64,
+    pawns: u64,
+    ep: u32,
+    turn: bool,
 }
 
 #[cfg(feature = "syzygy")]
@@ -193,7 +221,11 @@ impl PyrrhicArgs {
                 | pos.piece_type_bb(PieceType::Knight, Color::Black),
             pawns: pos.piece_type_bb(PieceType::Pawn, Color::White)
                 | pos.piece_type_bb(PieceType::Pawn, Color::Black),
-            ep: if pos.ep_square != Square::NONE { pos.ep_square.0 as u32 } else { 0 },
+            ep: if pos.ep_square != Square::NONE {
+                pos.ep_square.0 as u32
+            } else {
+                0
+            },
             turn: pos.side_to_move == Color::White,
         }
     }
@@ -239,8 +271,10 @@ pub fn probe_wdl(pos: &Position) -> Option<Wdl> {
 
     let a = PyrrhicArgs::from_pos(pos);
     let result = unsafe {
-        ffi::tb_probe_wdl(a.white, a.black, a.kings, a.queens, a.rooks,
-                          a.bishops, a.knights, a.pawns, a.ep, a.turn)
+        ffi::tb_probe_wdl(
+            a.white, a.black, a.kings, a.queens, a.rooks, a.bishops, a.knights, a.pawns, a.ep,
+            a.turn,
+        )
     };
 
     match result {
@@ -256,20 +290,24 @@ pub fn probe_wdl(pos: &Position) -> Option<Wdl> {
 const MAX_DTZ: i32 = 0x40000; // 262144
 
 /// Compute a tbScore from a Pyrrhic tbRank.
-/// Certain wins → SCORE_TB_WIN. Marginal wins → small cp. Draw → 0. Losses → mirror.
+/// Certain wins → SCORE_TB_WIN. Cursed wins → small cp. Draw → 0. Losses → mirror.
+///
+/// This Pyrrhic bridge ranks a cursed win as `MAX_DTZ - (dtz + rule50)`,
+/// unlike the newer half-range convention used by the reference scorer. The
+/// first cursed rank is therefore `MAX_DTZ - 101`, not `MAX_DTZ / 2 - 101`.
 #[cfg(feature = "syzygy")]
 fn compute_tb_score(tb_rank: i32) -> i32 {
-    let bound = MAX_DTZ / 2 - 100; // 130972
-    if tb_rank >= bound {
+    let win_bound = MAX_DTZ - 100;
+    if tb_rank >= win_bound {
         SCORE_TB_WIN // Certain win before 50-move rule
     } else if tb_rank > 0 {
-        // Gradual: scale from ~1 to ~49 cp (SF: max(3, r - (MAX_DTZ/2-200)) * PawnValue / 200)
-        let r = tb_rank.max(3) - (MAX_DTZ / 2 - 200);
+        // Gradual: scale from ~1 to ~49 cp as DTZ approaches the rule-50 limit.
+        let r = tb_rank - (MAX_DTZ - 200);
         (r.max(3) * 100) / 200
     } else if tb_rank == 0 {
         0
-    } else if tb_rank > -bound {
-        let r = tb_rank.min(-3) + (MAX_DTZ / 2 - 200);
+    } else if tb_rank > -win_bound {
+        let r = tb_rank + (MAX_DTZ - 200);
         (r.min(-3) * 100) / 200
     } else {
         -SCORE_TB_WIN // Certain loss
@@ -299,13 +337,24 @@ fn probe_root_dtz(pos: &Position) -> Option<Vec<(Move, i32, i32)>> {
     let mut results = std::mem::MaybeUninit::<ffi::TbRootMoves>::uninit();
     let success = unsafe {
         ffi::tb_probe_root_dtz(
-            a.white, a.black, a.kings, a.queens, a.rooks,
-            a.bishops, a.knights, a.pawns,
-            pos.halfmove_clock as u32, a.ep, a.turn, false,
+            a.white,
+            a.black,
+            a.kings,
+            a.queens,
+            a.rooks,
+            a.bishops,
+            a.knights,
+            a.pawns,
+            pos.halfmove_clock as u32,
+            a.ep,
+            a.turn,
+            false,
             results.as_mut_ptr(),
         )
     };
-    if success == 0 { return None; }
+    if success == 0 {
+        return None;
+    }
     let results = unsafe { results.assume_init() };
     Some(extract_root_moves(&results))
 }
@@ -317,13 +366,24 @@ fn probe_root_wdl(pos: &Position) -> Option<Vec<(Move, i32, i32)>> {
     let mut results = std::mem::MaybeUninit::<ffi::TbRootMoves>::uninit();
     let success = unsafe {
         ffi::tb_probe_root_wdl(
-            a.white, a.black, a.kings, a.queens, a.rooks,
-            a.bishops, a.knights, a.pawns,
-            pos.halfmove_clock as u32, a.ep, a.turn, true,
+            a.white,
+            a.black,
+            a.kings,
+            a.queens,
+            a.rooks,
+            a.bishops,
+            a.knights,
+            a.pawns,
+            pos.halfmove_clock as u32,
+            a.ep,
+            a.turn,
+            true,
             results.as_mut_ptr(),
         )
     };
-    if success == 0 { return None; }
+    if success == 0 {
+        return None;
+    }
     let results = unsafe { results.assume_init() };
     Some(extract_root_moves(&results))
 }
@@ -356,4 +416,22 @@ pub fn rank_root_moves(pos: &Position) -> Option<RootRanking> {
     }
 
     None
+}
+
+#[cfg(all(test, feature = "syzygy"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn root_score_separates_cursed_results_from_certain_results() {
+        assert_eq!(compute_tb_score(MAX_DTZ), SCORE_TB_WIN);
+        assert_eq!(compute_tb_score(MAX_DTZ - 100), SCORE_TB_WIN);
+        assert_eq!(compute_tb_score(MAX_DTZ - 101), 49);
+        assert_eq!(compute_tb_score(MAX_DTZ - 200), 1);
+        assert_eq!(compute_tb_score(0), 0);
+        assert_eq!(compute_tb_score(-MAX_DTZ + 200), -1);
+        assert_eq!(compute_tb_score(-MAX_DTZ + 101), -49);
+        assert_eq!(compute_tb_score(-MAX_DTZ + 100), -SCORE_TB_WIN);
+        assert_eq!(compute_tb_score(-MAX_DTZ), -SCORE_TB_WIN);
+    }
 }

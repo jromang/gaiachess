@@ -7,8 +7,7 @@ fn main() {
         let raw = std::fs::read(&model_path)
             .unwrap_or_else(|e| panic!("Failed to read MODEL={model_path}: {e}"));
 
-        let compressed =
-            zstd::encode_all(&raw[..], 22).expect("Failed to compress NNUE with zstd");
+        let compressed = zstd::encode_all(&raw[..], 22).expect("Failed to compress NNUE with zstd");
 
         let out_dir = std::env::var("OUT_DIR").unwrap();
         let out_path = format!("{out_dir}/model.nnue.zst");
@@ -44,8 +43,7 @@ fn main() {
     // would ship on every code change and defeat the two-module split.
     #[cfg(feature = "gaiatb")]
     if std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() != Ok("wasm32") {
-        let blob_path = std::env::var("GAIATB_BLOB")
-            .unwrap_or_else(|_| "tb/tb34.gtpk".to_string());
+        let blob_path = std::env::var("GAIATB_BLOB").unwrap_or_else(|_| "tb/tb34.gtpk".to_string());
 
         // Download from Hugging Face when the blob is not present locally
         if !std::path::Path::new(&blob_path).exists() {
@@ -129,8 +127,8 @@ fn main() {
     // binaries are built with: a mingw link would want the same thing through windres.
     if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
         let icon_path = "src/gui/assets/icon.ico";
-        let icon = std::fs::read(icon_path)
-            .unwrap_or_else(|e| panic!("Failed to read {icon_path}: {e}"));
+        let icon =
+            std::fs::read(icon_path).unwrap_or_else(|e| panic!("Failed to read {icon_path}: {e}"));
         let out_dir = std::env::var("OUT_DIR").unwrap();
         let res_path = format!("{out_dir}/icon.res");
         std::fs::write(&res_path, icon_resource(&icon)).unwrap();
@@ -139,7 +137,10 @@ fn main() {
     }
 
     // Rust compiler version
-    if let Ok(out) = std::process::Command::new("rustc").arg("--version").output() {
+    if let Ok(out) = std::process::Command::new("rustc")
+        .arg("--version")
+        .output()
+    {
         let ver = String::from_utf8_lossy(&out.stdout).trim().to_string();
         println!("cargo:rustc-env=RUSTC_VERSION={ver}");
     }
@@ -156,7 +157,10 @@ fn main() {
     for path in git_tip_files() {
         println!("cargo:rerun-if-changed={}", path.display());
     }
-    if let Ok(out) = std::process::Command::new("git").args(["rev-parse", "--short", "HEAD"]).output() {
+    if let Ok(out) = std::process::Command::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .output()
+    {
         let hash = String::from_utf8_lossy(&out.stdout).trim().to_string();
         println!("cargo:rustc-env=GIT_HASH={hash}");
     }
@@ -187,8 +191,10 @@ fn git_tip_files() -> Vec<std::path::PathBuf> {
             .success()
             .then(|| std::path::PathBuf::from(String::from_utf8_lossy(&out.stdout).trim()))
     };
-    let mut watched: Vec<std::path::PathBuf> =
-        ["HEAD", "packed-refs"].iter().filter_map(|arg| git_path(arg)).collect();
+    let mut watched: Vec<std::path::PathBuf> = ["HEAD", "packed-refs"]
+        .iter()
+        .filter_map(|arg| git_path(arg))
+        .collect();
     // The branch's own file. A detached HEAD has none: it carries the hash itself, and
     // `HEAD` is then the only file that moves.
     if let Ok(out) = std::process::Command::new("git")

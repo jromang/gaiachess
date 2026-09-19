@@ -174,8 +174,7 @@ impl Input {
         // The same physical-position bindings as the macroquad backend: the shim
         // reports Haiku raw key codes, which name positions, not letters.
         poll.confirm = hit(key::X) || hit(key::V) || hit(key::ENTER) || hit(key::SPACE);
-        poll.cancel =
-            hit(key::Z) || hit(key::C) || hit(key::ESCAPE) || hit(key::BACKSPACE);
+        poll.cancel = hit(key::Z) || hit(key::C) || hit(key::ESCAPE) || hit(key::BACKSPACE);
         poll.flip = hit(key::F);
         poll.next_scheme = hit(key::TAB);
         poll.restart = hit(key::R);
@@ -206,8 +205,8 @@ impl Input {
             }
             let n = self.down[i];
             self.down[i] = n + 1;
-            let fires = n == 0
-                || (n >= REPEAT_DELAY && (n - REPEAT_DELAY).is_multiple_of(REPEAT_RATE));
+            let fires =
+                n == 0 || (n >= REPEAT_DELAY && (n - REPEAT_DELAY).is_multiple_of(REPEAT_RATE));
             self.fired[i] |= fires;
             typed |= fires;
         }
@@ -232,7 +231,11 @@ impl Input {
             self.last_mouse = (mx, my);
             self.driving = true;
         }
-        self.mouse = if poll.inside { canvas_pixel(mx, my) } else { None };
+        self.mouse = if poll.inside {
+            canvas_pixel(mx, my)
+        } else {
+            None
+        };
         self.held = poll.held;
         self.press |= poll.press;
         // Pressing a key takes the hand back, so a player who reaches for the keyboard
@@ -379,7 +382,12 @@ fn pointer_inside_window() -> bool {
     }
 
     let mut at = Point { x: 0, y: 0 };
-    let mut client = Rect { left: 0, top: 0, right: 0, bottom: 0 };
+    let mut client = Rect {
+        left: 0,
+        top: 0,
+        right: 0,
+        bottom: 0,
+    };
     // The client area's own corner, which is what turns its size into screen coordinates.
     let mut corner = Point { x: 0, y: 0 };
     unsafe {
@@ -427,7 +435,11 @@ mod tests {
         input.press = true;
         input.held = true;
         input.consume();
-        assert_eq!(input.pointer(), Some((4, 5)), "the mouse has not gone anywhere");
+        assert_eq!(
+            input.pointer(),
+            Some((4, 5)),
+            "the mouse has not gone anywhere"
+        );
         assert!(input.held, "nor has the button come up");
         assert!(!input.press, "but pressing it is an event, not a state");
     }

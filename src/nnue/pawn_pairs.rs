@@ -151,8 +151,22 @@ pub fn collect_delta_for_pov(
     } else {
         (old_black, old_white, new_black, new_white)
     };
-    let n_subs = emit_touching(old_f & !new_f, old_e & !new_e, old_f, old_e, square_flip, subs);
-    let n_adds = emit_touching(new_f & !old_f, new_e & !old_e, new_f, new_e, square_flip, adds);
+    let n_subs = emit_touching(
+        old_f & !new_f,
+        old_e & !new_e,
+        old_f,
+        old_e,
+        square_flip,
+        subs,
+    );
+    let n_adds = emit_touching(
+        new_f & !old_f,
+        new_e & !old_e,
+        new_f,
+        new_e,
+        square_flip,
+        adds,
+    );
     (n_subs, n_adds)
 }
 
@@ -312,7 +326,10 @@ mod tests {
                         let lost: BTreeSet<u32> = before.difference(&after).copied().collect();
                         let gained: BTreeSet<u32> = after.difference(&before).copied().collect();
                         assert_eq!(sub_set, lost, "{fen} {mv:?} pov {pov} mirrored {mirrored}");
-                        assert_eq!(add_set, gained, "{fen} {mv:?} pov {pov} mirrored {mirrored}");
+                        assert_eq!(
+                            add_set, gained,
+                            "{fen} {mv:?} pov {pov} mirrored {mirrored}"
+                        );
                         checked += 1;
                     }
                 }

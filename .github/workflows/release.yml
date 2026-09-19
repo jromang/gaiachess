@@ -24,44 +24,64 @@ jobs:
           TAG="${GITHUB_REF#refs/tags/}"
           VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
 
-          gh release create "$TAG" \
-            --title "GaiaChess $VERSION" \
-            --notes "$(cat <<'NOTES'
-          ## What's new in 4.3.1
+          # Notes written to a file, never passed inline: the v4.3.1 release was
+          # created with `--notes "$(cat <<'NOTES' ...)"` and GitHub stored a body
+          # missing three whole paragraphs, silently. The runner's log showed the
+          # full text, so the loss happened past the shell. --notes-file round-trips
+          # byte for byte.
+          cat > "$RUNNER_TEMP/release-notes.md" <<'NOTES'
+          ## What's new in 4.3.2
 
-          **Scores now read like every other engine.** A pawn up used to print `+458` — the
-          raw unit the network searches in — and prints `+1.96` now. The conversion is
-          display only: the search is untouched and plays exactly the same moves. The new
-          `UCI_ShowWDL` option adds win/draw/loss estimates in per mille, and
-          `NormalizeScore` turns the conversion off for anyone who wants the raw unit back.
+          A maintenance release built on a month of tournament and analysis reports.
+          Most of the changes below were found by playing the engine under Fritz,
+          in blitz and in permanent brain, and each one comes with a test that pins
+          the game where it was seen.
 
-          **Fail-high lines showed the wrong move.** While the search was re-searching a
-          move that beat beta, every `lowerbound` line carried the *previous* iteration's
-          principal variation together with the *new* score — a move from one line and a
-          score from another. They now show the line that actually beat beta.
+          **New default network: `gaianet-t2b-e044`**, +4.8 ±3.6 Elo over e017 in a
+          decided SPRT (18 420 games). Same data and recipe, stricter training filter.
 
-          **UCI conformance.** `debug` and `isready` are answered while a search is running,
-          `go mate` works, every limit of a single `go` applies instead of just the first,
-          unknown tokens are ignored rather than dropping the whole command, and a position
-          with no legal move returns `bestmove 0000`.
+          **Time management rewritten.** In blitz the engine used a third of its clock
+          and finished games with most of its time unspent. The allocation follows the
+          usual shape now: a horizon of about fifty moves, more time early, and per-move
+          adjustments from score drops and best-move stability. `Move Overhead` is
+          exposed as an option and defaults to 40 ms (100 ms was silently applied
+          before).
 
-          **ChessBase GUIs (Fritz) keep their variations.** A position sent with a
-          four-field EPD FEN, or with castling rights that disagree with the board, was
-          refused outright: the engine silently stayed on the starting position and returned
-          a principal variation that was not legal on the board being shown.
+          **Tablebases.** A Nalimov "mated in zero" was scored as a draw, so a mate in
+          two could be announced for fifteen moves without ever being played. Mates
+          longer than 128 plies printed as `+312` instead of `mate N`. DTM scores now
+          honour the fifty-move rule, and Syzygy cursed wins and blessed losses at the
+          root are no longer reported as certain results. Analysing a seven-piece
+          position with WDL-only tables could freeze the output for over a minute and
+          flicker between `+2` and `+200`; the in-tree probing stops one piece below the
+          largest table, and aspiration bounds are no longer published once the root has
+          a tablebase score. New option `NalimovCache` (MiB, default 256).
 
-          **ARM is 14% faster** on Raspberry Pi 5 and other `asimddp` cores — the network's
-          dot products now dispatch to `sdot` at startup.
+          **Search.** A position seen for the second time was scored `0.00` as if it
+          were the third — the repetition test looked at the current position instead of
+          the one the move would recreate, and a won game was thrown away that way. The
+          move played and the final line now always come from the last completed
+          iteration (a `mate 25` proved at depth 21 could be dropped for a depth-19 line
+          at the stop). On the losing side of a decided position the search could run
+          to ply 127 and announce a mate in 36 where the mate was in 6; the mate-seeking
+          mode arms from depth 8 and caps the reductions there, and the ghost scores
+          around `-101.61` that leaked from that window are gone. Null-move pruning is
+          held back in sparse minor-piece endings where passing looks better than
+          moving, and its entry margin and ProbCut were brought to conventional values
+          after audits of two lost games.
 
-          **A position no longer depends on what was searched before it.** One evaluation
-          term survived from one search to the next, across `ucinewgame` included, so the
-          same position could return a different move depending on its predecessor.
-          Analysis and test suites are reproducible again.
+          **UCI.** A progress line is printed after one second without output, so GUIs
+          no longer see a silent engine during a long iteration. `UCI_ShowCurrLine`,
+          `UCI_ShowRefutations` and `cpuload` are supported. The final `info` line before
+          `bestmove` is the elected thread's exact line. `Debug Log File` appends
+          instead of overwriting and timestamps to the millisecond.
 
-          New default network: `gaianet-t2b-e017`.
+          **Speed.** The AVX2 network path is 12 % faster (threat rows kept in
+          registers, one L1 chain). Move generation tables were reworked on AVX2, and
+          ARM64 uses hyperbola quintessence for sliders.
 
-          Thanks to **David Rabel**, back on the team, for the UCI conformance testing and
-          for catching the fail-high display bug.
+          Co-authored with **David Rabel**, whose tournament logs and analyses drove
+          this release.
 
           ## Download
 
@@ -118,7 +138,10 @@ jobs:
           `COOP`/`COEP` headers — without which a search can only be abandoned, never
           cut short.
           NOTES
-          )"
+
+          gh release create "$TAG" \
+            --title "GaiaChess $VERSION" \
+            --notes-file "$RUNNER_TEMP/release-notes.md"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 

@@ -69,9 +69,15 @@ impl Cursor {
         }
         if self.sq == walk.target {
             self.walk = None;
-            return Step { moved: true, arrived: true };
+            return Step {
+                moved: true,
+                arrived: true,
+            };
         }
-        Step { moved: true, arrived: false }
+        Step {
+            moved: true,
+            arrived: false,
+        }
     }
 
     /// Sends the hand walking to `target`, which counts as a press once it gets
@@ -82,7 +88,11 @@ impl Cursor {
             self.walk = None;
             return;
         }
-        self.walk = Some(Walk { target, wait: 0, speed });
+        self.walk = Some(Walk {
+            target,
+            wait: 0,
+            speed,
+        });
     }
 
     /// Puts the hand on a square at once. The mouse does this rather than walk: it has

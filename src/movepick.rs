@@ -11,12 +11,12 @@ use crate::history::{ButterflyHistory, CaptureHistory, ContinuationHistory, Pawn
 use crate::movegen;
 use crate::position::Position;
 use crate::see;
-use crate::threads::{StackEntry, SS_OFFSET};
+use crate::threads::{SS_OFFSET, StackEntry};
 use crate::tt::TT;
 use crate::tune;
 use crate::types::{
-    ArrayBuf, Color, Move, Piece, PieceType, ScoredMove, Square, MAX_MOVES,
-    MT_CASTLING, MT_EN_PASSANT, MT_PROMOTION, PIECE_VALUE,
+    ArrayBuf, Color, MAX_MOVES, MT_CASTLING, MT_EN_PASSANT, MT_PROMOTION, Move, PIECE_VALUE, Piece,
+    PieceType, ScoredMove, Square,
 };
 use crate::zobrist::ZOBRIST;
 
@@ -42,9 +42,17 @@ pub(crate) fn child_key(pos: &Position, m: Move, piece: Piece) -> u64 {
     let to = m.to_sq();
     let mt = m.move_type();
 
-    let dest = if mt == MT_CASTLING { m.castle_king_to() } else { to };
+    let dest = if mt == MT_CASTLING {
+        m.castle_king_to()
+    } else {
+        to
+    };
     // What lands on the arrival square: the piece itself, or what a pawn became.
-    let landed = if mt == MT_PROMOTION { Piece::new(m.promo_type(), piece.color()) } else { piece };
+    let landed = if mt == MT_PROMOTION {
+        Piece::new(m.promo_type(), piece.color())
+    } else {
+        piece
+    };
     let mut key = pos.key
         ^ ZOBRIST.pieces[piece.index()][from.index()]
         ^ ZOBRIST.pieces[landed.index()][dest.index()]

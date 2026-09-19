@@ -11,7 +11,7 @@
 use std::sync::OnceLock;
 
 use crate::position::Position;
-use crate::types::{Color, PieceType, SCORE_MATE};
+use crate::types::{Color, PieceType, dtm_score};
 
 // ── Blob source ──────────────────────────────────────────────────────────────
 //
@@ -67,8 +67,8 @@ pub fn available() -> bool {
 /// Probe DTM for a position with ≤4 pieces (including kings).
 ///
 /// Returns a **STM-relative negamax score** ready to return from `alpha_beta`:
-/// - `mate_in(ply + dtm)` if the side to move wins in `dtm` halfmoves
-/// - `mated_in(ply + |dtm|)` if the side to move loses in `|dtm|` halfmoves
+/// - a mate score if the side to move wins (or is mated) within [`crate::types::MAX_PLY`]
+/// - a TB score (`cp ±20000` on the wire) if the DTM is longer than that
 /// - `0` for draws (stalemate, insufficient material)
 /// - `None` if the position is not in the tables (>4 pieces or tables not loaded)
 ///
@@ -78,26 +78,35 @@ pub fn probe_position(pos: &Position, ply: i32) -> Option<i32> {
     let prober = PROBER.get()?.as_ref()?;
 
     // Quick piece-count guard (should already be checked by caller, but be safe)
-    if pos.occupied().count_ones() > 4 { return None; }
+    if pos.occupied().count_ones() > 4 {
+        return None;
+    }
 
     let (white, black, wk, bk, pieces, np) = extract_for_probe(pos);
     let stm_white = pos.side_to_move == Color::White;
 
     let dtm = prober.probe_dtm(&white, &black, wk, bk, &pieces[..np], stm_white)?;
+    Some(stored_dtm_to_score(dtm as i32, ply))
+}
 
-    // probe_dtm returns STM-relative DTM:
-    //   dtm > 0: the side to move wins in dtm half-moves
-    //   dtm < 0: the side to move loses in |dtm| half-moves
-    //   dtm = 0: draw
-    let stm_dtm = dtm as i32;
-
-    Some(if stm_dtm > 0 {
-        SCORE_MATE - ply - stm_dtm       // mate_in(ply + stm_dtm)
-    } else if stm_dtm < 0 {
-        -SCORE_MATE + ply + (-stm_dtm) // mated_in(ply + (-stm_dtm))
-    } else {
-        0 // draw (stalemate or insufficient material)
-    })
+/// Map a stored DTM to a negamax score at `ply`.
+///
+/// `probe_dtm` returns an STM-relative value whose sign says who wins, and whose
+/// magnitude is the true distance in half-moves **plus one**: the tables count a
+/// checkmated side as lost in one, so `-1` is the mate on the board and `2` a mate
+/// in one half-move (see `gaiatb_sanity`). Zero is a draw. Reading the magnitude as
+/// the distance made every table mate one half-move too long, which let a search
+/// mate in one lose to a table "mate in two".
+fn stored_dtm_to_score(stored: i32, ply: i32) -> i32 {
+    debug_assert!(
+        stored != 1,
+        "a stored +1 would be a win in no half-move at all"
+    );
+    match stored {
+        0 => 0,
+        d if d > 0 => dtm_score(ply, d - 1),
+        d => dtm_score(ply, d + 1),
+    }
 }
 
 /// Extract piece data from a GaiaChess `Position` into the raw format expected
@@ -109,18 +118,28 @@ fn extract_for_probe(pos: &Position) -> ([u8; 5], [u8; 5], u8, u8, [u8; 8], usiz
     let bk = pos.king_sq(Color::Black).0;
 
     let white = [
-        pos.piece_type_bb(PieceType::Pawn,   Color::White).count_ones() as u8,
-        pos.piece_type_bb(PieceType::Knight, Color::White).count_ones() as u8,
-        pos.piece_type_bb(PieceType::Bishop, Color::White).count_ones() as u8,
-        pos.piece_type_bb(PieceType::Rook,   Color::White).count_ones() as u8,
-        pos.piece_type_bb(PieceType::Queen,  Color::White).count_ones() as u8,
+        pos.piece_type_bb(PieceType::Pawn, Color::White)
+            .count_ones() as u8,
+        pos.piece_type_bb(PieceType::Knight, Color::White)
+            .count_ones() as u8,
+        pos.piece_type_bb(PieceType::Bishop, Color::White)
+            .count_ones() as u8,
+        pos.piece_type_bb(PieceType::Rook, Color::White)
+            .count_ones() as u8,
+        pos.piece_type_bb(PieceType::Queen, Color::White)
+            .count_ones() as u8,
     ];
     let black = [
-        pos.piece_type_bb(PieceType::Pawn,   Color::Black).count_ones() as u8,
-        pos.piece_type_bb(PieceType::Knight, Color::Black).count_ones() as u8,
-        pos.piece_type_bb(PieceType::Bishop, Color::Black).count_ones() as u8,
-        pos.piece_type_bb(PieceType::Rook,   Color::Black).count_ones() as u8,
-        pos.piece_type_bb(PieceType::Queen,  Color::Black).count_ones() as u8,
+        pos.piece_type_bb(PieceType::Pawn, Color::Black)
+            .count_ones() as u8,
+        pos.piece_type_bb(PieceType::Knight, Color::Black)
+            .count_ones() as u8,
+        pos.piece_type_bb(PieceType::Bishop, Color::Black)
+            .count_ones() as u8,
+        pos.piece_type_bb(PieceType::Rook, Color::Black)
+            .count_ones() as u8,
+        pos.piece_type_bb(PieceType::Queen, Color::Black)
+            .count_ones() as u8,
     ];
 
     // piece_sqs order: white pawns, black pawns, then Q/R/B/N (white first, black second)
@@ -136,12 +155,22 @@ fn extract_for_probe(pos: &Position) -> ([u8; 5], [u8; 5], u8, u8, [u8; 8], usiz
         }
     };
 
-    add(pos.piece_type_bb(PieceType::Pawn,   Color::White));
-    add(pos.piece_type_bb(PieceType::Pawn,   Color::Black));
-    for pt in [PieceType::Queen, PieceType::Rook, PieceType::Bishop, PieceType::Knight] {
+    add(pos.piece_type_bb(PieceType::Pawn, Color::White));
+    add(pos.piece_type_bb(PieceType::Pawn, Color::Black));
+    for pt in [
+        PieceType::Queen,
+        PieceType::Rook,
+        PieceType::Bishop,
+        PieceType::Knight,
+    ] {
         add(pos.piece_type_bb(pt, Color::White));
     }
-    for pt in [PieceType::Queen, PieceType::Rook, PieceType::Bishop, PieceType::Knight] {
+    for pt in [
+        PieceType::Queen,
+        PieceType::Rook,
+        PieceType::Bishop,
+        PieceType::Knight,
+    ] {
         add(pos.piece_type_bb(pt, Color::Black));
     }
     drop(add);
@@ -199,12 +228,18 @@ const FLAG_SPLIT_STM: u8 = 1 << 2;
 const BINOMIAL: [[u64; 65]; 7] = {
     let mut t = [[0u64; 65]; 7];
     let mut n = 0;
-    while n < 65 { t[0][n] = 1; n += 1; }
+    while n < 65 {
+        t[0][n] = 1;
+        n += 1;
+    }
     let mut k = 1usize;
     while k < 7 {
         t[k][0] = 0;
         let mut n = 1usize;
-        while n < 65 { t[k][n] = t[k - 1][n - 1] + t[k][n - 1]; n += 1; }
+        while n < 65 {
+            t[k][n] = t[k - 1][n - 1] + t[k][n - 1];
+            n += 1;
+        }
         k += 1;
     }
     t
@@ -214,71 +249,114 @@ const BINOMIAL: [[u64; 65]; 7] = {
 
 const TRIANGLE_MAP: [i8; 64] = {
     let mut m = [-1i8; 64];
-    m[0]=0; m[1]=1; m[2]=2; m[3]=3; m[9]=4; m[10]=5; m[11]=6; m[18]=7; m[19]=8; m[27]=9;
+    m[0] = 0;
+    m[1] = 1;
+    m[2] = 2;
+    m[3] = 3;
+    m[9] = 4;
+    m[10] = 5;
+    m[11] = 6;
+    m[18] = 7;
+    m[19] = 8;
+    m[27] = 9;
     m
 };
 
 #[inline]
-fn is_on_diagonal(sq: u8) -> bool { let f = sq & 7; let r = sq >> 3; f == r && f < 4 }
+fn is_on_diagonal(sq: u8) -> bool {
+    let f = sq & 7;
+    let r = sq >> 3;
+    f == r && f < 4
+}
 
 fn canonicalize_king(sq: u8) -> (u8, u8) {
     let mut f = (sq & 7) as i8;
     let mut r = (sq >> 3) as i8;
     let mut t = 0u8;
-    if f > 3 { f = 7 - f; t |= 1; }
-    if r > 3 { r = 7 - r; t |= 2; }
-    if f < r { std::mem::swap(&mut f, &mut r); t |= 4; }
+    if f > 3 {
+        f = 7 - f;
+        t |= 1;
+    }
+    if r > 3 {
+        r = 7 - r;
+        t |= 2;
+    }
+    if f < r {
+        std::mem::swap(&mut f, &mut r);
+        t |= 4;
+    }
     ((r as u8) * 8 + (f as u8), t)
 }
 
 fn canonicalize_king_pawnful(sq: u8) -> (u8, u8) {
     let f = (sq & 7) as i8;
     let r = (sq >> 3) as i8;
-    if f > 3 { ((r as u8) * 8 + (7 - f) as u8, 1) } else { (sq, 0) }
+    if f > 3 {
+        ((r as u8) * 8 + (7 - f) as u8, 1)
+    } else {
+        (sq, 0)
+    }
 }
 
 #[inline]
 fn apply_transform(sq: u8, t: u8) -> u8 {
     let mut f = (sq & 7) as i8;
     let mut r = (sq >> 3) as i8;
-    if t & 1 != 0 { f = 7 - f; }
-    if t & 2 != 0 { r = 7 - r; }
-    if t & 4 != 0 { std::mem::swap(&mut f, &mut r); }
+    if t & 1 != 0 {
+        f = 7 - f;
+    }
+    if t & 2 != 0 {
+        r = 7 - r;
+    }
+    if t & 4 != 0 {
+        std::mem::swap(&mut f, &mut r);
+    }
     (r as u8) * 8 + (f as u8)
 }
 
 #[inline]
-fn diagonal_reflect(sq: u8) -> u8 { (sq & 7) * 8 + (sq >> 3) }
+fn diagonal_reflect(sq: u8) -> u8 {
+    (sq & 7) * 8 + (sq >> 3)
+}
 
 // ── Pawnless KK pairs (462) ─────────────────────────────────────────
 
 const fn build_map_kk() -> ([[i16; 64]; 10], [u16; 10], [u16; 10]) {
     let wks: [u8; 10] = [0, 1, 2, 3, 9, 10, 11, 18, 19, 27];
-    let diag: [bool; 10] = [true, false, false, false, true, false, false, true, false, true];
+    let diag: [bool; 10] = [
+        true, false, false, false, true, false, false, true, false, true,
+    ];
     let mut map = [[-1i16; 64]; 10];
     let mut count = [0u16; 10];
     let mut ti = 0;
     while ti < 10 {
         let wk = wks[ti];
-        let wf = (wk & 7) as i8; let wr = (wk >> 3) as i8;
+        let wf = (wk & 7) as i8;
+        let wr = (wk >> 3) as i8;
         let mut idx = 0i16;
         let mut bk = 0u8;
         while bk < 64 {
-            let bf = (bk & 7) as i8; let br = (bk >> 3) as i8;
+            let bf = (bk & 7) as i8;
+            let br = (bk >> 3) as i8;
             let df = if wf > bf { wf - bf } else { bf - wf };
             let dr = if wr > br { wr - br } else { br - wr };
             if bk == wk || (df <= 1 && dr <= 1) || (diag[ti] && bf < br) {
                 map[ti][bk as usize] = -1;
             } else {
-                map[ti][bk as usize] = idx; idx += 1;
+                map[ti][bk as usize] = idx;
+                idx += 1;
             }
             bk += 1;
         }
-        count[ti] = idx as u16; ti += 1;
+        count[ti] = idx as u16;
+        ti += 1;
     }
     let mut off = [0u16; 10];
     let mut i = 1;
-    while i < 10 { off[i] = off[i - 1] + count[i - 1]; i += 1; }
+    while i < 10 {
+        off[i] = off[i - 1] + count[i - 1];
+        i += 1;
+    }
     (map, count, off)
 }
 
@@ -295,27 +373,37 @@ const fn build_map_kk_pawnful() -> ([[i16; 64]; 32], [u16; 32], [u16; 32]) {
     let mut wk = 0u8;
     while wk < 64 {
         let wf = wk & 7;
-        if wf > 3 { wk += 1; continue; }
+        if wf > 3 {
+            wk += 1;
+            continue;
+        }
         let wi = ((wk >> 3) * 4 + wf) as usize;
-        let wr = (wk >> 3) as i8; let wfi = wf as i8;
+        let wr = (wk >> 3) as i8;
+        let wfi = wf as i8;
         let mut idx = 0i16;
         let mut bk = 0u8;
         while bk < 64 {
-            let bf = (bk & 7) as i8; let br = (bk >> 3) as i8;
+            let bf = (bk & 7) as i8;
+            let br = (bk >> 3) as i8;
             let df = if wfi > bf { wfi - bf } else { bf - wfi };
             let dr = if wr > br { wr - br } else { br - wr };
             if bk == wk || (df <= 1 && dr <= 1) {
                 map[wi][bk as usize] = -1;
             } else {
-                map[wi][bk as usize] = idx; idx += 1;
+                map[wi][bk as usize] = idx;
+                idx += 1;
             }
             bk += 1;
         }
-        count[wi] = idx as u16; wk += 1;
+        count[wi] = idx as u16;
+        wk += 1;
     }
     let mut off = [0u16; 32];
     let mut i = 1;
-    while i < 32 { off[i] = off[i - 1] + count[i - 1]; i += 1; }
+    while i < 32 {
+        off[i] = off[i - 1] + count[i - 1];
+        i += 1;
+    }
     (map, count, off)
 }
 
@@ -354,8 +442,7 @@ fn unpack_value(data: &[u8], index: usize, bits: u8) -> u8 {
     let byte_idx = (bit_off / 8) as usize;
     let bit_idx = (bit_off % 8) as u32;
     let mask = (1u16 << bits) - 1;
-    let raw = data[byte_idx] as u16
-        | ((data.get(byte_idx + 1).copied().unwrap_or(0) as u16) << 8);
+    let raw = data[byte_idx] as u16 | ((data.get(byte_idx + 1).copied().unwrap_or(0) as u16) << 8);
     ((raw >> bit_idx) & mask) as u8
 }
 
@@ -389,25 +476,62 @@ fn canonical_material(white: &MatCounts, black: &MatCounts) -> (MatCounts, MatCo
         }
         w_stronger
     };
-    if stronger { (*white, *black, false) } else { (*black, *white, true) }
+    if stronger {
+        (*white, *black, false)
+    } else {
+        (*black, *white, true)
+    }
 }
 
 fn material_sig(white: &MatCounts, black: &MatCounts) -> [u8; SIG_LEN] {
     let mut sig = [0u8; SIG_LEN];
     let mut pos = 0;
-    sig[pos] = b'K'; pos += 1;
-    for _ in 0..white[4] { sig[pos] = b'Q'; pos += 1; }
-    for _ in 0..white[3] { sig[pos] = b'R'; pos += 1; }
-    for _ in 0..white[2] { sig[pos] = b'B'; pos += 1; }
-    for _ in 0..white[1] { sig[pos] = b'N'; pos += 1; }
-    for _ in 0..white[0] { sig[pos] = b'P'; pos += 1; }
-    sig[pos] = b'v'; pos += 1;
-    sig[pos] = b'K'; pos += 1;
-    for _ in 0..black[4] { sig[pos] = b'Q'; pos += 1; }
-    for _ in 0..black[3] { sig[pos] = b'R'; pos += 1; }
-    for _ in 0..black[2] { sig[pos] = b'B'; pos += 1; }
-    for _ in 0..black[1] { sig[pos] = b'N'; pos += 1; }
-    for _ in 0..black[0] { sig[pos] = b'P'; pos += 1; }
+    sig[pos] = b'K';
+    pos += 1;
+    for _ in 0..white[4] {
+        sig[pos] = b'Q';
+        pos += 1;
+    }
+    for _ in 0..white[3] {
+        sig[pos] = b'R';
+        pos += 1;
+    }
+    for _ in 0..white[2] {
+        sig[pos] = b'B';
+        pos += 1;
+    }
+    for _ in 0..white[1] {
+        sig[pos] = b'N';
+        pos += 1;
+    }
+    for _ in 0..white[0] {
+        sig[pos] = b'P';
+        pos += 1;
+    }
+    sig[pos] = b'v';
+    pos += 1;
+    sig[pos] = b'K';
+    pos += 1;
+    for _ in 0..black[4] {
+        sig[pos] = b'Q';
+        pos += 1;
+    }
+    for _ in 0..black[3] {
+        sig[pos] = b'R';
+        pos += 1;
+    }
+    for _ in 0..black[2] {
+        sig[pos] = b'B';
+        pos += 1;
+    }
+    for _ in 0..black[1] {
+        sig[pos] = b'N';
+        pos += 1;
+    }
+    for _ in 0..black[0] {
+        sig[pos] = b'P';
+        pos += 1;
+    }
     sig
 }
 
@@ -417,9 +541,12 @@ fn material_sig(white: &MatCounts, black: &MatCounts) -> [u8; SIG_LEN] {
 /// plain scalars, and a struct here would only move the same list one line up.
 #[allow(clippy::too_many_arguments)]
 fn encode(
-    wk: u8, bk: u8, piece_sqs: &[u8],
+    wk: u8,
+    bk: u8,
+    piece_sqs: &[u8],
     has_pawns: bool,
-    num_white_pawns: usize, num_black_pawns: usize,
+    num_white_pawns: usize,
+    num_black_pawns: usize,
     non_pawn_groups: &[usize],
     per_stm_size: usize,
 ) -> Option<usize> {
@@ -437,27 +564,35 @@ fn encode(
             cpieces[i] = apply_transform(sq, transform);
         }
         let kk_local = MAP_KK_PAWNFUL[wi][cbk as usize];
-        if kk_local < 0 { return None; }
-        (KK_OFFSETS_PAWNFUL[wi] as usize + kk_local as usize, cwk, cbk)
+        if kk_local < 0 {
+            return None;
+        }
+        (
+            KK_OFFSETS_PAWNFUL[wi] as usize + kk_local as usize,
+            cwk,
+            cbk,
+        )
     } else {
         let (cwk, transform) = canonicalize_king(wk);
         let ti = TRIANGLE_MAP[cwk as usize];
-        if ti < 0 { return None; }
+        if ti < 0 {
+            return None;
+        }
         let ti = ti as usize;
         let mut cbk = apply_transform(bk, transform);
         for (i, &sq) in piece_sqs.iter().enumerate() {
             cpieces[i] = apply_transform(sq, transform);
         }
-        if is_on_diagonal(cwk)
-            && (cbk & 7) < (cbk >> 3)
-        {
+        if is_on_diagonal(cwk) && (cbk & 7) < (cbk >> 3) {
             cbk = diagonal_reflect(cbk);
             for p in cpieces[..num_pieces].iter_mut() {
                 *p = diagonal_reflect(*p);
             }
         }
         let kk_local = MAP_KK[ti][cbk as usize];
-        if kk_local < 0 { return None; }
+        if kk_local < 0 {
+            return None;
+        }
         (KK_OFFSETS[ti] as usize + kk_local as usize, cwk, cbk)
     };
 
@@ -482,7 +617,9 @@ fn encode(
             let sq = cpieces[num_white_pawns + i];
             let mut pi = (sq - 8) as usize;
             for &excl in &cpieces[..num_white_pawns] {
-                if (8..56).contains(&excl) && excl < sq { pi -= 1; }
+                if (8..56).contains(&excl) && excl < sq {
+                    pi -= 1;
+                }
             }
             bp_mapped[i] = pi;
         }
@@ -539,7 +676,11 @@ fn encode(
 #[inline]
 fn sq_to_idx(occupied: &[u8], sq: u8) -> usize {
     let mut idx = sq as usize;
-    for &occ in occupied { if sq > occ { idx -= 1; } }
+    for &occ in occupied {
+        if sq > occ {
+            idx -= 1;
+        }
+    }
     idx
 }
 
@@ -577,7 +718,9 @@ impl Prober {
         }
         let table_count = blob[5] as usize;
         let data_start = HEADER_SIZE + table_count * ENTRY_SIZE;
-        if blob.len() < data_start { return None; }
+        if blob.len() < data_start {
+            return None;
+        }
 
         // Size the decompressed store from the entries before filling it, so the
         // ~155 MB is allocated once instead of grown. The entry table understates
@@ -592,7 +735,9 @@ impl Prober {
             let flags = buf[8];
             let bits = buf[9] as usize;
             let per_stm = u32::from_le_bytes(buf[12..16].try_into().ok()?) as usize;
-            if flags & FLAG_SINGLE_VALUE != 0 { continue; }
+            if flags & FLAG_SINGLE_VALUE != 0 {
+                continue;
+            }
             total_packed += if flags & FLAG_SPLIT_STM != 0 {
                 2 * (per_stm * bits).div_ceil(8)
             } else {
@@ -624,7 +769,9 @@ impl Prober {
             if flags & FLAG_SINGLE_VALUE == 0 && comp_sz > 0 {
                 let cs = data_start + comp_off;
                 let ce = cs + comp_sz;
-                if ce > blob.len() { return None; }
+                if ce > blob.len() {
+                    return None;
+                }
                 let compressed = &blob[cs..ce];
 
                 if flags & FLAG_SPLIT_STM != 0 {
@@ -643,10 +790,17 @@ impl Prober {
             let (has_pawns, wp, bp, groups) = parse_sig_to_indexer(&sig);
 
             tables.push(ProberTable {
-                sig, flags, bits_per_entry: bits, max_dtm,
-                per_stm_size: per_stm, total_positions: total_pos,
-                packed_offset, btm_packed_offset,
-                has_pawns, num_white_pawns: wp, num_black_pawns: bp,
+                sig,
+                flags,
+                bits_per_entry: bits,
+                max_dtm,
+                per_stm_size: per_stm,
+                total_positions: total_pos,
+                packed_offset,
+                btm_packed_offset,
+                has_pawns,
+                num_white_pawns: wp,
+                num_black_pawns: bp,
                 non_pawn_groups: groups,
             });
         }
@@ -655,14 +809,19 @@ impl Prober {
             packed_data.capacity() == capacity,
             "the packed store outgrew its estimate and reallocated",
         );
-        Some(Prober { tables, packed_data })
+        Some(Prober {
+            tables,
+            packed_data,
+        })
     }
 
     /// Probe DTM. Returns `Some(dtm)` where dtm>0 means STM wins, dtm<0 STM loses, 0=draw.
     fn probe_dtm(
         &self,
-        white: &MatCounts, black: &MatCounts,
-        wk: u8, bk: u8,
+        white: &MatCounts,
+        black: &MatCounts,
+        wk: u8,
+        bk: u8,
         piece_sqs: &[u8],
         stm_white: bool,
     ) -> Option<i16> {
@@ -689,20 +848,35 @@ impl Prober {
             let ownp: usize = white[1..].iter().map(|&c| c as usize).sum();
             let obnp: usize = black[1..].iter().map(|&c| c as usize).sum();
             let mut pos = 0;
-            for &sq in &piece_sqs[owp..owp + obp] { enc_pieces[pos] = sq ^ 56; pos += 1; }
-            for &sq in &piece_sqs[..owp] { enc_pieces[pos] = sq ^ 56; pos += 1; }
+            for &sq in &piece_sqs[owp..owp + obp] {
+                enc_pieces[pos] = sq ^ 56;
+                pos += 1;
+            }
+            for &sq in &piece_sqs[..owp] {
+                enc_pieces[pos] = sq ^ 56;
+                pos += 1;
+            }
             let np_start = owp + obp;
             pos = obp + owp;
-            for &sq in &piece_sqs[np_start + ownp..np_start + ownp + obnp] { enc_pieces[pos] = sq ^ 56; pos += 1; }
-            for &sq in &piece_sqs[np_start..np_start + ownp] { enc_pieces[pos] = sq ^ 56; pos += 1; }
+            for &sq in &piece_sqs[np_start + ownp..np_start + ownp + obnp] {
+                enc_pieces[pos] = sq ^ 56;
+                pos += 1;
+            }
+            for &sq in &piece_sqs[np_start..np_start + ownp] {
+                enc_pieces[pos] = sq ^ 56;
+                pos += 1;
+            }
         } else {
             enc_pieces[..num_pieces].copy_from_slice(piece_sqs);
         }
 
         let idx = encode(
-            enc_wk, enc_bk, &enc_pieces[..num_pieces],
+            enc_wk,
+            enc_bk,
+            &enc_pieces[..num_pieces],
             table.has_pawns,
-            table.num_white_pawns, table.num_black_pawns,
+            table.num_white_pawns,
+            table.num_black_pawns,
             &table.non_pawn_groups,
             table.per_stm_size as usize,
         )?;
@@ -720,7 +894,11 @@ impl Prober {
                 (table.packed_offset, idx)
             }
         } else {
-            let adj = if enc_stm_black { idx + table.per_stm_size as usize } else { idx };
+            let adj = if enc_stm_black {
+                idx + table.per_stm_size as usize
+            } else {
+                idx
+            };
             (table.packed_offset, adj)
         };
         let data = &self.packed_data[base..];
@@ -743,10 +921,57 @@ fn parse_sig_to_indexer(sig: &[u8; SIG_LEN]) -> (bool, usize, usize, Vec<usize>)
     let bp = count_piece(black_str, b'P');
     let has_pawns = wp > 0 || bp > 0;
     let mut groups = Vec::new();
-    for &(side, ch) in &[(white_str, b'Q'), (white_str, b'R'), (white_str, b'B'), (white_str, b'N'),
-                          (black_str, b'Q'), (black_str, b'R'), (black_str, b'B'), (black_str, b'N')] {
+    for &(side, ch) in &[
+        (white_str, b'Q'),
+        (white_str, b'R'),
+        (white_str, b'B'),
+        (white_str, b'N'),
+        (black_str, b'Q'),
+        (black_str, b'R'),
+        (black_str, b'B'),
+        (black_str, b'N'),
+    ] {
         let c = count_piece(side, ch);
-        if c > 0 { groups.push(c); }
+        if c > 0 {
+            groups.push(c);
+        }
     }
     (has_pawns, wp, bp, groups)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{mate_in, mated_in};
+
+    #[test]
+    fn stored_distances_are_one_half_move_too_long() {
+        for ply in [0, 1, 6] {
+            assert_eq!(stored_dtm_to_score(0, ply), 0);
+            assert_eq!(
+                stored_dtm_to_score(-1, ply),
+                mated_in(ply),
+                "checkmated now"
+            );
+            assert_eq!(
+                stored_dtm_to_score(2, ply),
+                mate_in(ply + 1),
+                "mate in one half-move"
+            );
+            assert_eq!(stored_dtm_to_score(-2, ply), mated_in(ply + 1));
+            assert_eq!(stored_dtm_to_score(8, ply), mate_in(ply + 7));
+        }
+    }
+
+    /// End to end on the embedded tables: a rook mate in one, and the position after
+    /// it, seen from the mated side.
+    #[cfg(gaiatb_embedded)]
+    #[test]
+    fn the_embedded_tables_score_a_mate_in_one_as_such() {
+        assert!(init(), "embedded tables must load");
+        let pos = Position::from_fen("7k/8/6K1/8/8/8/8/R7 w - - 0 1").unwrap();
+        assert_eq!(probe_position(&pos, 0), Some(mate_in(1)));
+        let mated = Position::from_fen("R6k/8/6K1/8/8/8/8/8 b - - 1 1").unwrap();
+        assert_eq!(probe_position(&mated, 1), Some(mated_in(1)));
+    }
 }

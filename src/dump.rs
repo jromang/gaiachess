@@ -9,7 +9,7 @@ use std::sync::atomic::Ordering;
 
 use crate::position::Position;
 use crate::search;
-use crate::threads::{SharedState, ThreadData, STOP};
+use crate::threads::{STOP, SharedState, ThreadData};
 use crate::timeman::{SearchLimits, TimeManager};
 
 const STARTPOS: &str = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
@@ -40,7 +40,11 @@ pub struct DumpOptions {
 
 /// Run a deterministic single-threaded search and export the requested data.
 pub fn run(opts: &DumpOptions) {
-    let fen = if opts.fen == "startpos" { STARTPOS } else { &opts.fen };
+    let fen = if opts.fen == "startpos" {
+        STARTPOS
+    } else {
+        &opts.fen
+    };
     let mut pos = match Position::from_fen(fen) {
         Ok(p) => p,
         Err(e) => {
@@ -73,7 +77,8 @@ pub fn run(opts: &DumpOptions) {
     STOP.store(false, Ordering::Relaxed);
     td.prepare_search(&pos, &limits);
     // prepare_search gives infinite limits to id != 0 — override with real ones
-    td.tm = TimeManager::new(&limits);
+    let game_ply = td.pos.game_ply();
+    td.tm = TimeManager::new(&limits, game_ply, &mut td.original_time_adjust);
 
     #[cfg(feature = "tree")]
     if !opts.tree_out.is_empty() {

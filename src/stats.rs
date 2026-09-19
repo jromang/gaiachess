@@ -279,8 +279,8 @@ pub fn move_category(
         return 0;
     }
     let mt = m.move_type();
-    let is_noisy =
-        mt == MT_PROMOTION || mt == MT_EN_PASSANT
+    let is_noisy = mt == MT_PROMOTION
+        || mt == MT_EN_PASSANT
         || (mt != MT_CASTLING && pos.board[m.to_sq().index()] != Piece::NONE);
     if is_noisy {
         return if crate::see::see(pos, m, 0) { 1 } else { 2 };
@@ -331,11 +331,7 @@ impl SearchStats {
                 sum += (i as u64 + 1) * c;
                 n += c;
             }
-            if n == 0 {
-                0.0
-            } else {
-                sum as f64 / n as f64
-            }
+            if n == 0 { 0.0 } else { sum as f64 / n as f64 }
         };
         let _ = writeln!(
             out,
@@ -394,9 +390,10 @@ impl SearchStats {
             self.lmr_searches,
             pct(self.lmr_reduced, self.lmr_searches),
             pct(self.lmr_research, self.lmr_reduced),
-            self.do_deeper, self.do_shallower, self.pvs_research
+            self.do_deeper,
+            self.do_shallower,
+            self.pvs_research
         );
-
         // Whole-node pruning: tried -> cut rates per technique
         let tech = |name: &str, t: &TechDepth| -> String {
             let tried: u64 = t.tried.iter().sum();

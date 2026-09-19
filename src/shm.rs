@@ -115,11 +115,7 @@ pub fn verify_requested() -> bool {
 /// only if this process becomes the builder. On any failure the error says
 /// what went wrong in a form fit for `info string`, and the caller is expected
 /// to fall back to a private copy.
-pub fn acquire(
-    name: &str,
-    len: usize,
-    build: &mut dyn FnMut(&mut [u8]),
-) -> Result<Mapped, String> {
+pub fn acquire(name: &str, len: usize, build: &mut dyn FnMut(&mut [u8])) -> Result<Mapped, String> {
     imp::acquire(name, len, build)
 }
 
@@ -137,7 +133,11 @@ pub fn describe() -> String {
         return String::from("disabled (GAIA_SHARED_NET)");
     }
     let n = peers();
-    let verify = if verify_requested() { ", verifying" } else { "" };
+    let verify = if verify_requested() {
+        ", verifying"
+    } else {
+        ""
+    };
     format!("enabled, {n} peer(s) serving{verify}")
 }
 
@@ -157,11 +157,11 @@ mod imp {
     use std::sync::{Mutex, OnceLock};
     use std::time::{Duration, Instant};
 
-    use nix::fcntl::{fcntl, FcntlArg, SealFlag};
-    use nix::sys::memfd::{memfd_create, MFdFlags};
-    use nix::sys::mman::{madvise, mmap, mmap_anonymous, munmap, MapFlags, MmapAdvise, ProtFlags};
+    use nix::fcntl::{FcntlArg, SealFlag, fcntl};
+    use nix::sys::memfd::{MFdFlags, memfd_create};
+    use nix::sys::mman::{MapFlags, MmapAdvise, ProtFlags, madvise, mmap, mmap_anonymous, munmap};
     use nix::sys::socket::{
-        getsockopt, recvmsg, sendmsg, sockopt, ControlMessage, ControlMessageOwned, MsgFlags,
+        ControlMessage, ControlMessageOwned, MsgFlags, getsockopt, recvmsg, sendmsg, sockopt,
     };
     use nix::sys::stat::fstat;
     use nix::sys::uio::pread;
@@ -283,8 +283,13 @@ mod imp {
             let mut acc = crate::nnue::integrity::fnv1a64(path.as_os_str().as_encoded_bytes());
             if let Ok(md) = std::fs::metadata(&path) {
                 use std::os::unix::fs::MetadataExt;
-                for v in [md.dev(), md.ino(), md.size(), md.mtime() as u64, md.mtime_nsec() as u64]
-                {
+                for v in [
+                    md.dev(),
+                    md.ino(),
+                    md.size(),
+                    md.mtime() as u64,
+                    md.mtime_nsec() as u64,
+                ] {
                     acc = crate::nnue::integrity::fnv1a64(&{
                         let mut b = acc.to_le_bytes().to_vec();
                         b.extend_from_slice(&v.to_le_bytes());
@@ -319,7 +324,9 @@ mod imp {
         };
         let mut out = Vec::new();
         for line in text.lines() {
-            let Some(path) = line.rsplit(' ').next() else { continue };
+            let Some(path) = line.rsplit(' ').next() else {
+                continue;
+            };
             if let Some(rest) = path.strip_prefix('@')
                 && rest.starts_with(prefix)
                 && !out.iter().any(|p| p == rest)
@@ -338,8 +345,7 @@ mod imp {
         if name.len() > MAX_NAME || name.contains('\0') {
             return Err(format!("socket name unusable ({} bytes)", name.len()));
         }
-        SocketAddr::from_abstract_name(name.as_bytes())
-            .map_err(|e| format!("bad socket name: {e}"))
+        SocketAddr::from_abstract_name(name.as_bytes()).map_err(|e| format!("bad socket name: {e}"))
     }
 
     /// Ask one peer for the descriptor it is serving.
@@ -419,7 +425,10 @@ mod imp {
             return Err(String::from("image was published under another name"));
         }
         if got.payload_len != len as u64 {
-            return Err(format!("payload is {} bytes, expected {len}", got.payload_len));
+            return Err(format!(
+                "payload is {} bytes, expected {len}",
+                got.payload_len
+            ));
         }
         Ok(())
     }
@@ -484,7 +493,9 @@ mod imp {
             Ok(p) => p,
             Err(e) => {
                 // SAFETY: unmapping exactly the reservation made above.
-                unsafe { let _ = munmap(base, reserve.get()); }
+                unsafe {
+                    let _ = munmap(base, reserve.get());
+                }
                 return Err(format!("mmap: {e}"));
             }
         };
@@ -492,13 +503,17 @@ mod imp {
         // Give back the slivers around the aligned mapping.
         if head > 0 {
             // SAFETY: still our own reservation, untouched by the fixed mapping.
-            unsafe { let _ = munmap(base, head); }
+            unsafe {
+                let _ = munmap(base, head);
+            }
         }
         if tail > 0 {
             let end = std::ptr::NonNull::new((aligned + size) as *mut std::ffi::c_void);
             if let Some(end) = end {
                 // SAFETY: as above, the far end of the reservation.
-                unsafe { let _ = munmap(end, tail); }
+                unsafe {
+                    let _ = munmap(end, tail);
+                }
             }
         }
 
@@ -669,7 +684,9 @@ mod imp {
                 // outlive the process that published it.
                 if let Some(nn) = std::ptr::NonNull::new(ptr as *mut std::ffi::c_void) {
                     // SAFETY: unmapping exactly what was mapped above.
-                    unsafe { let _ = munmap(nn, size); }
+                    unsafe {
+                        let _ = munmap(nn, size);
+                    }
                 }
                 return Err(e);
             }
@@ -680,7 +697,11 @@ mod imp {
         // still reads the shared pages, which is the whole point.
         let _ = serve(name, fd);
         debug_assert_eq!(ptr as usize % 64, 0);
-        Ok(Mapped { ptr: ptr as *const u8, len, origin })
+        Ok(Mapped {
+            ptr: ptr as *const u8,
+            len,
+            origin,
+        })
     }
 
     pub fn acquire(
@@ -753,7 +774,9 @@ mod imp {
         _len: usize,
         _build: &mut dyn FnMut(&mut [u8]),
     ) -> Result<Mapped, String> {
-        Err(String::from("sharing needs memfd and abstract sockets (Linux)"))
+        Err(String::from(
+            "sharing needs memfd and abstract sockets (Linux)",
+        ))
     }
 }
 
@@ -793,8 +816,10 @@ mod tests {
 
         // The second acquire must find the server started by the first and
         // take the descriptor from it rather than build anything.
-        let received = acquire(&name, SMALL, &mut |_| panic!("rebuilt an image it should have received"))
-            .expect("receive");
+        let received = acquire(&name, SMALL, &mut |_| {
+            panic!("rebuilt an image it should have received")
+        })
+        .expect("receive");
         assert_eq!(received.origin, Origin::Received);
         assert_eq!(built.bytes(), received.bytes());
 
@@ -831,7 +856,11 @@ mod tests {
 
         // One builder, and everyone reading the same bytes. More than one build
         // would mean the init lock let two processes through.
-        assert_eq!(builds.load(Ordering::Relaxed), 1, "the image was built twice");
+        assert_eq!(
+            builds.load(Ordering::Relaxed),
+            1,
+            "the image was built twice"
+        );
         assert_eq!(
             results.iter().filter(|(o, _)| *o == Origin::Built).count(),
             1

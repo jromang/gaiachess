@@ -131,9 +131,7 @@ fn weighted(book: &[(Move, u32)], roll: u64) -> Move {
 /// open the same game — so it is the one place where the wall clock gets a say.
 fn roll() -> u64 {
     static STATE: OnceLock<AtomicU64> = OnceLock::new();
-    let state = STATE.get_or_init(|| {
-        AtomicU64::new(crate::time::seed_from_clock())
-    });
+    let state = STATE.get_or_init(|| AtomicU64::new(crate::time::seed_from_clock()));
     // Counter-based: the sequence is the SplitMix64 the Zobrist keys are built with,
     // which needs no lock and no read-modify-write loop to stay sound across threads.
     mix(state.fetch_add(0x9E37_79B9_7F4A_7C15, Ordering::Relaxed))
@@ -171,7 +169,10 @@ fn load() -> Vec<Entry> {
             .split_whitespace()
             .map(|item| {
                 let (uci, weight) = item.split_once(':').expect("book move without a weight");
-                (legal(&pos, uci), weight.parse().expect("unreadable book weight"))
+                (
+                    legal(&pos, uci),
+                    weight.parse().expect("unreadable book weight"),
+                )
             })
             .collect();
         debug_assert!(!entry.is_empty(), "book row with no moves");
@@ -222,9 +223,16 @@ mod tests {
             .filter(|row| !row.starts_with('#') && !row.is_empty())
             .count();
         let book = BOOK.get_or_init(load);
-        assert_eq!(book.len(), rows, "rows and positions must match one for one");
+        assert_eq!(
+            book.len(),
+            rows,
+            "rows and positions must match one for one"
+        );
         assert!(rows > 300, "the book looks truncated: {rows} rows");
-        assert!(book.iter().all(|(_, moves)| moves.iter().all(|&(mv, w)| mv.is_ok() && w > 0)));
+        assert!(
+            book.iter()
+                .all(|(_, moves)| moves.iter().all(|&(mv, w)| mv.is_ok() && w > 0))
+        );
     }
 
     #[test]
@@ -257,13 +265,21 @@ mod tests {
         let mut previous = 0;
         for level in MIN_LEVEL..FULL_STRENGTH {
             let plies = book_plies(level);
-            assert!(plies >= previous, "level {level} forgets theory the rung below knew");
+            assert!(
+                plies >= previous,
+                "level {level} forgets theory the rung below knew"
+            );
             previous = plies;
         }
-        assert!(book_plies(FULL_STRENGTH - 1) >= 12, "the top rungs should know it all");
+        assert!(
+            book_plies(FULL_STRENGTH - 1) >= 12,
+            "the top rungs should know it all"
+        );
 
         // A level with a four-ply window plays two moves and then thinks for itself.
-        let level = (MIN_LEVEL..FULL_STRENGTH).find(|&l| book_plies(l) == 4).expect("a 4-ply rung");
+        let level = (MIN_LEVEL..FULL_STRENGTH)
+            .find(|&l| book_plies(l) == 4)
+            .expect("a 4-ply rung");
         assert!(decide(&after("e2e4 e7e5 g1f3"), level, false, 0).is_some());
         assert!(decide(&after("e2e4 e7e5 g1f3 b8c6"), level, false, 0).is_none());
 
@@ -281,10 +297,18 @@ mod tests {
         let mut drawn = std::collections::HashSet::new();
         for roll in 0..500 {
             let mv = decide(&start, 5, false, mix(roll)).expect("level 5 opens out of the book");
-            assert!(book.contains(&mv.to_uci()), "{} is not in the book", mv.to_uci());
+            assert!(
+                book.contains(&mv.to_uci()),
+                "{} is not in the book",
+                mv.to_uci()
+            );
             drawn.insert(mv.to_uci());
         }
-        assert!(drawn.len() >= 4, "only {} different openings in 500 games", drawn.len());
+        assert!(
+            drawn.len() >= 4,
+            "only {} different openings in 500 games",
+            drawn.len()
+        );
         assert!(drawn.contains("e2e4") && drawn.contains("d2d4"));
     }
 

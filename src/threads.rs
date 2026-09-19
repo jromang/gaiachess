@@ -6,7 +6,10 @@
 //! and the atomic stop flag. All history tables, killers, search stack, and PV
 //! are per-thread.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::mpsc;
 
 use crate::history::{
     ButterflyHistory, CaptureHistory, ContCorrectionHistory, ContinuationHistory, Countermoves,
@@ -71,6 +74,29 @@ pub fn counting_nodes() -> bool {
 /// so a reader wanting a rate takes the difference over a window of its own.
 pub static NODES_SEARCHED: AtomicU64 = AtomicU64::new(0);
 
+/// Milliseconds into the search at which the main thread last printed anything.
+///
+/// A deep iteration can run for seconds without completing — tens of millions of
+/// nodes inside one root move in the reported analysis sessions — and an interface
+/// that hears nothing shows a frozen engine. The main thread therefore reports its
+/// progress on its own once [`HEARTBEAT_MS`] have passed in silence.
+pub static LAST_INFO_MS: AtomicU64 = AtomicU64::new(0);
+
+/// The silence the main thread tolerates before reporting progress, in ms.
+pub static HEARTBEAT_MS: AtomicU64 = AtomicU64::new(1000);
+
+/// Record that a line was just printed, `elapsed_ms` into the search.
+#[inline]
+pub fn note_output(elapsed_ms: u64) {
+    LAST_INFO_MS.store(elapsed_ms, Ordering::Relaxed);
+}
+
+/// Whether the silence since `last_ms` has reached `interval_ms` at `now_ms`.
+#[inline]
+pub fn heartbeat_due(now_ms: u64, last_ms: u64, interval_ms: u64) -> bool {
+    now_ms >= last_ms.saturating_add(interval_ms)
+}
+
 /// Whether whoever is hosting the engine has asked for the search to end.
 ///
 /// Deliberately not part of [`should_stop`], which every node calls: an imported function
@@ -103,7 +129,7 @@ pub fn should_stop() -> bool {
 use crate::movegen;
 use crate::position::Position;
 use crate::search;
-use crate::timeman::{SearchLimits, TimeManager};
+use crate::timeman::{INITIAL_TIME_REDUCTION, SearchLimits, TIME_ADJUST_UNSET, TimeManager};
 use crate::tt::TT;
 use crate::types::*;
 
@@ -112,6 +138,135 @@ use crate::types::*;
 pub const SS_OFFSET: usize = 8;
 
 const STARTPOS: &str = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
+
+/// One-writer lock-free snapshot consumed only by the UCI reporting thread.
+struct CurrLineSlot {
+    generation: AtomicU32,
+    len: AtomicUsize,
+    moves: [AtomicU16; MAX_PLY + 1],
+}
+
+impl CurrLineSlot {
+    fn new() -> Self {
+        Self {
+            generation: AtomicU32::new(0),
+            len: AtomicUsize::new(0),
+            moves: [const { AtomicU16::new(0) }; MAX_PLY + 1],
+        }
+    }
+
+    fn publish(&self, line: &[Move]) {
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        let len = line.len().min(self.moves.len());
+        for (dst, mv) in self.moves.iter().zip(line).take(len) {
+            dst.store(mv.0, Ordering::SeqCst);
+        }
+        self.len.store(len, Ordering::SeqCst);
+        self.generation.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn clear(&self) {
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        self.len.store(0, Ordering::SeqCst);
+        self.generation.fetch_add(1, Ordering::SeqCst);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn snapshot(&self) -> Option<(u32, Vec<Move>)> {
+        for _ in 0..4 {
+            let before = self.generation.load(Ordering::SeqCst);
+            if before & 1 != 0 {
+                continue;
+            }
+            let len = self.len.load(Ordering::SeqCst).min(self.moves.len());
+            let line: Vec<Move> = self.moves[..len]
+                .iter()
+                .map(|mv| Move(mv.load(Ordering::SeqCst)))
+                .collect();
+            let after = self.generation.load(Ordering::SeqCst);
+            if before == after && !line.is_empty() {
+                return Some((after, line));
+            }
+        }
+        None
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+struct CurrLineReporter {
+    stop: Option<mpsc::Sender<()>>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl CurrLineReporter {
+    fn start(threads: &[ThreadData]) -> Option<Self> {
+        if threads.first().is_none_or(|td| !td.report_curr_line) {
+            return None;
+        }
+
+        let slots: Vec<_> = threads.iter().map(|td| Arc::clone(&td.curr_line)).collect();
+        let chess960 = threads[0].pos.chess960;
+        let (stop, stopped) = mpsc::channel();
+        let handle = std::thread::Builder::new()
+            .name("uci-currline".into())
+            .spawn(move || {
+                let mut generations = vec![0; slots.len()];
+                loop {
+                    match stopped.recv_timeout(std::time::Duration::from_secs(1)) {
+                        Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                        Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    }
+
+                    let Some(snapshots) = slots
+                        .iter()
+                        .map(|slot| slot.snapshot())
+                        .collect::<Option<Vec<_>>>()
+                    else {
+                        continue;
+                    };
+                    if snapshots
+                        .iter()
+                        .zip(&generations)
+                        .all(|((generation, _), previous)| generation == previous)
+                    {
+                        continue;
+                    }
+
+                    let mut lines = Vec::with_capacity(snapshots.len());
+                    for (i, (generation, line)) in snapshots.iter().enumerate() {
+                        generations[i] = *generation;
+                        let moves = line
+                            .iter()
+                            .map(|mv| mv.to_uci_960(chess960))
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        if snapshots.len() == 1 {
+                            lines.push(format!("info currline {moves}"));
+                        } else {
+                            lines.push(format!("info currline {} {moves}", i + 1));
+                        }
+                    }
+                    crate::out::lines(&lines);
+                }
+            })
+            .expect("failed to spawn UCI currline reporter");
+        Some(Self {
+            stop: Some(stop),
+            handle: Some(handle),
+        })
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Drop for CurrLineReporter {
+    fn drop(&mut self) {
+        self.stop.take();
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
 
 // ============================================================
 // RootMove
@@ -122,9 +277,16 @@ const STARTPOS: &str = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1
 #[derive(Clone)]
 pub struct RootMove {
     pub mv: Move,
-    /// Score from current depth iteration (-SCORE_INFINITE if not yet searched).
+    /// Score of the last completed iteration in which this move was the line's
+    /// best (-SCORE_INFINITE while it never was). Never a bound: only a settled
+    /// aspiration loop writes it, and a stopped iteration writes nothing.
     pub score: i32,
-    /// Score from previous depth iteration (for aspiration centering on incomplete depths).
+    /// The iteration `score` comes from (0 while the move was never scored). The
+    /// root moves are kept sorted by depth first, so `root_moves[0]` is always the
+    /// deepest completed result — the move played and the line reported when the
+    /// search stops in the middle of an iteration.
+    pub depth: i32,
+    /// The score this move had before `score` was last written.
     pub previous_score: i32,
     /// Running average score for aspiration window centering.
     pub avg_score: i32,
@@ -140,15 +302,21 @@ pub struct RootMove {
     pub tb_score: i32,
     /// Cumulative nodes spent searching this move (for node fraction TM).
     pub nodes_spent: u64,
+    /// Root move followed by the reply line already found while searching it.
+    pub refutation: [Move; MAX_PLY + 1],
+    pub refutation_len: usize,
 }
 
 impl RootMove {
     pub fn new(mv: Move) -> Self {
         let mut pv = [Move::NONE; MAX_PLY + 1];
         pv[0] = mv;
+        let mut refutation = [Move::NONE; MAX_PLY + 1];
+        refutation[0] = mv;
         RootMove {
             mv,
             score: -SCORE_INFINITE,
+            depth: 0,
             previous_score: -SCORE_INFINITE,
             avg_score: SCORE_NONE,
             pv,
@@ -157,6 +325,8 @@ impl RootMove {
             tb_rank: 0,
             tb_score: 0,
             nodes_spent: 0,
+            refutation,
+            refutation_len: 1,
         }
     }
 }
@@ -167,8 +337,9 @@ impl RootMove {
 pub struct TbConfig {
     /// Root position is in loaded tablebases.
     pub root_in_tb: bool,
-    /// Max piece count for in-tree TB probing. 0 = DTZ available, skip in-tree probes.
-    /// >0 = WDL-only fallback, probe in search at this cardinality.
+    /// Max piece count for in-tree TB probing. 0 = skip in-tree probes (DTZ at
+    /// the root, or a loss/draw). >0 = WDL-only win: probe below TB_LARGEST so a
+    /// 7-piece WDL-only root does not WDL-hit every node.
     pub cardinality: u32,
 }
 
@@ -192,6 +363,10 @@ pub struct StackEntry {
     pub reduction: i32,
     /// Follow-PV guard: true if this node is on the previous iteration's PV
     pub follow_pv: bool,
+    /// Beta cutoffs seen at this ply since the parent entered its move loop.
+    /// The parent zeroes it once; every child searched from there shares the
+    /// slot, so it counts how often this ply keeps refuting the parent's moves.
+    pub failhighs: u8,
 }
 
 impl Default for StackEntry {
@@ -208,6 +383,7 @@ impl Default for StackEntry {
             double_extensions: 0,
             reduction: 0,
             follow_pv: false,
+            failhighs: 0,
         }
     }
 }
@@ -230,6 +406,13 @@ unsafe impl Send for StackEntry {}
 pub struct SharedState {
     pub tt: TT,
     pub corr: SharedCorrectionHistory,
+    cpu_load: crate::cpuload::CpuLoad,
+    /// Root best-move changes of the current search, summed over every thread.
+    /// Time management reads it: a root that keeps changing its mind is a root
+    /// worth more time, and instability seen by any thread counts. The main
+    /// thread takes and zeroes it once per iteration; a root best-move change is
+    /// rare enough that the atomic is never contended.
+    pub best_move_changes: AtomicU32,
 }
 
 impl SharedState {
@@ -240,13 +423,20 @@ impl SharedState {
         SharedState {
             tt: TT::new(hash_mb),
             corr: SharedCorrectionHistory::new(threads),
+            cpu_load: crate::cpuload::CpuLoad::new(),
+            best_move_changes: AtomicU32::new(0),
         }
+    }
+
+    pub fn cpu_load(&self, threads: usize) -> Option<u32> {
+        self.cpu_load.permille(threads)
     }
 
     /// Clear everything shared (`ucinewgame`, and between bench runs).
     pub fn clear(&mut self) {
         self.tt.clear();
         self.corr.clear();
+        self.best_move_changes.store(0, Ordering::Relaxed);
     }
 }
 
@@ -297,6 +487,16 @@ pub struct ThreadData {
     pub tm: TimeManager,
     /// Current iterative deepening depth (for SE ply guard).
     pub root_depth: i32,
+    /// Lowest ply at which null-move pruning may run during an NMP verification
+    /// search. Zero outside verification. This is per-thread because helpers search
+    /// independent trees.
+    pub nmp_min_ply: usize,
+    /// Mate hunt: the root is deep and its value decisive-sized, so the
+    /// iteration is refining a forced line rather than weighing evaluations.
+    /// Singular extensions are off (every TT move looks singular when the
+    /// alternatives are all mates) and reverse futility stays shallow.
+    /// Recomputed before every aspiration retry; see `search.rs`.
+    pub seek_mate: bool,
     /// Deepest iteration completed by this thread.
     pub completed_depth: i32,
     /// Best move found by this thread.
@@ -317,7 +517,11 @@ pub struct ThreadData {
     pub stopped: bool,
     /// Maximum ply reached during current depth iteration (for UCI seldepth).
     pub seldepth: i32,
-    /// Local cache of ponder state. Avoids atomic load every 2048 nodes.
+    /// The root move being searched and its rank in the root loop, for the
+    /// progress line printed during a long iteration.
+    pub root_move: Move,
+    pub root_move_number: usize,
+    /// Local cache of ponder state. Avoids atomic load every 512 nodes.
     /// Set in `prepare_search()`, cleared on `ponderhit` detection.
     pub pondering: bool,
     /// `go mate N`: stop iterative deepening once a mate in at most N moves is found.
@@ -343,10 +547,16 @@ pub struct ThreadData {
     /// TB adjudication in datagen handles endgame labels separately.
     #[allow(dead_code)] // used with --features datagen
     pub datagen_mode: bool,
-    /// Best move stability counter for time management (consecutive same best move).
-    pub bm_stability: i32,
-    /// Previous iteration's best move for stability tracking.
-    pub prev_best_move: Move,
+    /// Per-game tilt of the time budget, computed on the first move that carries
+    /// a clock and kept for the rest of the game. Negative means "not computed".
+    pub original_time_adjust: f64,
+    /// Score and running average this thread ended its *previous* search on, and
+    /// the time reduction it left. Time management compares the position in front
+    /// of it to the one it just played: a score that fell since last move buys
+    /// more time. `SCORE_NONE` where there is no previous move to compare to.
+    pub best_previous_score: i32,
+    pub best_previous_avg_score: i32,
+    pub previous_time_reduction: f64,
     /// Set by evaluate_pos() when the lazy-eval gate fired (PeSTO used instead of NNUE).
     /// Read immediately afterward to skip correction history application/update.
     pub used_lazy_eval: bool,
@@ -361,6 +571,11 @@ pub struct ThreadData {
     /// Follow-PV guard: PV from the previous iteration
     pub last_iteration_pv: [Move; MAX_PLY + 1],
     pub last_iteration_pv_len: usize,
+    curr_line: Arc<CurrLineSlot>,
+    /// Snapshotted once per search; publishing uses atomics but never waits.
+    pub report_curr_line: bool,
+    /// Main-thread-only capture of already searched root replies.
+    pub report_refutations: bool,
     /// Search statistics (feature `stats`). Boxed to keep ThreadData small.
     /// Written only by the owning thread; aggregated by the pool after join.
     #[cfg(feature = "stats")]
@@ -434,8 +649,10 @@ impl ThreadData {
             root_delta: SCORE_INFINITE,
             stack,
             sentinel_conthist: sentinel,
-            tm: TimeManager::new(&SearchLimits::infinite()),
+            tm: TimeManager::infinite(),
             root_depth: 0,
+            nmp_min_ply: 0,
+            seek_mate: false,
             completed_depth: 0,
             best_move: Move::NONE,
             best_score: -SCORE_INFINITE,
@@ -444,6 +661,8 @@ impl ThreadData {
             per_thread_nodes: false,
             stopped: false,
             seldepth: 0,
+            root_move: Move::NONE,
+            root_move_number: 0,
             pondering: false,
             mate_limit: None,
             root_moves: Vec::new(),
@@ -454,13 +673,18 @@ impl ThreadData {
             #[cfg(feature = "syzygy")]
             tb_config: TbConfig::default(),
             datagen_mode: false,
-            bm_stability: 0,
-            prev_best_move: Move::NONE,
+            original_time_adjust: TIME_ADJUST_UNSET,
+            best_previous_score: SCORE_NONE,
+            best_previous_avg_score: SCORE_NONE,
+            previous_time_reduction: INITIAL_TIME_REDUCTION,
             used_lazy_eval: false,
             skill: crate::skill::Snapshot::FULL_STRENGTH,
             optimism: [0; 2],
             last_iteration_pv: [Move::NONE; MAX_PLY + 1],
             last_iteration_pv_len: 0,
+            curr_line: Arc::new(CurrLineSlot::new()),
+            report_curr_line: false,
+            report_refutations: false,
             #[cfg(feature = "stats")]
             stats: Box::new(crate::stats::SearchStats::zeroed()),
             #[cfg(feature = "tree")]
@@ -514,7 +738,7 @@ impl ThreadData {
         )
     }
 
-    /// Check time/node limits every 2048 nodes.
+    /// Check time/node limits every 512 nodes.
     /// For helper threads (infinite limits), this is effectively a no-op.
     /// During pondering, time/node limits are suspended until `ponderhit`.
     #[inline]
@@ -524,6 +748,20 @@ impl ThreadData {
             // showing what the engine is doing on the player's time.
             if counting_nodes() {
                 NODES_SEARCHED.fetch_add(512, Ordering::Relaxed);
+            }
+
+            // The interface must never see a mute engine: after a second without a
+            // line, the main thread says where it is. One clock read per 512 nodes,
+            // which the deadline test below already pays.
+            if self.id == 0 && !self.silent {
+                let now = self.tm.total_elapsed_ms();
+                if heartbeat_due(
+                    now,
+                    LAST_INFO_MS.load(Ordering::Relaxed),
+                    HEARTBEAT_MS.load(Ordering::Relaxed),
+                ) {
+                    self.print_heartbeat(now);
+                }
             }
 
             // A host outside the engine may want the search to end: a browser tab, where
@@ -540,13 +778,24 @@ impl ThreadData {
             if self.pondering && !PONDER.load(Ordering::Relaxed) {
                 self.pondering = false;
                 self.tm.restart();
+                // A depth-limited ponder may already have searched far beyond its
+                // requested depth. Do not finish another large iteration after the hit.
+                if self.root_depth > self.tm.max_depth() {
+                    STOP.store(true, Ordering::Relaxed);
+                }
             }
 
             // Skip time/node limits while pondering (search indefinitely).
             // In datagen, and whenever a node budget was split across the pool, the
             // limit is this thread's alone: stop it like the deadline below — a thread
             // spending its own share must not kill its siblings through the global STOP.
-            if !self.pondering && (self.tm.should_stop_hard() || self.nodes >= self.tm.max_nodes())
+            // The deadline cannot fire before depth one is in hand: a move has to be
+            // played, and the alternative is handing back whatever the first legal
+            // move happened to be. The node budget has no such guard, so a fixed-node
+            // search returns the same tree as ever.
+            if !self.pondering
+                && ((self.completed_depth >= 1 && self.tm.should_stop_hard())
+                    || self.nodes >= self.tm.max_nodes())
             {
                 if self.datagen_mode || self.per_thread_nodes {
                     self.stopped = true;
@@ -559,6 +808,30 @@ impl ThreadData {
                 self.stopped = true;
             }
         }
+    }
+
+    /// Progress line for a long iteration: depth, selective depth, the root move
+    /// under search and the counters — everything but a score and a PV, which the
+    /// iteration has not produced yet.
+    fn print_heartbeat(&self, now_ms: u64) {
+        let nodes = self.nodes.max(NODES_SEARCHED.load(Ordering::Relaxed));
+        let nps = nodes * 1000 / now_ms.max(1);
+        let currmove = if self.root_move != Move::NONE {
+            format!(
+                " currmove {} currmovenumber {}",
+                self.root_move.to_uci_960(self.pos.chess960),
+                self.root_move_number
+            )
+        } else {
+            String::new()
+        };
+        out!(
+            "info depth {} seldepth {}{currmove} nodes {nodes} nps {nps} tbhits {} time {now_ms}",
+            self.root_depth,
+            self.seldepth,
+            self.tb_hits
+        );
+        note_output(now_ms);
     }
 
     /// Check if this thread should stop searching.
@@ -608,15 +881,17 @@ impl ThreadData {
             self.nnue.refresh(&self.pos);
         }
         self.root_depth = 0;
+        self.nmp_min_ply = 0;
+        self.seek_mate = false;
         self.completed_depth = 0;
         self.seldepth = 0;
+        self.root_move = Move::NONE;
+        self.root_move_number = 0;
         self.best_move = Move::NONE;
         self.best_score = -SCORE_INFINITE;
         self.stopped = false;
         self.pondering = PONDER.load(Ordering::Relaxed);
         self.mate_limit = limits.mate;
-        self.bm_stability = 0;
-        self.prev_best_move = Move::NONE;
         self.killers.clear();
         // The first iteration has no running average yet, so the optimism block at the
         // root is skipped and the eval would otherwise be blended with the value left
@@ -624,6 +899,7 @@ impl ThreadData {
         self.optimism = [0; 2];
         self.pv_index = 0;
         self.tb_hits = 0;
+        self.curr_line.clear();
         #[cfg(feature = "syzygy")]
         {
             self.tb_config = TbConfig {
@@ -657,13 +933,16 @@ impl ThreadData {
         // except for a node budget, which is divided evenly instead (see
         // `split_node_limit`). At one thread nothing is divided and nothing changes.
         self.per_thread_nodes = false;
+        let game_ply = self.pos.game_ply();
         match split_node_limit(limits, self.thread_count).filter(|_| self.thread_count > 1) {
             Some(share) => {
                 self.per_thread_nodes = true;
-                self.tm = TimeManager::new(&share);
+                self.tm = TimeManager::new(&share, game_ply, &mut self.original_time_adjust);
             }
-            None if self.id == 0 => self.tm = TimeManager::new(limits),
-            None => self.tm = TimeManager::new(&SearchLimits::infinite()),
+            None if self.id == 0 => {
+                self.tm = TimeManager::new(limits, game_ply, &mut self.original_time_adjust);
+            }
+            None => self.tm = TimeManager::infinite(),
         }
         self.apply_skill_ceiling();
         // The upper rungs need to see more than one root move to have anything to choose
@@ -701,6 +980,26 @@ impl ThreadData {
         self.cont_history.clear();
         self.countermoves.clear();
         self.cont_correction.clear();
+    }
+
+    /// Publish the candidate root line without waiting on the UCI output path.
+    pub fn publish_curr_line(&self, root_move: Move) {
+        let Some(rm) = self.root_moves.iter().find(|rm| rm.mv == root_move) else {
+            return;
+        };
+        self.curr_line.publish(&rm.pv[..rm.pv_len.max(1)]);
+    }
+
+    /// Forget the previous game's time-management state (`ucinewgame`).
+    ///
+    /// These four outlive a search on purpose — they compare this move to the
+    /// last one — so they are the one thing a new game has to clear that
+    /// `prepare_search` must not.
+    pub fn new_game(&mut self) {
+        self.original_time_adjust = TIME_ADJUST_UNSET;
+        self.best_previous_score = SCORE_NONE;
+        self.best_previous_avg_score = SCORE_NONE;
+        self.previous_time_reduction = INITIAL_TIME_REDUCTION;
     }
 }
 
@@ -757,6 +1056,7 @@ impl ThreadPool {
         self.shared.clear();
         for td in &mut self.threads {
             td.clear_histories();
+            td.new_game();
         }
     }
 
@@ -784,11 +1084,18 @@ impl ThreadPool {
         // helpers running, every thread feeds the shared counter, zeroed here so a
         // single-thread search that follows never reads a stale total.
         NODES_SEARCHED.store(0, Ordering::Relaxed);
+        LAST_INFO_MS.store(0, Ordering::Relaxed);
 
         // Prepare all threads
         for td in &mut self.threads {
             td.multi_pv = self.multi_pv;
             td.prepare_search_filtered(pos, &limits, search_moves);
+        }
+        let report_curr_line = crate::uci::show_curr_line() && !self.threads[0].silent;
+        let report_refutations = crate::uci::show_refutations() && !self.threads[0].silent;
+        for td in &mut self.threads {
+            td.report_curr_line = report_curr_line;
+            td.report_refutations = report_refutations && td.id == 0;
         }
 
         // A weakened engine opens out of the book rather than searching, which is what
@@ -802,6 +1109,11 @@ impl ThreadPool {
         if let Some(mv) = crate::book::choice(pos, analysing) {
             return (mv, None);
         }
+
+        self.shared.cpu_load.reset();
+
+        #[cfg(not(target_arch = "wasm32"))]
+        let _curr_line_reporter = CurrLineReporter::start(&self.threads);
 
         // A handicapped engine searches on one thread whatever the machine has, so a
         // given skill level plays the same everywhere. Extra cores would otherwise
@@ -850,43 +1162,86 @@ impl ThreadPool {
         // Select best thread via weighted vote aggregation
         let best_idx = self.select_best_thread();
         self.last_best_idx = best_idx;
+
         let best = self.threads[best_idx].best_move;
         let ponder = self.extract_ponder_move(best_idx);
         (best, ponder)
     }
 
+    /// Emit the final UCI snapshot immediately before `bestmove`.
+    ///
+    /// Normal iterative output can be followed by `currmove` from an interrupted
+    /// iteration. Repeating the last completed PV here gives the GUI final statistics
+    /// and also makes a helper selected by Lazy SMP agree with the move being played.
+    pub fn print_final_uci_info(&self) {
+        let td = &self.threads[self.last_best_idx];
+        if td.silent || td.root_moves.is_empty() {
+            return;
+        }
+
+        if td.root_moves[0].depth > 0 {
+            let multi_pv = td.reported_multi_pv.min(td.root_moves.len()).max(1);
+            // Every root move carries the depth its score comes from, and the
+            // deepest completed line is at the front: the snapshot is exact, never
+            // a bound, never shallower than what was finished.
+            search::print_multi_pv_info(td, &self.shared, multi_pv);
+        } else if td.best_move.is_ok() {
+            let elapsed = td.tm.total_elapsed_ms().max(1);
+            let cpuload = self
+                .shared
+                .cpu_load(td.thread_count)
+                .map_or_else(String::new, |load| format!(" cpuload {load}"));
+            out!(
+                "info depth 0 nodes {} time {elapsed}{cpuload} pv {}",
+                td.nodes,
+                td.best_move.to_uci_960(td.pos.chess960)
+            );
+        }
+    }
+
     /// Select the best thread via weighted vote aggregation.
     ///
-    /// Each thread votes for its best move with weight =
-    /// `(score - min_score + 10) * completed_depth`. Votes are aggregated
-    /// per move. Special handling for decisive scores (mates, TB wins).
-    /// Tiebreak uses PV truncation filter (`pv_len > 2`).
+    /// Only threads whose front root move was scored at the deepest completed
+    /// iteration of the pool take part: each votes for that move with weight
+    /// `score - min_score + 10`, votes are summed per move, ties go to the longer
+    /// PV. A thread whose front move is decisive (mate or tablebase, and every root
+    /// score is exact) is taken over any vote — shorter mate, longer defence. A
+    /// shallower thread with a stale optimistic score can therefore never outvote a
+    /// deeper one that has seen the refutation: with the old weights, two helpers at
+    /// depth 12 on a +7 outvoted the main thread at depth 13 on a −279 that had
+    /// already published the refutation of their move.
     fn select_best_thread(&self) -> usize {
         // Skip voting for single thread or multi-PV mode
         if self.threads.len() <= 1 || self.multi_pv > 1 {
             return 0;
         }
 
-        // Find min score across all threads that completed at least one iteration
+        let scored = |t: &ThreadData| !t.root_moves.is_empty() && t.root_moves[0].depth > 0;
+        let deepest = self
+            .threads
+            .iter()
+            .filter(|t| scored(t))
+            .map(|t| t.root_moves[0].depth)
+            .max()
+            .unwrap_or(0);
+        if deepest == 0 {
+            return 0;
+        }
+        let elector = |t: &ThreadData| scored(t) && t.root_moves[0].depth == deepest;
+
         let min_score = self
             .threads
             .iter()
-            .filter(|t| t.completed_depth > 0 && !t.root_moves.is_empty())
+            .filter(|t| elector(t))
             .map(|t| t.root_moves[0].score)
             .min()
             .unwrap_or(-SCORE_INFINITE);
-
-        // Vote weight: score advantage (with +10 offset) × depth
-        let vote_value = |t: &ThreadData| -> i64 {
-            (t.root_moves[0].score as i64 - min_score as i64 + 10) * t.completed_depth as i64
-        };
+        let vote_value =
+            |t: &ThreadData| -> i64 { t.root_moves[0].score as i64 - min_score as i64 + 10 };
 
         // Aggregate votes per move via small Vec (max entries = thread count)
         let mut votes: Vec<(Move, i64)> = Vec::with_capacity(self.threads.len());
-        for t in &self.threads {
-            if t.completed_depth == 0 || t.root_moves.is_empty() {
-                continue;
-            }
+        for t in self.threads.iter().filter(|t| elector(t)) {
             let mv = t.root_moves[0].mv;
             if let Some(entry) = votes.iter_mut().find(|(m, _)| *m == mv) {
                 entry.1 += vote_value(t);
@@ -894,20 +1249,22 @@ impl ThreadPool {
                 votes.push((mv, vote_value(t)));
             }
         }
-
         let get_votes =
             |mv: Move| -> i64 { votes.iter().find(|(m, _)| *m == mv).map_or(0, |e| e.1) };
 
         let is_win = |s: i32| s >= SCORE_TB_WIN_IN_MAX;
         let is_loss = |s: i32| s != -SCORE_INFINITE && s <= -SCORE_TB_WIN_IN_MAX;
+        let decisive = |s: i32| is_win(s) || is_loss(s);
 
-        let mut best = 0usize;
-        for i in 1..self.threads.len() {
-            let ti = &self.threads[i];
-            if ti.completed_depth == 0 || ti.root_moves.is_empty() {
+        let mut best = self
+            .threads
+            .iter()
+            .position(|t| elector(t))
+            .expect("the deepest thread is an elector");
+        for (i, ti) in self.threads.iter().enumerate() {
+            if i == best || !scored(ti) {
                 continue;
             }
-
             let best_td = &self.threads[best];
             let best_score = best_td.root_moves[0].score;
             let this_score = ti.root_moves[0].score;
@@ -922,17 +1279,15 @@ impl ThreadPool {
                 if is_loss(this_score) && this_score < best_score {
                     best = i;
                 }
-            } else if is_win(this_score) || is_loss(this_score) {
-                // This thread found a decisive result, take it
+            } else if decisive(this_score) {
+                // A decisive result is exact whatever its depth: take it
                 best = i;
-            } else {
+            } else if elector(ti) {
                 // Normal: compare aggregated votes, tiebreak by vote_value × (pv_len > 2)
                 let best_mv_votes = get_votes(best_td.root_moves[0].mv);
                 let this_mv_votes = get_votes(ti.root_moves[0].mv);
-
                 let pv_filtered_value =
                     |t: &ThreadData| -> i64 { vote_value(t) * (t.root_moves[0].pv_len > 2) as i64 };
-
                 if this_mv_votes > best_mv_votes
                     || (this_mv_votes == best_mv_votes
                         && pv_filtered_value(ti) > pv_filtered_value(best_td))
@@ -970,11 +1325,35 @@ impl ThreadPool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_heartbeat_is_due_once_the_silence_reaches_the_interval() {
+        assert!(!heartbeat_due(999, 0, 1000));
+        assert!(heartbeat_due(1000, 0, 1000));
+        assert!(heartbeat_due(2500, 1200, 1000));
+        assert!(!heartbeat_due(2100, 1200, 1000));
+        assert!(heartbeat_due(5, u64::MAX, 1000) == false, "no overflow");
+    }
     use crate::types::Move;
 
     /// A quiet middlegame position: deep enough that a few thousand nodes settle
     /// nothing, so no thread can finish its work before spending its budget.
     const MIDGAME: &str = "r1bq1rk1/pp2ppbp/2np2p1/2n5/P3PP2/N1P2N2/1PB3PP/R1B1QRK1 b - - 0 1";
+
+    #[test]
+    fn current_line_snapshot_is_complete_and_clearable() {
+        let slot = CurrLineSlot::new();
+        let line = [
+            Move::new(Square::E2, Square::E4),
+            Move::new(Square::E7, Square::E5),
+            Move::new(Square::G1, Square::F3),
+        ];
+        assert!(slot.snapshot().is_none());
+        slot.publish(&line);
+        assert_eq!(slot.snapshot().unwrap().1, line);
+        slot.clear();
+        assert!(slot.snapshot().is_none());
+    }
 
     #[test]
     fn a_node_budget_divides_evenly_and_nothing_else_does() {
@@ -1086,5 +1465,120 @@ mod tests {
         let names: Vec<String> = td.root_moves.iter().map(|rm| rm.mv.to_uci()).collect();
         assert!(names.contains(&"e2e4".to_string()));
         assert!(names.contains(&"d2d4".to_string()));
+    }
+
+    #[test]
+    fn searchmoves_confines_the_actual_root_search() {
+        let pos = Position::from_fen_ex("r3k2r/8/8/8/8/8/8/R3K2R w AHah - 0 1", true).unwrap();
+        let only = crate::uci::parse_uci_move(&pos, "e1h1").expect("legal Chess960 castle");
+        let mut pool = ThreadPool::new(1, 4);
+        pool.threads[0].silent = true;
+        let (best, _) = pool.start_search_filtered(&pos, SearchLimits::depth(1), &[only]);
+        let rm = &pool.threads[0].root_moves[0];
+        assert_eq!(best, only);
+        assert!(rm.pv_len > 0, "the allowed move received no searched PV");
+        assert_eq!(rm.pv[0], only);
+        assert!(rm.depth > 0, "the allowed move was never scored");
+    }
+
+    #[test]
+    fn multipv_finishes_in_descending_score_order() {
+        let pos = Position::from_fen(STARTPOS).unwrap();
+        let mut pool = ThreadPool::new(1, 4);
+        pool.multi_pv = 3;
+        pool.threads[0].silent = true;
+        pool.start_search(&pos, SearchLimits::depth(5));
+        let lines = &pool.threads[0].root_moves[..3];
+        assert!(
+            lines.iter().all(|rm| rm.depth == 5),
+            "MultiPV lines not all from the last iteration: {:?}",
+            lines.iter().map(|rm| rm.depth).collect::<Vec<_>>()
+        );
+        assert!(
+            lines.windows(2).all(|pair| pair[0].score >= pair[1].score),
+            "MultiPV scores are not descending: {:?}",
+            lines.iter().map(|rm| rm.score).collect::<Vec<_>>()
+        );
+    }
+
+    /// Hand-filled pools for the election. The tester's game: the main thread had
+    /// finished depth 13 on b6a5 (−279) after publishing the refutation of b6b2,
+    /// two helpers still stood at depth 12 on b6b2 (+7) — and b6b2 was played.
+    #[test]
+    fn the_election_never_takes_a_shallower_stale_thread() {
+        let b6a5 = Move::new(crate::types::Square::B6, crate::types::Square::A5);
+        let b6b2 = Move::new(crate::types::Square::B6, crate::types::Square::B2);
+        let set = |td: &mut ThreadData, mv: Move, score: i32, depth: i32| {
+            let mut rm = RootMove::new(mv);
+            rm.score = score;
+            rm.depth = depth;
+            rm.pv_len = 4;
+            td.root_moves = vec![rm];
+            td.completed_depth = depth;
+        };
+        let mut pool = ThreadPool::new(3, 1);
+        set(&mut pool.threads[0], b6a5, -279, 13);
+        set(&mut pool.threads[1], b6b2, 7, 12);
+        set(&mut pool.threads[2], b6b2, 7, 12);
+        assert_eq!(pool.select_best_thread(), 0, "the deeper thread decides");
+
+        // The shallower threads are the deeper ones: they decide, by majority.
+        set(&mut pool.threads[0], b6a5, -279, 12);
+        set(&mut pool.threads[1], b6b2, 7, 13);
+        set(&mut pool.threads[2], b6b2, 7, 13);
+        assert_eq!(pool.select_best_thread(), 1);
+
+        // At equal depth the votes are score-weighted: a clearly better single
+        // score beats two mediocre ones, two close ones beat one.
+        set(&mut pool.threads[0], b6a5, 40, 13);
+        set(&mut pool.threads[1], b6b2, 7, 13);
+        set(&mut pool.threads[2], b6b2, 7, 13);
+        assert_eq!(pool.select_best_thread(), 0);
+        set(&mut pool.threads[0], b6a5, 20, 13);
+        set(&mut pool.threads[1], b6b2, 15, 13);
+        set(&mut pool.threads[2], b6b2, 15, 13);
+        assert_eq!(pool.select_best_thread(), 1);
+
+        // A completed mate is exact at any depth and beats the vote.
+        set(&mut pool.threads[0], b6a5, 40, 13);
+        set(&mut pool.threads[1], b6b2, 7, 13);
+        set(&mut pool.threads[2], b6b2, mate_in(9), 11);
+        assert_eq!(pool.select_best_thread(), 2);
+
+        // A thread that never scored a move is not a candidate.
+        set(&mut pool.threads[0], b6a5, 40, 13);
+        set(&mut pool.threads[1], b6b2, 7, 13);
+        pool.threads[2].root_moves = vec![RootMove::new(b6b2)];
+        pool.threads[2].completed_depth = 0;
+        assert_eq!(pool.select_best_thread(), 0);
+    }
+
+    /// A real four-thread search: the move handed back is the front move of the
+    /// elected thread, and that thread stands at the deepest completed iteration.
+    #[test]
+    fn the_elected_thread_stands_at_the_deepest_completed_iteration() {
+        let pos = Position::from_fen(
+            "r1bq1rk1/pp2bppp/2n1pn2/2pp4/3P4/2PBPN2/PP1N1PPP/R1BQ1RK1 w - - 0 8",
+        )
+        .unwrap();
+        let mut pool = ThreadPool::new(4, 16);
+        for td in &mut pool.threads {
+            td.silent = true;
+        }
+        let (best, _) = pool.start_search(&pos, SearchLimits::nodes(200_000));
+        let elected = &pool.threads[pool.last_best_idx];
+        assert_eq!(best, elected.root_moves[0].mv);
+        let deepest = pool
+            .threads
+            .iter()
+            .map(|t| t.root_moves[0].depth)
+            .max()
+            .unwrap();
+        assert!(
+            elected.root_moves[0].depth == deepest
+                || elected.root_moves[0].score.abs() >= SCORE_TB_WIN_IN_MAX,
+            "elected thread at depth {} while another completed {deepest}",
+            elected.root_moves[0].depth
+        );
     }
 }

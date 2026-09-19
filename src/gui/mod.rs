@@ -118,7 +118,11 @@ impl App {
         // Input is ignored while a screen is still arriving, so a held key cannot
         // fall through onto the screen behind it.
         let idle = Input::default();
-        let seen = if self.fade == Fade::None { input } else { &idle };
+        let seen = if self.fade == Fade::None {
+            input
+        } else {
+            &idle
+        };
         let done = match &mut self.scene {
             Scene::Menu(scene) => {
                 let started = scene.update(seen, sfx);
@@ -372,8 +376,7 @@ fn write_png(path: &str, fb: &Fb) {
 fn write_png(path: &str, fb: &Fb) {
     let mut bytes = vec![0u8; FB_W * FB_H * 4];
     fb.copy_to(&mut bytes);
-    let file = std::fs::File::create(path)
-        .unwrap_or_else(|e| panic!("cannot create {path}: {e}"));
+    let file = std::fs::File::create(path).unwrap_or_else(|e| panic!("cannot create {path}: {e}"));
     let mut enc = png::Encoder::new(std::io::BufWriter::new(file), FB_W as u32, FB_H as u32);
     enc.set_color(png::ColorType::Rgba);
     enc.set_depth(png::BitDepth::Eight);
@@ -454,22 +457,34 @@ fn capture_game(scene: &mut GameScene, shot: &Shot<'_>) -> Mouse {
     // Where the mouse is left for the closing ticks and the shot itself.
     let mut mouse = Mouse::default();
     for token in shot.clicks.split_whitespace() {
-        mouse = Mouse { at: Some(centre(scene, token, "--shot-clicks")), held: false };
+        mouse = Mouse {
+            at: Some(centre(scene, token, "--shot-clicks")),
+            held: false,
+        };
         scene.update(&mouse.pressing(), &mut Queue::default());
         scene.update(&mouse.resting(), &mut Queue::default());
         settle(scene, mouse);
     }
     if let Some(token) = shot.hover.split_whitespace().next() {
-        mouse = Mouse { at: Some(centre(scene, token, "--shot-hover")), held: false };
+        mouse = Mouse {
+            at: Some(centre(scene, token, "--shot-hover")),
+            held: false,
+        };
     }
-    for (flag, text, keep_hold) in [("--shot-drag", shot.drag, true), ("--shot-drop", shot.drop, false)] {
+    for (flag, text, keep_hold) in [
+        ("--shot-drag", shot.drag, true),
+        ("--shot-drop", shot.drop, false),
+    ] {
         let mut squares = text.split_whitespace();
         let (Some(from), Some(to)) = (squares.next(), squares.next()) else {
             continue;
         };
         // Pick the piece up where it stands, carry it, and either keep hold of it or
         // let go — which is what tells a legal drop from one that hops back.
-        mouse = Mouse { at: Some(centre(scene, from, flag)), held: true };
+        mouse = Mouse {
+            at: Some(centre(scene, from, flag)),
+            held: true,
+        };
         scene.update(&mouse.pressing(), &mut Queue::default());
         mouse.at = Some(centre(scene, to, flag));
         scene.update(&mouse.resting(), &mut Queue::default());
@@ -589,7 +604,9 @@ mod tests {
 
         // The board takes no orders until the opening parade has finished.
         for _ in 0..1200 {
-            let Scene::Game(scene) = &app.scene else { panic!("the game screen has gone") };
+            let Scene::Game(scene) = &app.scene else {
+                panic!("the game screen has gone")
+            };
             if !scene.animating() {
                 break;
             }
@@ -609,7 +626,10 @@ mod tests {
         confirm.confirm = true;
         app.update(&confirm, &mut sfx);
 
-        assert!(!app.config.sound, "the board turned it off and the application kept it");
+        assert!(
+            !app.config.sound,
+            "the board turned it off and the application kept it"
+        );
         assert!(
             !MenuScene::new(app.config).config.sound,
             "so the title screen it goes back to agrees"
@@ -626,19 +646,31 @@ mod tests {
         let mut sfx = Queue::default();
         let mut app = App::new();
         app.fade = Fade::None;
-        assert!(app.quit_requested(&input), "the title screen has nothing behind it");
+        assert!(
+            app.quit_requested(&input),
+            "the title screen has nothing behind it"
+        );
 
         app.fade = Fade::In;
-        assert!(!app.quit_requested(&input), "a screen still arriving eats the press");
+        assert!(
+            !app.quit_requested(&input),
+            "a screen still arriving eats the press"
+        );
         app.fade = Fade::None;
 
         if let Scene::Menu(menu) = &mut app.scene {
             menu.open_about(&mut sfx);
         }
-        assert!(!app.quit_requested(&input), "with about open, cancel closes that");
+        assert!(
+            !app.quit_requested(&input),
+            "with about open, cancel closes that"
+        );
 
         app.scene = Scene::Game(Box::new(GameScene::new(app.config)));
-        assert!(!app.quit_requested(&input), "in a game, cancel opens the menu");
+        assert!(
+            !app.quit_requested(&input),
+            "in a game, cancel opens the menu"
+        );
 
         input.cancel = false;
         app.scene = Scene::Menu(MenuScene::new(app.config));

@@ -18,7 +18,6 @@
 
 use crate::bitboard::*;
 use crate::types::*;
-use std::sync::OnceLock;
 
 // ============================================================
 // Direction deltas for ray generation (matching A1=0 convention)
@@ -34,7 +33,7 @@ const DIR_SOUTH_WEST: i8 = -9;
 const DIR_SOUTH_EAST: i8 = -7;
 
 // ============================================================
-// Table data — stored as plain arrays for Send+Sync compatibility
+// Table data — generated at compile time
 // Loaded into SIMD registers at call time via _mm256_loadu_si256
 // ============================================================
 
@@ -51,38 +50,21 @@ struct AvxTableData {
     rook_attacks_ew: [u8; 512],
 }
 
-// Safety: AvxTableData is only written once during init() and then read-only
-unsafe impl Send for AvxTableData {}
-unsafe impl Sync for AvxTableData {}
-
-static AVX_TABLES: OnceLock<AvxTableData> = OnceLock::new();
+static AVX_TABLES: AvxTableData = make_tables();
 
 // ============================================================
 // Initialization
 // ============================================================
 
-/// Initialize SIMD attack tables. Must be called before any SIMD attack function.
-/// Safe to call multiple times (OnceLock ensures single init).
-pub fn init() {
-    AVX_TABLES.get_or_init(|| {
-        let mut data = AvxTableData {
-            queen_mask_left: [[0i64; 4]; 64],
-            queen_mask_right: [[0i64; 4]; 64],
-            bishop_mask: [[0i64; 4]; 64],
-            rook_mask_ns: [[0i64; 2]; 64],
-            rook_attacks_ew: [0u8; 512],
-        };
-        init_tables(&mut data);
-        data
-    });
-}
+/// Kept as a no-op for callers that initialize every optional backend at startup.
+pub const fn init() {}
 
 /// Compute a single directional ray from a square (excluding the square itself).
 /// Returns all squares along the ray until the board edge.
-fn ray_mask(sq: u8, dir: i8) -> u64 {
+const fn ray_mask(sq: u8, dir: i8) -> u64 {
     let mut mask = 0u64;
     let mut s = sq as i8 + dir;
-    while (0..64).contains(&s) {
+    while s >= 0 && s < 64 {
         let file_diff = ((s & 7) - ((s - dir) & 7)).abs();
         if file_diff > 2 {
             break; // wrapped around a/h file
@@ -93,19 +75,27 @@ fn ray_mask(sq: u8, dir: i8) -> u64 {
     mask
 }
 
-fn init_tables(data: &mut AvxTableData) {
+const fn make_tables() -> AvxTableData {
+    let mut data = AvxTableData {
+        queen_mask_left: [[0i64; 4]; 64],
+        queen_mask_right: [[0i64; 4]; 64],
+        bishop_mask: [[0i64; 4]; 64],
+        rook_mask_ns: [[0i64; 2]; 64],
+        rook_attacks_ew: [0u8; 512],
+    };
     // "Left" = positive direction rays (towards higher bits for that direction)
     // CFish ordering: [East, North, NE, NW] for left, [West, South, SW, SE] for right
     let left_dirs = [DIR_EAST, DIR_NORTH, DIR_NORTH_EAST, DIR_NORTH_WEST];
     let right_dirs = [DIR_WEST, DIR_SOUTH, DIR_SOUTH_WEST, DIR_SOUTH_EAST];
 
-    for sq in 0u8..64 {
+    let mut sq = 0u8;
+    while sq < 64 {
         // Queen masks: left (positive) and right (negative) rays
-        for (i, &dir) in left_dirs.iter().enumerate() {
-            data.queen_mask_left[sq as usize][i] = ray_mask(sq, dir) as i64;
-        }
-        for (i, &dir) in right_dirs.iter().enumerate() {
-            data.queen_mask_right[sq as usize][i] = ray_mask(sq, dir) as i64;
+        let mut i = 0;
+        while i < 4 {
+            data.queen_mask_left[sq as usize][i] = ray_mask(sq, left_dirs[i]) as i64;
+            data.queen_mask_right[sq as usize][i] = ray_mask(sq, right_dirs[i]) as i64;
+            i += 1;
         }
 
         // Bishop masks for byte-swap trick:
@@ -115,10 +105,10 @@ fn init_tables(data: &mut AvxTableData) {
         // byte-swapped occupancy. The swaph2l fold step will un-flip the results.
         let flipped_sq = sq ^ 56; // flip_rank
         data.bishop_mask[sq as usize] = [
-            ray_mask(sq, DIR_NORTH_EAST) as i64,              // lane 0: NE (orig occ, normal coords)
-            ray_mask(flipped_sq, DIR_NORTH_WEST) as i64,      // lane 1: SW-as-NW-from-flip (swapped occ, flipped coords)
-            ray_mask(sq, DIR_NORTH_WEST) as i64,              // lane 2: NW (orig occ, normal coords)
-            ray_mask(flipped_sq, DIR_NORTH_EAST) as i64,      // lane 3: SE-as-NE-from-flip (swapped occ, flipped coords)
+            ray_mask(sq, DIR_NORTH_EAST) as i64, // lane 0: NE (orig occ, normal coords)
+            ray_mask(flipped_sq, DIR_NORTH_WEST) as i64, // lane 1: SW-as-NW-from-flip (swapped occ, flipped coords)
+            ray_mask(sq, DIR_NORTH_WEST) as i64,         // lane 2: NW (orig occ, normal coords)
+            ray_mask(flipped_sq, DIR_NORTH_EAST) as i64, // lane 3: SE-as-NE-from-flip (swapped occ, flipped coords)
         ];
 
         // Rook N/S masks for byte-swap trick:
@@ -130,18 +120,21 @@ fn init_tables(data: &mut AvxTableData) {
             ray_mask(sq, DIR_NORTH) as i64,
             ray_mask(flipped_sq, DIR_NORTH) as i64,
         ];
+        sq += 1;
     }
 
     // Rook E/W rank attack table
     // Indexed by: (inner_6bit_occ * 4 + file)
     // inner_6bit_occ = (rank_occupancy >> 1) & 0x3F, but CFish stores it as (occ & 0x7E)
     // which is the same bits just not shifted: index = (occ & 0x7E) * 4 + file
-    for occ8 in (0u8..128).step_by(2) {
+    let mut occ8 = 0u8;
+    while occ8 < 128 {
         // occ8 represents the inner 6 bits of rank occupancy (bits 1-6)
-        for file in 0u8..8 {
+        let mut file = 0u8;
+        while file < 8 {
             let mut att = 0u8;
             // Scan east
-            let mut s = (1u8 << file).checked_shl(1).unwrap_or(0);
+            let mut s = if file == 7 { 0 } else { 1u8 << (file + 1) };
             while s != 0 {
                 att |= s;
                 if occ8 & s != 0 {
@@ -159,23 +152,16 @@ fn init_tables(data: &mut AvxTableData) {
                 s >>= 1;
             }
             data.rook_attacks_ew[(occ8 as usize) * 4 + file as usize] = att;
+            file += 1;
         }
+        occ8 += 2;
     }
+    data
 }
 
 #[inline(always)]
 fn tables() -> &'static AvxTableData {
-    AVX_TABLES.get_or_init(|| {
-        let mut data = AvxTableData {
-            queen_mask_left: [[0i64; 4]; 64],
-            queen_mask_right: [[0i64; 4]; 64],
-            bishop_mask: [[0i64; 4]; 64],
-            rook_mask_ns: [[0i64; 2]; 64],
-            rook_attacks_ew: [0u8; 512],
-        };
-        init_tables(&mut data);
-        data
-    })
+    &AVX_TABLES
 }
 
 // ============================================================
@@ -307,10 +293,7 @@ mod avx512 {
 
     /// Compute aggregated attacks of ALL sliders of one color simultaneously.
     /// All 8 ray directions are processed in parallel in a single 512-bit register.
-    #[cfg_attr(
-        not(target_feature = "avx512f"),
-        target_feature(enable = "avx512f")
-    )]
+    #[cfg_attr(not(target_feature = "avx512f"), target_feature(enable = "avx512f"))]
     #[inline]
     pub unsafe fn slider_attacks_setwise(
         bishops: u64,
@@ -334,14 +317,14 @@ mod avx512 {
 
             // Directional masks to prevent wrap-around
             let masks = _mm512_set_epi64(
-                !RANK_8 as i64,                  // lane 7: south — wraps rank 1→8
-                !FILE_H as i64,                  // lane 6: west — wraps A→H
-                !FILE_A as i64,                  // lane 5: east — wraps H→A
-                !RANK_1 as i64,                  // lane 4: north — wraps rank 8→1
-                (!RANK_8 & !FILE_H) as i64,      // lane 3: soWe
-                (!RANK_8 & !FILE_A) as i64,      // lane 2: soEa
-                (!RANK_1 & !FILE_H) as i64,      // lane 1: noWe
-                (!RANK_1 & !FILE_A) as i64,      // lane 0: noEa
+                !RANK_8 as i64,             // lane 7: south — wraps rank 1→8
+                !FILE_H as i64,             // lane 6: west — wraps A→H
+                !FILE_A as i64,             // lane 5: east — wraps H→A
+                !RANK_1 as i64,             // lane 4: north — wraps rank 8→1
+                (!RANK_8 & !FILE_H) as i64, // lane 3: soWe
+                (!RANK_8 & !FILE_A) as i64, // lane 2: soEa
+                (!RANK_1 & !FILE_H) as i64, // lane 1: noWe
+                (!RANK_1 & !FILE_A) as i64, // lane 0: noEa
             );
 
             // Kogge-Stone parallel prefix fill
@@ -497,13 +480,12 @@ pub fn slider_attacks_setwise(bishops: u64, rooks: u64, queens: u64, occupied: u
 mod tests {
     use super::*;
 
-    fn magic_bishop(sq: Square, occupied: u64) -> u64 {
-        // Use the public dispatch function (routes to SIMD or magic internally)
-        crate::bitboard::bishop_attacks(sq, occupied)
+    fn reference_bishop(sq: Square, occupied: u64) -> u64 {
+        sliding_attack_otf(sq.0, occupied, &BISHOP_DELTAS)
     }
 
-    fn magic_rook(sq: Square, occupied: u64) -> u64 {
-        crate::bitboard::rook_attacks(sq, occupied)
+    fn reference_rook(sq: Square, occupied: u64) -> u64 {
+        sliding_attack_otf(sq.0, occupied, &ROOK_DELTAS)
     }
 
     #[test]
@@ -542,7 +524,7 @@ mod tests {
             let sq = Square(sq);
             for &occ in &test_occs {
                 let simd = bishop_attacks(sq, occ);
-                let magic = magic_bishop(sq, occ);
+                let magic = reference_bishop(sq, occ);
                 assert_eq!(
                     simd, magic,
                     "bishop_attacks mismatch at {}: simd={:#018x} magic={:#018x} occ={:#018x}",
@@ -567,7 +549,7 @@ mod tests {
             let sq = Square(sq);
             for &occ in &test_occs {
                 let simd = rook_attacks(sq, occ);
-                let magic = magic_rook(sq, occ);
+                let magic = reference_rook(sq, occ);
                 assert_eq!(
                     simd, magic,
                     "rook_attacks mismatch at {}: simd={:#018x} magic={:#018x} occ={:#018x}",
@@ -592,7 +574,7 @@ mod tests {
             let sq = Square(sq);
             for &occ in &test_occs {
                 let simd = queen_attacks(sq, occ);
-                let magic = magic_bishop(sq, occ) | magic_rook(sq, occ);
+                let magic = reference_bishop(sq, occ) | reference_rook(sq, occ);
                 assert_eq!(
                     simd, magic,
                     "queen_attacks mismatch at {}: simd={:#018x} magic={:#018x} occ={:#018x}",

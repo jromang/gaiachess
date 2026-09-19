@@ -107,8 +107,7 @@ pub struct NNUEParams {
 }
 
 /// Exact byte count of the network binary.
-pub const NNUE_FILE_SIZE: usize =
-    FT_SIZE * L1_SIZE * 2                              // ft_pst_weights: i16
+pub const NNUE_FILE_SIZE: usize = FT_SIZE * L1_SIZE * 2                              // ft_pst_weights: i16
     + THREAT_INPUT_SIZE * L1_SIZE                      // ft_threat_weights: i8
     + L1_SIZE * 2                                      // ft_biases: i16
     + FT_SIZE * OUTPUT_BUCKETS * 4                     // psqt_pst_weights: i32
@@ -118,9 +117,12 @@ pub const NNUE_FILE_SIZE: usize =
     + OUTPUT_BUCKETS * L3_SIZE * (2 * L2_SIZE) * 4    // l2_weights: f32
     + OUTPUT_BUCKETS * L3_SIZE * 4                     // l2_biases: f32
     + OUTPUT_BUCKETS * (L3_SIZE + 2 * L2_SIZE) * 4    // l3_weights: f32
-    + OUTPUT_BUCKETS * 4;                              // l3_biases: f32
+    + OUTPUT_BUCKETS * 4; // l3_biases: f32
 
-const _: () = assert!(NNUE_FILE_SIZE == 87_311_392, "NNUE_FILE_SIZE must be 87,311,392");
+const _: () = assert!(
+    NNUE_FILE_SIZE == 87_311_392,
+    "NNUE_FILE_SIZE must be 87,311,392"
+);
 
 impl NNUEParams {
     /// Allocate a zeroed network on the heap.
@@ -202,9 +204,8 @@ fn transform_fingerprint() -> u32 {
             repermute_row(&mut row, perm);
         }
         // SAFETY: reading an i16 array as its own bytes.
-        let bytes = unsafe {
-            std::slice::from_raw_parts(row.as_ptr() as *const u8, size_of_val(&row))
-        };
+        let bytes =
+            unsafe { std::slice::from_raw_parts(row.as_ptr() as *const u8, size_of_val(&row)) };
         super::integrity::fnv1a64(bytes) as u32
     })
 }
@@ -221,7 +222,10 @@ pub(crate) const LAYOUT_HASH: u32 = {
     h = h32(h, size_of::<NNUEParams>() as u32);
     h = h32(h, align_of::<NNUEParams>() as u32);
     h = h32(h, std::mem::offset_of!(NNUEParams, ft_pst_weights) as u32);
-    h = h32(h, std::mem::offset_of!(NNUEParams, ft_threat_weights) as u32);
+    h = h32(
+        h,
+        std::mem::offset_of!(NNUEParams, ft_threat_weights) as u32,
+    );
     h = h32(h, std::mem::offset_of!(NNUEParams, ft_biases) as u32);
     h = h32(h, std::mem::offset_of!(NNUEParams, l1_weights) as u32);
     h = h32(h, std::mem::offset_of!(NNUEParams, l1_biases) as u32);
@@ -316,7 +320,9 @@ fn target_perm() -> Option<&'static [usize]> {
 }
 
 fn repermute_ft(params: &mut NNUEParams) {
-    let Some(target_perm) = target_perm() else { return };
+    let Some(target_perm) = target_perm() else {
+        return;
+    };
     for row in params.ft_pst_weights.0.iter_mut() {
         repermute_row(row, target_perm);
     }
@@ -444,14 +450,20 @@ fn materialise(data: &[u8], content_hash: u64) -> &'static NNUEParams {
                     let mine = build_private(data);
                     // SAFETY: viewing one `NNUEParams` as its bytes.
                     let mine = unsafe {
-                        std::slice::from_raw_parts(mine.as_ref() as *const NNUEParams as *const u8, len)
+                        std::slice::from_raw_parts(
+                            mine.as_ref() as *const NNUEParams as *const u8,
+                            len,
+                        )
                     };
                     if mine != bytes {
                         crate::outerr!(
                             "info string NNUE network: shared image disagrees with this build, \
                              falling back to a private copy (bump IMAGE_FORMAT_VERSION)"
                         );
-                        return install_private(build_private(data), String::from("image mismatch"));
+                        return install_private(
+                            build_private(data),
+                            String::from("image mismatch"),
+                        );
                     }
                 }
 
@@ -522,8 +534,7 @@ pub fn params() -> &'static NNUEParams {
 /// `net_embedded` alone would claim a network on a `MODEL=`-but-no-`nnue` build,
 /// whose params are actually zeroed.
 pub fn has_network() -> bool {
-    !RUNTIME_PARAMS.load(Ordering::Relaxed).is_null()
-        || cfg!(all(feature = "nnue", net_embedded))
+    !RUNTIME_PARAMS.load(Ordering::Relaxed).is_null() || cfg!(all(feature = "nnue", net_embedded))
 }
 
 /// Decompress the embedded network and check it, yielding the file's bytes.
@@ -569,7 +580,9 @@ fn decompress_embedded() -> &'static NNUEParams {
 pub fn set_shared(enabled: bool) -> Result<NetBacking, String> {
     let policy = shared_policy();
     if !crate::shm::supported() {
-        return Err(String::from("sharing needs memfd and abstract sockets (Linux)"));
+        return Err(String::from(
+            "sharing needs memfd and abstract sockets (Linux)",
+        ));
     }
     if policy.load(Ordering::Relaxed) == enabled {
         return backing().ok_or_else(|| String::from("no network loaded yet"));
@@ -592,7 +605,10 @@ pub fn set_shared(enabled: bool) -> Result<NetBacking, String> {
     let params = materialise(&data, super::integrity::content_hash(&data));
     // The old backing is left where it is, for the reason given on
     // `load_from_bytes`: a search thread may be reading through it.
-    RUNTIME_PARAMS.store(params as *const NNUEParams as *mut NNUEParams, Ordering::Release);
+    RUNTIME_PARAMS.store(
+        params as *const NNUEParams as *mut NNUEParams,
+        Ordering::Release,
+    );
     backing().ok_or_else(|| String::from("no backing recorded"))
 }
 
@@ -632,7 +648,10 @@ pub fn load_from_bytes(data: &[u8]) -> Result<super::integrity::Provenance, Stri
     // The pointer is stored as mutable because that is what `AtomicPtr` holds,
     // but nothing ever writes through it: shared images are sealed read-only by
     // the kernel, and a private one is only written before it is published.
-    RUNTIME_PARAMS.store(params as *const NNUEParams as *mut NNUEParams, Ordering::Release);
+    RUNTIME_PARAMS.store(
+        params as *const NNUEParams as *mut NNUEParams,
+        Ordering::Release,
+    );
 
     // Increment generation so Finny table caches are invalidated.
     NETWORK_GENERATION.fetch_add(1, Ordering::Release);
@@ -695,7 +714,11 @@ mod tests {
     #[test]
     fn the_image_name_leaves_room_for_the_socket_decoration() {
         let name = super::image_name(0xffff_ffff_ffff_ffff);
-        assert!(name.len() <= 60, "image name is {} bytes: {name}", name.len());
+        assert!(
+            name.len() <= 60,
+            "image name is {} bytes: {name}",
+            name.len()
+        );
         assert!(!name.contains('\0'));
     }
 

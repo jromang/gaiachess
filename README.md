@@ -5,8 +5,6 @@ executable — and twenty levels of play, from a child's first game to a grandma
 
 ![The board mid-game: an Italian, the hand carrying the bishop to e6](docs/screenshot.png)
 
-> See also: [gaiachess.free.fr](http://gaiachess.free.fr/) — the original Gaia website
-
 **Gaia 4** is a complete rewrite from C to Rust — not a single line of the original code survived. Back after 20 years.
 
 ## Play in your browser
@@ -106,7 +104,7 @@ on a laptop as on a server.
 
 - **NNUE**: GaiaNet threat-feature architecture (12 king buckets × 768 PST + filtered threat features, ~41K inputs → 640 → CReLU+pairwise → 16 → 32 → 1), 8 output buckets, trained with [Bullet](https://github.com/jw1912/bullet) on self-play data
 - **SIMD**: runtime dispatch AVX-512+VNNI / AVX-512 / AVX2 / scalar — one binary, resolved from CPUID at startup (NEON on ARM)
-- **Movegen**: per-piece PEXT (BMI2) / AVX2 BLSMSK / magic; setwise AVX-512 Kogge-Stone / scalar — runtime-elected too, with PEXT skipped on the AMD generations that microcode it
+- **Movegen**: per-piece PEXT (BMI2) / AVX2 BLSMSK / magic on x86, Hyperbola Quintessence (`rbit`) on ARM64; setwise AVX-512 Kogge-Stone / scalar — runtime-elected too, with PEXT skipped on the AMD generations that microcode it
 
 ### UCI
 
@@ -155,13 +153,13 @@ The neural network and the GaiaTB tablebases are embedded — no external file n
 
 The first version of Gaia was born in June 2003, in a student apartment in Strasbourg. Back then, David Rabel and I were writing C code between classes, debugging with printf, and testing against Crafty on a single-core Pentium. We were young, we were clueless, we were having a blast.
 
-We released six versions in three years, entered a few French computer chess championships, and then... life happened. Studies, jobs, moving, family. Gaia 3.5 came out in June 2006, and then silence. For almost twenty years. I've since lost touch with David.
+We released six versions in three years, entered a few French computer chess championships, and then... life happened. Studies, jobs, moving, family. Gaia 3.5 came out in June 2006, and then silence. For almost twenty years.
 
 In the meantime, the chess programming world has changed beyond recognition. Neural networks went from science fiction to standard equipment. NNUE happened. Open-source engines reached superhuman strength and spawned an entire ecosystem. The [Chess Programming Wiki](https://www.chessprogramming.org/) turned into an incredible knowledge base. Rust appeared and made systems programming actually enjoyable. Tools like SPRT testing brought real statistical rigor to engine development. The community grew, shared, documented everything.
 
 Coming back to chess programming after all this time felt like waking up in the future. Everything I struggled with in 2003 now has a name, a wiki page, and a dozen open-source implementations to learn from. It's humbling and exhilarating at the same time.
 
-So I started over. From scratch. Alone, this time, but standing on the shoulders of an incredible community.
+So I started over. From scratch. Alone at first, standing on the shoulders of an incredible community. David has since rejoined — the same two authors as in 2003.
 
 ## Acknowledgements
 
@@ -228,4 +226,4 @@ The NNUE trainer lives in `trainer/` (see its `--help` for usage).
 
 Gaia is free software, distributed under the [GNU General Public License version 3](LICENSE) (or any later version at your option).
 
-© 2003–2026 Jean-François Romang
+© 2003–2026 Jean-François Romang, David Rabel

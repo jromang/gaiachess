@@ -16,6 +16,8 @@ pub const I16_LANES: usize = 32;
 pub const I32_LANES: usize = 16;
 /// Number of f32 elements per SIMD register.
 pub const F32_LANES: usize = 16;
+/// Emulated 512-bit dpbusd: one chain, same as AVX2.
+pub const DPBUSD_CHAINS: usize = 1;
 
 // ============================================================
 // i16 operations (accumulator, FT activation)
@@ -70,10 +72,7 @@ pub unsafe fn packus(a: __m512i, b: __m512i) -> __m512i {
 /// Fix lane interleaving after packus (AVX-512 crosses 128-bit lanes).
 #[inline(always)]
 pub unsafe fn permute(a: __m512i) -> __m512i {
-    _mm512_permutexvar_epi64(
-        _mm512_setr_epi64(0, 2, 4, 6, 1, 3, 5, 7),
-        a,
-    )
+    _mm512_permutexvar_epi64(_mm512_setr_epi64(0, 2, 4, 6, 1, 3, 5, 7), a)
 }
 
 /// Load I16_LANES (32) i8 values from `ptr` and sign-extend to i16.

@@ -21,11 +21,11 @@
 
 use std::sync::OnceLock;
 
+use crate::nnue::L1_SIZE;
 use crate::nnue::accumulator::Accumulator;
 use crate::nnue::forward::{self, NNZ_SIZE};
 use crate::nnue::kernels::{self, k_avx2, k_avx512, k_scalar, k_vnni512, threat512};
 use crate::nnue::network::{Aligned, PermKind};
-use crate::nnue::L1_SIZE;
 use crate::types::Color;
 
 // ============================================================
@@ -100,15 +100,13 @@ impl NnzKind {
 /// Function pointers into the resolved kernel instance, plus the metadata the
 /// loader (`perm`) and the `info` report need.
 pub struct CpuDispatch {
-    pub forward_dense:
-        unsafe fn(&Accumulator, &Aligned<[[i16; L1_SIZE]; 2]>, Color, usize) -> f32,
+    pub forward_dense: unsafe fn(&Accumulator, &Aligned<[[i16; L1_SIZE]; 2]>, Color, usize) -> f32,
     pub find_nnz: unsafe fn(&Aligned<[u8; L1_SIZE]>) -> ([u16; NNZ_SIZE], usize),
     pub acc_add1_sub1: unsafe fn(*const i16, *mut i16, usize, usize),
     pub acc_add1_sub2: unsafe fn(*const i16, *mut i16, usize, usize, usize),
     pub acc_add2_sub2: unsafe fn(*const i16, *mut i16, usize, usize, usize, usize),
     pub finny_apply: unsafe fn(*mut i16, &[usize], &[usize]),
-    pub threat_batch:
-        unsafe fn(*const i16, *mut i16, *const [i8; L1_SIZE], &[u32], &[u32]),
+    pub threat_batch: unsafe fn(*const i16, *mut i16, *const [i8; L1_SIZE], &[u32], &[u32]),
     pub tier: SimdTier,
     pub nnz: NnzKind,
     pub perm: PermKind,
@@ -142,7 +140,10 @@ pub fn get() -> &'static CpuDispatch {
     return DISPATCH.get_or_init(resolve);
     #[cfg(not(test))]
     unsafe {
-        debug_assert!(DISPATCH.get().is_some(), "cpu dispatch read before init_cpu_dispatch");
+        debug_assert!(
+            DISPATCH.get().is_some(),
+            "cpu dispatch read before init_cpu_dispatch"
+        );
         DISPATCH.get().unwrap_unchecked()
     }
 }
@@ -251,7 +252,11 @@ fn amd_vendor_and_slow_pext() -> (bool, bool) {
     let id1 = __cpuid(1);
     let base_family = (id1.eax >> 8) & 0xF;
     let ext_family = (id1.eax >> 20) & 0xFF;
-    let family = if base_family == 0xF { base_family + ext_family } else { base_family };
+    let family = if base_family == 0xF {
+        base_family + ext_family
+    } else {
+        base_family
+    };
     (true, family < 0x19)
 }
 
@@ -352,9 +357,7 @@ fn choose(
     // the dispatched binary (+1.2% NPS on Zen 5, 12/12 interleaved PGO runs —
     // plausibly the 850 KB PEXT tables against AVX2's 7.5 KB in a cache
     // already crowded by the network). Intel keeps PEXT, unmeasured here.
-    let pext_default = caps.bmi2
-        && !caps.amd_slow_pext
-        && !(caps.amd && static_avx2);
+    let pext_default = caps.bmi2 && !caps.amd_slow_pext && !(caps.amd && static_avx2);
     let (pext_on, pext_forced) = match pext_ov {
         Some(true) if caps.bmi2 => (true, true),
         Some(true) => (false, false),
@@ -392,7 +395,15 @@ fn resolve() -> CpuDispatch {
     if pext_ov == Some(true) && !caps.bmi2 {
         eprintln!("info string GAIA_PEXT=1 ignored: this CPU has no BMI2");
     }
-    let Selection { tier, nnz, perm, attacks, setwise512, forced, pext_forced } = choose(
+    let Selection {
+        tier,
+        nnz,
+        perm,
+        attacks,
+        setwise512,
+        forced,
+        pext_forced,
+    } = choose(
         caps,
         cap,
         pext_ov,
@@ -401,8 +412,10 @@ fn resolve() -> CpuDispatch {
     );
 
     let find_nnz = match nnz {
-        NnzKind::Compress512 => forward::find_nnz_compress512
-            as unsafe fn(&Aligned<[u8; L1_SIZE]>) -> ([u16; NNZ_SIZE], usize),
+        NnzKind::Compress512 => {
+            forward::find_nnz_compress512
+                as unsafe fn(&Aligned<[u8; L1_SIZE]>) -> ([u16; NNZ_SIZE], usize)
+        }
         NnzKind::Avx2Table => forward::find_nnz_avx2,
         NnzKind::Generic => k_scalar::find_nnz_generic,
     };
@@ -416,7 +429,13 @@ fn resolve() -> CpuDispatch {
             acc_add2_sub2: k_vnni512::acc_add2_sub2,
             finny_apply: k_vnni512::finny_apply,
             threat_batch: threat512::threat_batch,
-            tier, nnz, perm, attacks, setwise512, forced, pext_forced,
+            tier,
+            nnz,
+            perm,
+            attacks,
+            setwise512,
+            forced,
+            pext_forced,
         },
         SimdTier::Avx512 => CpuDispatch {
             forward_dense: k_avx512::forward_dense,
@@ -426,7 +445,13 @@ fn resolve() -> CpuDispatch {
             acc_add2_sub2: k_avx512::acc_add2_sub2,
             finny_apply: k_avx512::finny_apply,
             threat_batch: threat512::threat_batch,
-            tier, nnz, perm, attacks, setwise512, forced, pext_forced,
+            tier,
+            nnz,
+            perm,
+            attacks,
+            setwise512,
+            forced,
+            pext_forced,
         },
         SimdTier::Avx2 => CpuDispatch {
             forward_dense: k_avx2::forward_dense,
@@ -436,7 +461,13 @@ fn resolve() -> CpuDispatch {
             acc_add2_sub2: k_avx2::acc_add2_sub2,
             finny_apply: k_avx2::finny_apply,
             threat_batch: k_avx2::threat_batch,
-            tier, nnz, perm, attacks, setwise512, forced, pext_forced,
+            tier,
+            nnz,
+            perm,
+            attacks,
+            setwise512,
+            forced,
+            pext_forced,
         },
         SimdTier::Scalar => CpuDispatch {
             forward_dense: k_scalar::forward_dense,
@@ -446,7 +477,13 @@ fn resolve() -> CpuDispatch {
             acc_add2_sub2: k_scalar::acc_add2_sub2,
             finny_apply: k_scalar::finny_apply,
             threat_batch: k_scalar::threat_batch,
-            tier, nnz, perm, attacks, setwise512, forced, pext_forced,
+            tier,
+            nnz,
+            perm,
+            attacks,
+            setwise512,
+            forced,
+            pext_forced,
         },
     }
 }
@@ -459,12 +496,15 @@ fn resolve() -> CpuDispatch {
 mod tests {
     use super::*;
 
-    fn caps(
-        avx2: bool, fma: bool, f: bool, bw: bool, vl: bool, vnni: bool, vbmi2: bool,
-    ) -> Caps {
+    fn caps(avx2: bool, fma: bool, f: bool, bw: bool, vl: bool, vnni: bool, vbmi2: bool) -> Caps {
         Caps {
-            avx2, fma,
-            avx512f: f, avx512bw: bw, avx512vl: vl, avx512vnni: vnni, avx512vbmi2: vbmi2,
+            avx2,
+            fma,
+            avx512f: f,
+            avx512bw: bw,
+            avx512vl: vl,
+            avx512vnni: vnni,
+            avx512vbmi2: vbmi2,
             bmi2: avx2, // BMI2 ships with AVX2 on every real CPU; overridden where it matters
             amd: false,
             amd_slow_pext: false,
@@ -533,7 +573,13 @@ mod tests {
 
     #[test]
     fn a_cpu_without_avx2_falls_back_to_scalar_and_linear_weights() {
-        let s = choose(caps(false, false, false, false, false, false, false), None, None, false, false);
+        let s = choose(
+            caps(false, false, false, false, false, false, false),
+            None,
+            None,
+            false,
+            false,
+        );
         assert_eq!(s.tier, SimdTier::Scalar);
         assert_eq!(s.nnz, NnzKind::Generic);
         assert_eq!(s.perm, PermKind::Linear);

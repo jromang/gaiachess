@@ -74,7 +74,12 @@ pub const ZOBRIST: Zobrist = {
 
     let side = values[idx];
 
-    Zobrist { pieces, ep, castling, side }
+    Zobrist {
+        pieces,
+        ep,
+        castling,
+        side,
+    }
 };
 
 #[cfg(test)]

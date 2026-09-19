@@ -55,7 +55,9 @@ unsafe extern "system" {
 /// shell. Asked only after attaching: a console handle inherited from the launcher
 /// is only meaningful once we share that console.
 fn usable(handle: Handle) -> bool {
-    !handle.is_null() && handle != INVALID_HANDLE_VALUE && unsafe { GetFileType(handle) } != FILE_TYPE_UNKNOWN
+    !handle.is_null()
+        && handle != INVALID_HANDLE_VALUE
+        && unsafe { GetFileType(handle) } != FILE_TYPE_UNKNOWN
 }
 
 /// Whether anything could ever be read from stdin.
@@ -116,7 +118,10 @@ pub fn attach_parent_console() {
 /// `CONIN$` name the console we are attached to, so the fallback is a fresh handle to it
 /// rather than a copy of anything inherited.
 fn restore_or_bind(std_handle: u32, inherited: Handle, device: &CStr, access: u32) {
-    debug_assert_matches!(std_handle, STD_INPUT_HANDLE | STD_OUTPUT_HANDLE | STD_ERROR_HANDLE);
+    debug_assert_matches!(
+        std_handle,
+        STD_INPUT_HANDLE | STD_OUTPUT_HANDLE | STD_ERROR_HANDLE
+    );
     debug_assert!(access == GENERIC_READ || access == GENERIC_WRITE);
 
     if usable(inherited) {

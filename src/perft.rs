@@ -7,7 +7,7 @@
 
 use crate::movegen;
 use crate::position::Position;
-use crate::types::{ArrayBuf, Move, MAX_MOVES};
+use crate::types::{ArrayBuf, MAX_MOVES, Move};
 use std::time::Instant;
 
 /// Count all leaf nodes at `depth` in the move tree (bulk counting at depth 1).
@@ -34,11 +34,20 @@ pub fn perft(pos: &mut Position, depth: u32) -> u64 {
         pos.make_move(m);
         nodes += perft(pos, depth - 1);
         pos.unmake_move(m);
-        #[cfg(debug_assertions)] {
-            debug_assert_eq!(pos.key, key_before,
-                "perft: Zobrist key drift for {}", m.to_uci());
-            debug_assert_eq!(pos.pawn_key, pawn_key_before,
-                "perft: pawn_key drift for {}", m.to_uci());
+        #[cfg(debug_assertions)]
+        {
+            debug_assert_eq!(
+                pos.key,
+                key_before,
+                "perft: Zobrist key drift for {}",
+                m.to_uci()
+            );
+            debug_assert_eq!(
+                pos.pawn_key,
+                pawn_key_before,
+                "perft: pawn_key drift for {}",
+                m.to_uci()
+            );
         }
     }
     nodes
@@ -120,9 +129,8 @@ mod tests {
     fn perft_chess324_kaufman() {
         // Node counts filled from this implementation after the FRC encoding
         // change; Chess324 uses orthodox castling so they must match any engine.
-        let mut pos = Position::from_fen(
-            "rnqbknbr/pppppppp/8/8/8/8/PPPPPPPP/RNBBKNQR w KQkq - 0 1",
-        ).unwrap();
+        let mut pos =
+            Position::from_fen("rnqbknbr/pppppppp/8/8/8/8/PPPPPPPP/RNBBKNQR w KQkq - 0 1").unwrap();
         assert_eq!(perft(&mut pos, 1), 20);
         assert_eq!(perft(&mut pos, 2), 400);
         assert_eq!(perft(&mut pos, 3), 8998);
@@ -148,9 +156,8 @@ mod tests {
 
     #[test]
     fn perft_dfrc_asymmetric() {
-        let mut pos = Position::from_fen(
-            "nrkbnqbr/pppppppp/8/8/8/8/PPPPPPPP/BBNRKQNR w HDhb - 0 1",
-        ).unwrap();
+        let mut pos =
+            Position::from_fen("nrkbnqbr/pppppppp/8/8/8/8/PPPPPPPP/BBNRKQNR w HDhb - 0 1").unwrap();
         assert_eq!(perft(&mut pos, 1), 20);
         assert_eq!(perft(&mut pos, 2), 380);
         assert_eq!(perft(&mut pos, 3), 8544);
@@ -171,7 +178,9 @@ mod tests {
         let mut pos = Position::from_fen("4k3/8/8/8/8/8/8/6KR w K - 0 1").unwrap();
         let mut buf = crate::types::ArrayBuf::<crate::types::Move, 256>::new();
         let n = movegen::generate_legal_moves(&pos, &mut buf);
-        let castle = (0..n).map(|i| buf[i]).find(|m| m.move_type() == MT_CASTLING);
+        let castle = (0..n)
+            .map(|i| buf[i])
+            .find(|m| m.move_type() == MT_CASTLING);
         let m = castle.expect("O-O with king already on g1");
         assert_eq!(m.from_sq(), Square::G1);
         assert_eq!(m.to_sq(), Square::H1);
@@ -191,7 +200,9 @@ mod tests {
         let mut pos = Position::from_fen("4k3/8/8/8/8/8/8/5KR1 w K - 0 1").unwrap();
         let mut buf = crate::types::ArrayBuf::<crate::types::Move, 256>::new();
         let n = movegen::generate_legal_moves(&pos, &mut buf);
-        let m = (0..n).map(|i| buf[i]).find(|mv| mv.move_type() == MT_CASTLING)
+        let m = (0..n)
+            .map(|i| buf[i])
+            .find(|mv| mv.move_type() == MT_CASTLING)
             .expect("O-O as a king/rook swap");
         assert_eq!(m.from_sq(), Square::F1);
         assert_eq!(m.to_sq(), Square::G1);
@@ -208,7 +219,9 @@ mod tests {
         let mut pos = Position::from_fen("4k3/8/8/8/8/8/8/4KR2 w K - 0 1").unwrap();
         let mut buf = crate::types::ArrayBuf::<crate::types::Move, 256>::new();
         let n = movegen::generate_legal_moves(&pos, &mut buf);
-        let m = (0..n).map(|i| buf[i]).find(|mv| mv.move_type() == MT_CASTLING)
+        let m = (0..n)
+            .map(|i| buf[i])
+            .find(|mv| mv.move_type() == MT_CASTLING)
             .expect("O-O with rook on f1");
         assert_eq!(m.to_sq(), Square::F1);
         assert_eq!(m.to_uci(), "e1g1");
@@ -232,7 +245,10 @@ mod tests {
         let pos = Position::from_fen("4k3/8/8/8/8/5r2/8/R3K2R w KQ - 0 1").unwrap();
         let mut buf = crate::types::ArrayBuf::<crate::types::Move, 256>::new();
         let n = movegen::generate_legal_moves(&pos, &mut buf);
-        let castles: Vec<_> = (0..n).map(|i| buf[i]).filter(|m| m.move_type() == MT_CASTLING).collect();
+        let castles: Vec<_> = (0..n)
+            .map(|i| buf[i])
+            .filter(|m| m.move_type() == MT_CASTLING)
+            .collect();
         assert_eq!(castles.len(), 1, "only O-O-O should survive");
         assert_eq!(castles[0].castle_king_to(), Square::C1);
     }
@@ -254,7 +270,8 @@ mod tests {
         assert_eq!(pos.castle_rook_sq(crate::types::WHITE_OO), Square::F1);
         let mut buf = crate::types::ArrayBuf::<crate::types::Move, 256>::new();
         let n = movegen::generate_legal_moves(&pos, &mut buf);
-        let m = (0..n).map(|i| buf[i])
+        let m = (0..n)
+            .map(|i| buf[i])
             .find(|m| m.from_sq() == Square::G3 && m.to_sq() == Square::H1)
             .expect("Ng3xh1");
         pos.make_move(m);
@@ -263,19 +280,29 @@ mod tests {
 
     #[test]
     fn uci_castling_standard_vs_960() {
-        let pos = Position::from_fen(
-            "r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1",
-        ).unwrap();
+        let pos = Position::from_fen("r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1").unwrap();
         let mut buf = crate::types::ArrayBuf::<crate::types::Move, 256>::new();
         let n = movegen::generate_legal_moves(&pos, &mut buf);
-        let oo = (0..n).map(|i| buf[i]).find(|m| m.move_type() == MT_CASTLING && m.castle_king_to() == Square::G1)
+        let oo = (0..n)
+            .map(|i| buf[i])
+            .find(|m| m.move_type() == MT_CASTLING && m.castle_king_to() == Square::G1)
             .unwrap();
         assert_eq!(oo.to_uci(), "e1g1");
         assert_eq!(oo.to_uci_960(true), "e1h1");
-        assert!(crate::uci::parse_uci_move(&pos, "e1g1").unwrap().move_type() == MT_CASTLING);
+        assert!(
+            crate::uci::parse_uci_move(&pos, "e1g1")
+                .unwrap()
+                .move_type()
+                == MT_CASTLING
+        );
         let mut pos960 = pos.clone();
         pos960.set_chess960(true);
-        assert!(crate::uci::parse_uci_move(&pos960, "e1h1").unwrap().move_type() == MT_CASTLING);
+        assert!(
+            crate::uci::parse_uci_move(&pos960, "e1h1")
+                .unwrap()
+                .move_type()
+                == MT_CASTLING
+        );
         // Two squares is not a king walk: without the standard rewrite, e1g1 is nothing.
         assert!(crate::uci::parse_uci_move(&pos960, "e1g1").is_none());
     }

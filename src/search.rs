@@ -18,10 +18,36 @@ use crate::position::Position;
 use crate::skill;
 use crate::stats::st;
 use crate::threads::{PONDER, SS_OFFSET, SharedState, ThreadData};
+use crate::timeman::{
+    TM_EFFORT_MUL, TM_EFFORT_THRESHOLD, TM_FALL_BASE, TM_FALL_ITER, TM_FALL_MAX, TM_FALL_MIN,
+    TM_FALL_PREV, TM_FORCED_MOVE_MS, TM_INSTABILITY_BASE, TM_INSTABILITY_MUL, TM_REDUCTION_BASE,
+    TM_REDUCTION_DIV, TM_STABLE_BASE, TM_STABLE_CENTER, TM_STABLE_OFFSET, TM_STABLE_SLOPE,
+    TM_STABLE_SPAN,
+};
 use crate::tree::{tr, tree_ret};
 use crate::tt::Bound;
 use crate::tune;
 use crate::types::*;
+
+/// Mate hunt (`ThreadData::seek_mate`): from this iteration on, a root value
+/// of at least `SEEK_MATE_SCORE` (about five pawns: 2000 in the reference
+/// engines' units, whose pawn is ~385, is 2400 in ours at 458) means the
+/// search is refining a forced line. Singular extensions are then off,
+/// reverse futility pruning is limited to `SEEK_MATE_RFP_DEPTH` plies, a
+/// late-move reduction never turns into an extension, and a reduced move
+/// that fails high is re-searched at its nominal depth, not deeper.
+///
+/// The hunt starts at iteration 8, not 16 as in the reference form: it is
+/// meant to catch the search *before* it stalls, and in a decided endgame
+/// the stall sets in at depth 11-15. From then on every iteration is one
+/// forced line the losing side stretches towards the 50-move horizon —
+/// saturated histories make the reductions negative, the re-search adds a
+/// ply on top, and the tree lives at ply 60-126 (issue #21: three quarters
+/// of a depth-15 search beyond ply 60, iteration never completed; with the
+/// hunt armed, seldepth 28 and the mate found).
+const SEEK_MATE_MIN_DEPTH: i32 = 8;
+const SEEK_MATE_SCORE: i32 = 2400;
+const SEEK_MATE_RFP_DEPTH: i32 = 5;
 
 /// Compile-time node type dispatch via marker types.
 /// Eliminates runtime `ply == 0` checks and allows the compiler to
@@ -274,9 +300,30 @@ fn wdl_suffix(score: i32, pos: &Position, show: bool) -> String {
 /// by replaying DTZ probes position-by-position, choosing the move with best DTZ rank.
 /// Tie-breaks minimize opponent mobility.
 ///
+/// Capped at half a move-overhead per MultiPV line when a clock is running: the
+/// walk is display-only and must not eat the move. Without DTZ the extension
+/// cannot make progress toward mate, so it stops after validating the search PV.
+///
 /// The position is left unchanged (all moves are undone at the end).
 #[cfg(feature = "syzygy")]
-fn syzygy_extend_pv(pos: &mut Position, rm: &mut crate::threads::RootMove) {
+fn syzygy_extend_pv(
+    pos: &mut Position,
+    rm: &mut crate::threads::RootMove,
+    has_clock: bool,
+    multi_pv: usize,
+) {
+    debug_assert!(rm.pv_len > 0, "TB PV extension needs the root move");
+    debug_assert!(multi_pv > 0, "multi_pv {multi_pv} must be positive");
+
+    let started = crate::time::Instant::now();
+    let abort = || -> bool {
+        has_clock
+            && 2 * multi_pv as u128 * started.elapsed().as_millis() >= tune::MOVE_OVERHEAD() as u128
+    };
+    if abort() {
+        return;
+    }
+
     // Step 0: play the root move
     pos.make_move(rm.pv[0]);
     let mut ply = 1;
@@ -304,18 +351,23 @@ fn syzygy_extend_pv(pos: &mut Position, rm: &mut crate::threads::RootMove) {
             ply -= 1;
             break;
         }
+        if abort() {
+            break;
+        }
     }
     rm.pv_len = ply;
 
     // Step 2: extend PV via successive DTZ probes
     loop {
-        if pos.draw_by_fifty_move_rule() {
+        if abort() || pos.draw_by_fifty_move_rule() {
             break;
         }
-        let Some((ranked, _dtz)) = crate::tb::rank_root_moves(pos) else {
+        let Some((ranked, dtz)) = crate::tb::rank_root_moves(pos) else {
             break;
         };
-        if ranked.is_empty() {
+        // WDL ranks a win but does not point at mate. Walking it can loop until
+        // MAX_PLY on a seven-piece WDL-only root.
+        if !dtz || ranked.is_empty() {
             break;
         }
         let mut legal_buf = ArrayBuf::<Move, MAX_MOVES>::new();
@@ -374,11 +426,17 @@ fn syzygy_extend_pv(pos: &mut Position, rm: &mut crate::threads::RootMove) {
     for i in (0..ply).rev() {
         pos.unmake_move(rm.pv[i]);
     }
+
+    if abort() {
+        out!(
+            "info string Syzygy based PV extension requires more time, increase Move Overhead as needed."
+        );
+    }
 }
 
 /// Print UCI info lines for all PV lines at the current depth.
-fn print_multi_pv_info(td: &ThreadData, shared: &SharedState, depth: i32, multi_pv: usize) {
-    let elapsed = td.tm.elapsed_ms().max(1);
+pub(crate) fn print_multi_pv_info(td: &ThreadData, shared: &SharedState, multi_pv: usize) {
+    let elapsed = td.tm.total_elapsed_ms().max(1);
     // With helpers running, the shared counter (to the nearest 512 per thread) is the
     // search's total; alone, the thread's own count is exact and never smaller.
     let nodes = td
@@ -386,15 +444,15 @@ fn print_multi_pv_info(td: &ThreadData, shared: &SharedState, depth: i32, multi_
         .max(crate::threads::NODES_SEARCHED.load(std::sync::atomic::Ordering::Relaxed));
     let nps = nodes * 1000 / elapsed;
     let hashfull = shared.tt.hashfull();
+    let cpuload = shared.cpu_load(td.thread_count);
 
     for (i, rm) in td.root_moves[..multi_pv].iter().enumerate() {
-        // Use previous_score if current depth was interrupted before this PV was searched.
-        // When root_in_tb, the DTZ-best move might not be the search-best move, so
+        // Each line is reported at the depth its score comes from: a line the
+        // current iteration did not reach keeps the depth that scored it. When
+        // root_in_tb, the DTZ-best move might not be the search-best move, so
         // fall back to tb_score for display.
-        let search_score = if rm.score != -SCORE_INFINITE {
-            Some((rm.score, depth))
-        } else if rm.previous_score != -SCORE_INFINITE {
-            Some((rm.previous_score, (depth - 1).max(1)))
+        let search_score = if rm.depth > 0 {
+            Some((rm.score, rm.depth))
         } else {
             None
         };
@@ -412,7 +470,7 @@ fn print_multi_pv_info(td: &ThreadData, shared: &SharedState, depth: i32, multi_
                 (s, d)
             }
         } else if use_tb {
-            (rm.tb_score, depth)
+            (rm.tb_score, td.completed_depth.max(1))
         } else {
             continue;
         };
@@ -430,6 +488,7 @@ fn print_multi_pv_info(td: &ThreadData, shared: &SharedState, depth: i32, multi_
             &wdl,
             nodes,
             nps,
+            cpuload,
             hashfull,
             elapsed,
         );
@@ -448,6 +507,7 @@ fn print_one_pv(
     wdl: &str,
     nodes: u64,
     nps: u64,
+    cpuload: Option<u32>,
     hashfull: usize,
     elapsed: u64,
 ) {
@@ -460,10 +520,23 @@ fn print_one_pv(
     }
 
     // Always emit multipv: ChessBase indexes analysis lines by it, even at 1.
+    let cpuload = cpuload.map_or_else(String::new, |load| format!(" cpuload {load}"));
     out!(
-        "info depth {depth} seldepth {sel_depth} multipv {multipv} score {score_str}{bound}{wdl} nodes {nodes} nps {nps} hashfull {hashfull} tbhits {} time {elapsed} pv {pv_str}",
+        "info depth {depth} seldepth {sel_depth} multipv {multipv} score {score_str}{bound}{wdl} nodes {nodes} nps {nps}{cpuload} hashfull {hashfull} tbhits {} time {elapsed} pv {pv_str}",
         td.tb_hits,
     );
+    crate::threads::note_output(elapsed);
+}
+
+fn print_refutations(td: &ThreadData) {
+    for rm in td.root_moves.iter().skip(1) {
+        let moves = rm.refutation[..rm.refutation_len]
+            .iter()
+            .map(|mv| mv.to_uci_960(td.pos.chess960))
+            .collect::<Vec<_>>()
+            .join(" ");
+        out!("info refutation {moves}");
+    }
 }
 
 /// Print the partial line of an aspiration fail-high or fail-low.
@@ -476,11 +549,29 @@ fn print_one_pv(
 ///
 /// A fail-low has no new line to show: no move raised alpha, so the best move known is
 /// still the one at the front, and only its score has become an upper bound.
-fn print_bound_line(td: &ThreadData, shared: &SharedState, depth: i32, score: i32, fail_high: bool) {
+fn print_bound_line(
+    td: &ThreadData,
+    shared: &SharedState,
+    depth: i32,
+    score: i32,
+    fail_high: bool,
+) {
     if td.root_moves.is_empty() {
         return;
     }
-    let elapsed = td.tm.elapsed_ms().max(1);
+    // Aspiration bounds are centipawn windows. On a TB win/loss the GUI (Fritz)
+    // treats them as the eval, so the display flickers +2 / +200. Exact `info`
+    // already publishes tb_score; skip the transient bound.
+    #[cfg(feature = "syzygy")]
+    if td.tb_config.root_in_tb
+        && td
+            .root_moves
+            .get(td.pv_index)
+            .is_some_and(|rm| rm.tb_score != 0)
+    {
+        return;
+    }
+    let elapsed = td.tm.total_elapsed_ms().max(1);
     let nodes = td
         .nodes
         .max(crate::threads::NODES_SEARCHED.load(std::sync::atomic::Ordering::Relaxed));
@@ -504,10 +595,15 @@ fn print_bound_line(td: &ThreadData, shared: &SharedState, depth: i32, score: i3
         idx + 1,
         depth,
         &format_score(score, &td.pos, crate::uci::normalize_score()),
-        if fail_high { " lowerbound" } else { " upperbound" },
+        if fail_high {
+            " lowerbound"
+        } else {
+            " upperbound"
+        },
         &wdl_suffix(score, &td.pos, crate::uci::show_wdl()),
         nodes,
         nps,
+        shared.cpu_load(td.thread_count),
         shared.tt.hashfull(),
         elapsed,
     );
@@ -545,7 +641,14 @@ pub fn search(td: &mut ThreadData, shared: &SharedState) {
         return;
     }
 
-    let max_depth = td.tm.max_depth().min(MAX_PLY as i32);
+    let requested_max_depth = td.tm.max_depth().min(MAX_PLY as i32);
+    // Search past an otherwise binding depth limit while pondering. Once ponderhit
+    // arrives, the first completed iteration at or beyond the requested depth returns.
+    let max_depth = if td.pondering {
+        MAX_PLY as i32
+    } else {
+        requested_max_depth
+    };
 
     // Syzygy root move ranking.
     // Tries DTZ first (precise, 50-move aware), then WDL fallback.
@@ -565,22 +668,61 @@ pub fn search(td: &mut ThreadData, shared: &SharedState) {
         }
         // Sort by DTZ rank descending (best move first)
         td.root_moves.sort_by(|a, b| b.tb_rank.cmp(&a.tb_rank));
-        // Two reasons not to probe in the tree: DTZ has already ranked the root,
-        // or we are losing anyway and probing cannot change that. Otherwise probe
-        // at max_pieces cardinality.
+        // DTZ at the root, or a loss/draw: nothing in-tree will change the result.
+        // A WDL-only win used to probe at TB_LARGEST (7 with 7WDL loaded). Every
+        // node of a 7-piece tree is then a WDL hit that does not distinguish
+        // winning moves, and analysis can stall for tens of seconds with no
+        // `info` line. Probe one cardinality below, where DTZ usually lives, so
+        // a capture into 6-piece still sees the tables.
         let losing = ranked.first().is_some_and(|(_, _, s)| *s <= 0);
         td.tb_config.cardinality = if dtz_available || losing {
             0
         } else {
-            crate::tb::max_pieces()
+            let cap = crate::tb::max_pieces().saturating_sub(1);
+            debug_assert!(
+                cap < crate::tb::max_pieces() || crate::tb::max_pieces() <= 1,
+                "WDL-only in-tree cardinality {cap} must be below TB_LARGEST {}",
+                crate::tb::max_pieces()
+            );
+            cap
         };
     }
 
     // Follow-PV guard: reset the PV recorded from the previous iteration
     td.last_iteration_pv_len = 0;
 
+    // Time management state, alive for the whole search. Fed on every iteration,
+    // pondering included — only the stop test is suspended there — so the first
+    // iteration after a ponderhit already has a rescaled bound to answer to.
+    let mut time_reduction = 1.0f64;
+    let mut tot_best_move_changes = 0.0f64;
+    let mut last_best_move_depth = 0i32;
+    // Not seeded from `td.best_move`: `prepare_search` preloads that with the
+    // first legal move, and depth 1 would then look like a move that never
+    // changed even when it did.
+    let mut prev_best_move = Move::NONE;
+    // Scores of the last four iterations, seeded from the move just played so the
+    // first iteration already has something to fall from. Zero where there is
+    // nothing to compare to.
+    let seed = if known_score(td.best_previous_score) {
+        td.best_previous_score
+    } else {
+        0
+    };
+    let mut iter_value = [seed; 4];
+    let mut iter_idx = 0usize;
+    if is_main {
+        shared
+            .best_move_changes
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
     'id: for depth in 1..=max_depth {
         td.root_depth = depth;
+
+        // Age out root instability: a change three iterations ago says less about
+        // this position than a change in the last one.
+        tot_best_move_changes /= 2.0;
 
         // Multi-PV: full root search for each requested principal variation.
         // Each PV line gets its own aspiration window centered on its running average.
@@ -617,7 +759,14 @@ pub fn search(td: &mut ThreadData, shared: &SharedState) {
             let mut delta = tune::ASP_INITIAL_DELTA();
             debug_assert!(delta > 0, "aspiration: initial delta {} <= 0", delta);
 
-            if depth >= tune::ASP_MIN_DEPTH() && prev_avg != SCORE_NONE {
+            // No window once the score has left the evaluation range: a mate
+            // or tablebase score moves by plies, not by centipawns, and the
+            // running average of such a score with the evaluations before it
+            // is a number in no man's land — a window centred there fails on
+            // every retry and each failure stores its ghost bound in the table
+            // (issue #21: `lowerbound -13293` at the root of a lost endgame).
+            if depth >= tune::ASP_MIN_DEPTH() && prev_avg != SCORE_NONE && !is_beyond_eval(prev_avg)
+            {
                 delta += prev_avg.abs() / tune::ASP_SCORE_DIV();
                 alpha = (prev_avg - delta).max(-SCORE_INFINITE);
                 beta = (prev_avg + delta).min(SCORE_INFINITE);
@@ -634,7 +783,16 @@ pub fn search(td: &mut ThreadData, shared: &SharedState) {
             // Aspiration retry loop
             let score;
             let mut failed_high_cnt = 0i32;
+            // The root value as the mate hunt sees it: the last completed
+            // iteration, then the fail-soft return of each retry — a fail-low
+            // spiral toward a forced loss switches the hunt on before the window
+            // has caught up with the score.
+            let mut root_value = td.root_moves[pv_idx].score;
             loop {
+                td.seek_mate = depth >= SEEK_MATE_MIN_DEPTH
+                    && root_value != -SCORE_INFINITE
+                    && root_value != SCORE_NONE
+                    && root_value.abs() >= SEEK_MATE_SCORE;
                 // Reduce depth on repeated fail-highs
                 let adjusted_depth = (depth - failed_high_cnt).max(1);
                 td.root_delta = (beta - alpha).max(1);
@@ -646,6 +804,20 @@ pub fn search(td: &mut ThreadData, shared: &SharedState) {
                     break;
                 }
 
+                root_value = s;
+                // The score has left the evaluation range: a window is
+                // pointless, and halving one edge towards a decisive other
+                // edge would put a bound in no man's land — every cutoff
+                // under it then returns a blend of an evaluation and a proof.
+                if is_beyond_eval(s) && (s <= alpha || s >= beta) {
+                    if reports {
+                        print_bound_line(td, shared, depth, s, s >= beta);
+                    }
+                    alpha = -SCORE_INFINITE;
+                    beta = SCORE_INFINITE;
+                    failed_high_cnt = 0;
+                    continue;
+                }
                 if s <= alpha {
                     st!(td, st_, st_.asp_fail_low += 1;);
                     if reports {
@@ -681,8 +853,9 @@ pub fn search(td: &mut ThreadData, shared: &SharedState) {
             }
 
             // Find the root move that alpha_beta selected as best (td.pv[0][0])
-            // and update its score, PV, and running average. Other root moves keep
-            // score = -SCORE_INFINITE. Stable sort then brings the winner to root_moves[pv_idx].
+            // and update its score, depth, PV, and running average. Other root moves
+            // keep the score and depth of the iteration that last chose them; the
+            // sort by depth then brings the winner to root_moves[pv_idx].
             let pv_len = td.pv_len[0];
             if pv_len > 0 {
                 let best_mv = td.pv[0][0];
@@ -690,12 +863,24 @@ pub fn search(td: &mut ThreadData, shared: &SharedState) {
                     .iter_mut()
                     .find(|rm| rm.mv == best_mv)
                 {
+                    debug_assert!(
+                        depth > rm.depth || pv_idx > 0,
+                        "a line scored twice at one depth"
+                    );
+                    rm.previous_score = rm.score;
                     rm.score = score;
+                    rm.depth = depth;
                     rm.pv[..pv_len].copy_from_slice(&td.pv[0][..pv_len]);
                     rm.pv_len = pv_len;
                     rm.sel_depth = td.seldepth;
                     // Update running average on the winning move
-                    rm.avg_score = if rm.avg_score == SCORE_NONE {
+                    // A decisive score is not averaged with evaluations, nor
+                    // evaluations with it: the midpoint would centre the next
+                    // window in no man's land (issue #21).
+                    rm.avg_score = if rm.avg_score == SCORE_NONE
+                        || is_beyond_eval(score)
+                        || is_beyond_eval(rm.avg_score)
+                    {
                         score
                     } else {
                         (rm.avg_score + score) / 2
@@ -703,9 +888,9 @@ pub fn search(td: &mut ThreadData, shared: &SharedState) {
                 }
             }
 
-            // Sort root_moves[pv_idx..sort_end] by score descending.
-            // Only the winner has a real score; all others are -SCORE_INFINITE.
-            // Stable sort preserves order among ties.
+            // Sort root_moves[pv_idx..sort_end] by depth then score, descending: the
+            // move just scored comes first, older winners keep their rank, and the
+            // moves never scored stay behind. Stable sort preserves order among ties.
             //
             // When root_in_tb, limit sort to moves with the SAME tb_rank as the
             // current PV move. This lets the
@@ -724,13 +909,28 @@ pub fn search(td: &mut ThreadData, shared: &SharedState) {
             #[cfg(not(feature = "syzygy"))]
             let sort_end = tb_group_end;
 
-            td.root_moves[pv_idx..sort_end].sort_by(|a, b| b.score.cmp(&a.score));
+            td.root_moves[pv_idx..sort_end]
+                .sort_by(|a, b| b.depth.cmp(&a.depth).then_with(|| b.score.cmp(&a.score)));
         }
 
         // Abort if stopped mid-search
         if td.should_stop() && td.best_move != Move::NONE {
             break;
         }
+
+        // Separate root searches can disagree slightly because their histories and TT
+        // state evolve between PVs. The wire contract is simpler: multipv 1 is the
+        // highest reported score, followed by the remaining lines in score order.
+        #[cfg(feature = "syzygy")]
+        td.root_moves[..multi_pv].sort_by(|a, b| {
+            b.tb_rank
+                .cmp(&a.tb_rank)
+                .then_with(|| b.depth.cmp(&a.depth))
+                .then_with(|| b.score.cmp(&a.score))
+        });
+        #[cfg(not(feature = "syzygy"))]
+        td.root_moves[..multi_pv]
+            .sort_by(|a, b| b.depth.cmp(&a.depth).then_with(|| b.score.cmp(&a.score)));
 
         // Best move from top root move
         if !td.root_moves.is_empty() {
@@ -744,44 +944,72 @@ pub fn search(td: &mut ThreadData, shared: &SharedState) {
                 .copy_from_slice(&td.root_moves[0].pv[..td.last_iteration_pv_len]);
         }
 
-        // Best move + score stability tracking for time management.
-        // Adjusts the soft limit so the engine thinks longer when the best move
-        // is unstable or the score is dropping, and shorter when both are stable.
+        // Time management: rescale what this move was expected to cost by how much
+        // the position is still moving underneath it. A best move that keeps
+        // changing, a score that is falling, a tree still spread over several root
+        // moves all buy time; a root that has settled gives it back.
         //
         // Reference: CPW — Search Progression § Soft bound (best move stability, eval stability)
-        if td.best_move == td.prev_best_move {
-            td.bm_stability = (td.bm_stability + 1).min(tune::TM_BM_MAX());
-        } else {
-            td.bm_stability = 0;
+        if td.best_move != prev_best_move {
+            last_best_move_depth = depth;
         }
-        td.prev_best_move = td.best_move;
+        prev_best_move = td.best_move;
 
-        if is_main && !td.pondering {
-            let bm_mul =
-                (tune::TM_BM_BASE() - td.bm_stability * tune::TM_BM_FACTOR()) as f64 / 1000.0;
-            let prev_score = td.root_moves[0].previous_score;
-            let score_diff = if prev_score != SCORE_NONE && prev_score != -SCORE_INFINITE {
-                (prev_score - td.best_score).clamp(tune::TM_SCORE_MIN(), tune::TM_SCORE_MAX())
-            } else {
-                0
-            };
-            let score_mul = (tune::TM_SCORE_BASE() as f64
-                + score_diff as f64 * tune::TM_SCORE_FACTOR() as f64)
-                / 1000.0;
+        if is_main && td.tm.has_clock() {
+            // Every thread's root changes, taken and zeroed for the next
+            // iteration. Main thread only: a helper doing it would swallow counts
+            // that never reach the one thread holding the clock.
+            tot_best_move_changes += shared
+                .best_move_changes
+                .swap(0, std::sync::atomic::Ordering::Relaxed)
+                as f64;
 
-            // Node fraction TM: if most nodes go to the best move, stop early;
-            // if nodes are spread across many moves, spend more time.
-            //
-            // Node fraction: if most nodes go to the best move, stop early.
-            let nodes_mul = if depth > 7 && td.nodes > 0 {
-                let bm_nodes = td.root_moves[0].nodes_spent as f64;
-                let fraction = bm_nodes / td.nodes as f64;
-                (tune::TM_NODES_BASE() as f64 - tune::TM_NODES_FACTOR() as f64 * fraction) / 1000.0
+            let best = td.best_score;
+
+            // Worse than the move just played, or worse than four iterations ago,
+            // and the position deserves more than it was given. An unknown previous
+            // score reads as a large drop, so the first move of a game gets the
+            // ceiling — the right answer with nothing to compare against.
+            let falling_eval = ((TM_FALL_BASE
+                + TM_FALL_PREV * (td.best_previous_avg_score - best) as f64
+                + TM_FALL_ITER * (iter_value[iter_idx] - best) as f64)
+                / 100.0)
+                .clamp(TM_FALL_MIN, TM_FALL_MAX);
+
+            // How long the best move has held: a smooth step in depth around the
+            // iteration it last changed at, weighed against the step the previous
+            // move ended on. A position that settled last move settles cheaper now.
+            let center = last_best_move_depth as f64 + TM_STABLE_CENTER;
+            time_reduction = TM_STABLE_BASE
+                + TM_STABLE_SPAN
+                    / (TM_STABLE_OFFSET + (-TM_STABLE_SLOPE * (depth as f64 - center)).exp());
+            let reduction = (TM_REDUCTION_BASE + td.previous_time_reduction)
+                / (TM_REDUCTION_DIV * time_reduction);
+
+            let instability = TM_INSTABILITY_BASE
+                + TM_INSTABILITY_MUL * tot_best_move_changes / td.thread_count as f64;
+
+            // Nearly the whole tree spent under one root move: nothing is competing
+            // with it any more, so there is little left to learn by staying.
+            let effort = td.root_moves[0].nodes_spent * 100_000 / td.nodes.max(1);
+            let high_effort = if effort >= TM_EFFORT_THRESHOLD {
+                TM_EFFORT_MUL
             } else {
                 1.0
             };
-            td.tm.adjust_soft_limit(bm_mul * score_mul * nodes_mul);
+
+            let mut total =
+                td.tm.optimum_ms() as f64 * falling_eval * reduction * instability * high_effort;
+            // One legal move: play it. The cap is for whoever is watching — the
+            // search has nothing to decide.
+            if td.root_moves.len() == 1 {
+                total = total.min(TM_FORCED_MOVE_MS);
+            }
+            debug_assert!(total >= 0.0, "time budget {total} must not be negative");
+            td.tm.set_soft_limit(total as u64);
         }
+        iter_value[iter_idx] = td.best_score;
+        iter_idx = (iter_idx + 1) & 3;
 
         td.completed_depth = depth;
 
@@ -801,8 +1029,6 @@ pub fn search(td: &mut ThreadData, shared: &SharedState) {
             );
         }
 
-        // Print UCI info before resetting scores, otherwise the line falls back
-        // to previous_score and reports depth-1.
         if reports {
             // Only as many lines as were asked for: a weakened level searches extra ones
             // for its own use, and an interface that asked for one wants one.
@@ -816,15 +1042,19 @@ pub fn search(td: &mut ThreadData, shared: &SharedState) {
             #[cfg(feature = "syzygy")]
             if td.tb_config.root_in_tb {
                 for i in 0..multi_pv {
-                    // Use tb_score to decide if PV extension is needed (search score
-                    // may be missing if DTZ-best move differs from search-best move)
-                    if td.root_moves[i].tb_score > 0 {
-                        syzygy_extend_pv(&mut td.pos, &mut td.root_moves[i]);
+                    let rm = &mut td.root_moves[i];
+                    // A mate is already a complete PV. A line not searched at this
+                    // depth was extended when it last printed.
+                    if rm.tb_score != 0 && rm.depth == depth && !is_mate_score(rm.score) {
+                        syzygy_extend_pv(&mut td.pos, rm, td.tm.has_clock(), multi_pv);
                     }
                 }
             }
 
-            print_multi_pv_info(td, shared, depth, multi_pv);
+            print_multi_pv_info(td, shared, multi_pv);
+            if td.report_refutations && td.tm.total_elapsed_ms() >= 1000 {
+                print_refutations(td);
+            }
         }
 
         let mate_found = td.mate_limit.is_some_and(|n| {
@@ -835,12 +1065,6 @@ pub fn search(td: &mut ThreadData, shared: &SharedState) {
                     .is_some_and(|rm| mate_in_moves(rm.score).is_some_and(|m| m > 0 && m <= n))
         });
 
-        // Save previous_score for next iteration's aspiration centering, then reset scores
-        for rm in td.root_moves.iter_mut() {
-            rm.previous_score = rm.score;
-            rm.score = -SCORE_INFINITE;
-        }
-
         if mate_found {
             break;
         }
@@ -849,6 +1073,9 @@ pub fn search(td: &mut ThreadData, shared: &SharedState) {
         if td.pondering && !PONDER.load(std::sync::atomic::Ordering::Relaxed) {
             td.pondering = false;
             td.tm.restart();
+        }
+        if !td.pondering && depth >= requested_max_depth {
+            break;
         }
 
         // Soft time and soft node checks after each iteration (main thread only;
@@ -861,32 +1088,51 @@ pub fn search(td: &mut ThreadData, shared: &SharedState) {
         }
     }
 
+    // Hand this search's tail to the next move: time management compares the
+    // position in front of it to the one just played. Read before
+    // `apply_variety`, which rewrites the best score for a weakened level.
+    td.previous_time_reduction = time_reduction;
+    td.best_previous_score = if known_score(td.best_score) {
+        td.best_score
+    } else {
+        SCORE_NONE
+    };
+    td.best_previous_avg_score = td.root_moves.first().map_or(SCORE_NONE, |rm| rm.avg_score);
+
     apply_variety(td);
+}
+
+/// Whether a score is a real evaluation rather than a sentinel.
+///
+/// `SCORE_NONE` and `±SCORE_INFINITE` all appear where a search never produced a
+/// number; feeding one into an arithmetic comparison would read as a swing of
+/// thirty thousand centipawns.
+#[inline]
+fn known_score(score: i32) -> bool {
+    score.abs() < SCORE_INFINITE
 }
 
 /// Lets a weakened level pick between the root moves it found worth playing.
 ///
 /// Run once, after the search has finished, on the scores of the last completed
-/// iteration — by then each iteration has moved its scores into `previous_score`. Nothing
-/// about the search itself changes: the moves and their scores are exactly what they were,
-/// and only which one is handed back differs. Full strength never reaches the body.
+/// iteration — the lines it resolved all carry that depth. Nothing about the search
+/// itself changes: the moves and their scores are exactly what they were, and only
+/// which one is handed back differs. Full strength never reaches the body.
 fn apply_variety(td: &mut ThreadData) {
     if !td.skill.active || td.skill.rung.variety_moves <= 1 || td.root_moves.is_empty() {
         return;
     }
     // Only the lines the multi-PV search actually resolved have a score to compare.
+    let last = td.root_moves[0].depth;
     let scored = td
         .root_moves
         .iter()
-        .take_while(|rm| rm.previous_score != -SCORE_INFINITE && rm.previous_score != SCORE_NONE)
+        .take_while(|rm| rm.depth == last && rm.depth > 0 && rm.score != SCORE_NONE)
         .count();
     if scored <= 1 {
         return;
     }
-    let scores: Vec<i32> = td.root_moves[..scored]
-        .iter()
-        .map(|rm| rm.previous_score)
-        .collect();
+    let scores: Vec<i32> = td.root_moves[..scored].iter().map(|rm| rm.score).collect();
     let chosen = skill::variety_pick(&td.skill, td.pos.key, &scores);
     debug_assert!(chosen < scored);
     if chosen == 0 {
@@ -1056,6 +1302,10 @@ fn alpha_beta<NT: NodeType>(
             && (ply - 1) < td.last_iteration_pv_len
             && td.ss(ply - 1).played_move == td.last_iteration_pv[ply - 1]);
     td.ss_mut(ply).follow_pv = follow_pv;
+    // The child ply's fail-high count restarts with this node's move loop.
+    if ply + 1 < MAX_PLY {
+        td.ss_mut(ply + 1).failhighs = 0;
+    }
 
     let in_check = td.pos.in_check();
     let orig_alpha = alpha;
@@ -1143,16 +1393,18 @@ fn alpha_beta<NT: NodeType>(
         let score = match entry.category {
             TbCategory::Draw => 0,
             TbCategory::Win => {
-                if let Some(dtm) = entry.dtm {
-                    // dtm is in halfmoves (plies) from the API
-                    SCORE_MATE - ply as i32 - dtm.abs()
+                // dtm is in halfmoves (plies) from the API; a win is never zero
+                // of them, and zero would now read as "mated now".
+                if let Some(dtm) = entry.dtm.filter(|d| *d != 0) {
+                    dtm_score(ply as i32, dtm.abs())
                 } else {
                     tb_win_in(ply as i32)
                 }
             }
             TbCategory::Loss => {
+                // Zero half-moves to be mated is the mate on the board.
                 if let Some(dtm) = entry.dtm {
-                    -SCORE_MATE + ply as i32 + dtm.abs()
+                    dtm_score(ply as i32, -dtm.abs())
                 } else {
                     tb_loss_in(ply as i32)
                 }
@@ -1519,15 +1771,31 @@ fn alpha_beta<NT: NodeType>(
             s.rfp.tried[crate::stats::db(depth)] += 1;
         }
     });
+    // Never against a decisive bound: with beta a mate or tablebase loss the
+    // margin test always passes, and `(static_eval + beta) / 2` would return a
+    // score that is neither an evaluation nor a proof — it then lands in the
+    // TT and drives singular extensions in the mate search around it.
     if !NT::PV
         && !in_check
-        && depth <= tune::RFP_MAX_DEPTH()
+        && depth
+            <= if td.seek_mate {
+                SEEK_MATE_RFP_DEPTH
+            } else {
+                tune::RFP_MAX_DEPTH()
+            }
+        && !is_loss_or_unproven(beta)
+        && !is_win_or_unproven(static_eval)
         && static_eval - (rfp_mult * (depth - improving as i32)).max(tune::RFP_MIN())
             + tune::RFP_OW_BONUS() * opponent_worsening as i32
             >= beta
     {
         st!(td, s, s.rfp.cut[crate::stats::db(depth)] += 1;);
-        tree_ret!(td, ply, crate::tree::X_RFP, depth, (static_eval + beta) / 2);
+        let ret = (static_eval + beta) / 2;
+        debug_assert!(
+            !is_beyond_eval(ret),
+            "RFP: decisive return {ret} from eval {static_eval}, beta {beta}"
+        );
+        tree_ret!(td, ply, crate::tree::X_RFP, depth, ret);
     }
 
     // Razoring: at low depths, when the static eval is far below alpha,
@@ -1571,10 +1839,15 @@ fn alpha_beta<NT: NodeType>(
     if !NT::PV
         && cut_node
         && !skip_null
+        && (td.nmp_min_ply == 0 || ply >= td.nmp_min_ply)
         && !in_check
         && excluded == Move::NONE
         && depth >= tune::NMP_MIN_DEPTH()
-        && static_eval >= beta
+        && static_eval
+            >= beta
+                - tune::NMP_MARGIN_DEPTH() * depth
+                - tune::NMP_MARGIN_IMPROVING() * improving as i32
+                + tune::NMP_MARGIN_BASE()
         && td.pos.has_non_pawn_material(td.pos.side_to_move)
         && !(tt_bound == Bound::Lower && tt_move != Move::NONE && {
             let cap = td.pos.board[tt_move.to_sq().index()];
@@ -1587,8 +1860,12 @@ fn alpha_beta<NT: NodeType>(
         debug_assert!(!NT::PV, "null move en PV node");
         debug_assert!(excluded == Move::NONE, "null move pendant SE");
         debug_assert!(
-            static_eval >= beta,
-            "null move: eval {} < beta {}",
+            static_eval
+                >= beta
+                    - tune::NMP_MARGIN_DEPTH() * depth
+                    - tune::NMP_MARGIN_IMPROVING() * improving as i32
+                    + tune::NMP_MARGIN_BASE(),
+            "null move: eval {} under the margin over beta {}",
             static_eval,
             beta
         );
@@ -1647,29 +1924,50 @@ fn alpha_beta<NT: NodeType>(
             tree_ret!(td, ply, crate::tree::X_STOPPED, depth, 0);
         }
 
-        if null_score >= beta && !is_mate_score(null_score) {
-            // At low depths, return immediately.
-            // At high depths (>= NMP_VERIF_DEPTH), reduce remaining depth
-            // and continue normal search instead of returning.
-            // No re-search: NMP stays active after verification
-            if depth < tune::NMP_VERIF_DEPTH() {
+        // A null search may prove a normal score, but never an unproven mate or
+        // tablebase result. At high depth, verify the fail-high by searching this
+        // same position again. NMP stays disabled in the verification subtree until
+        // it has descended far enough (a minimum-ply gate); unlike merely reducing
+        // `depth`, this actually tests that a legal move reaches beta.
+        if null_score >= beta && !is_beyond_eval(null_score) {
+            if td.nmp_min_ply != 0 || depth < tune::NMP_VERIF_DEPTH() {
                 st!(td, s, s.nmp.cut[crate::stats::db(depth)] += 1;);
                 tree_ret!(td, ply, crate::tree::X_NMP_CUTOFF, depth, null_score);
             }
 
-            // Reduce depth and fall through to normal move loop
+            debug_assert_eq!(td.nmp_min_ply, 0, "recursive NMP verification");
+            let verification_depth = depth - r;
+            td.nmp_min_ply = ply + (3 * verification_depth.max(0) / 4) as usize;
             st!(td, s, s.nmp_verif_runs += 1;);
-            depth -= tune::NMP_VERIF_REDUCTION();
-            if depth <= 0 {
-                tree_ret!(
-                    td,
-                    ply,
-                    crate::tree::X_NMP_VERIF_TO_QS,
-                    depth,
-                    quiescence::<NT>(td, shared, alpha, beta, ply)
-                );
+            tr!(td, t, t.mv(
+                ply as u8,
+                0,
+                0,
+                255,
+                crate::tree::A_NMP_VERIF,
+                0,
+                verification_depth,
+            ););
+            let verification_score = alpha_beta::<NonPv>(
+                td,
+                shared,
+                beta - 1,
+                beta,
+                verification_depth,
+                ply,
+                false,
+                false,
+            );
+            td.nmp_min_ply = 0;
+
+            if td.should_stop() {
+                tree_ret!(td, ply, crate::tree::X_STOPPED, depth, 0);
             }
-            // Fall through to move loop with reduced depth
+
+            if verification_score >= beta {
+                st!(td, s, s.nmp.cut[crate::stats::db(depth)] += 1;);
+                tree_ret!(td, ply, crate::tree::X_NMP_CUTOFF, depth, null_score);
+            }
         }
     }
 
@@ -1686,7 +1984,7 @@ fn alpha_beta<NT: NodeType>(
         && !in_check
         && excluded == Move::NONE
         && depth >= tune::PROBCUT_MIN_DEPTH()
-        && beta.abs() < SCORE_MATE_IN_MAX
+        && !is_beyond_eval(beta)
         && !(tt_depth >= depth - 3
             && tt_score != SCORE_NONE
             && tt_score < beta + tune::PROBCUT_MARGIN())
@@ -1833,6 +2131,8 @@ fn alpha_beta<NT: NodeType>(
     // Track quiet moves searched (for history malus on cutoff)
     let mut quiets_searched: ArrayBuf<Move, MAX_QUIETS_SEARCHED> = ArrayBuf::new();
     let mut quiet_count: usize = 0;
+    // How many moves at this node have already raised alpha.
+    let mut alpha_raises = 0i32;
 
     // Track capture moves searched (for capture history malus on cutoff)
     let mut captures_searched: ArrayBuf<Move, MAX_CAPTURES_SEARCHED> = ArrayBuf::new();
@@ -1884,8 +2184,9 @@ fn alpha_beta<NT: NodeType>(
             .tt
             .prefetch(child_key(&td.pos, m, td.pos.board[m.from_sq().index()]));
 
-        // Multi-PV: skip moves already assigned to earlier PV lines
-        if NT::ROOT && td.pv_index > 0 && td.root_moves[..td.pv_index].iter().any(|rm| rm.mv == m) {
+        // At the root, root_moves is also the `go searchmoves` allow-list. Starting at
+        // pv_index simultaneously excludes lines already assigned in Multi-PV mode.
+        if NT::ROOT && !td.root_moves[td.pv_index..].iter().any(|rm| rm.mv == m) {
             continue;
         }
 
@@ -1905,11 +2206,19 @@ fn alpha_beta<NT: NodeType>(
 
         move_count += 1;
 
-        if NT::ROOT && td.id == 0 && !td.silent && td.tm.elapsed_ms() >= 1000 {
+        if NT::ROOT {
+            td.root_move = m;
+            td.root_move_number = move_count as usize;
+        }
+        if NT::ROOT && td.id == 0 && !td.silent && td.tm.total_elapsed_ms() >= 1000 {
             out!(
                 "info currmove {} currmovenumber {move_count}",
                 m.to_uci_960(td.pos.chess960)
             );
+            crate::threads::note_output(td.tm.total_elapsed_ms());
+        }
+        if NT::ROOT && td.report_curr_line && td.tm.total_elapsed_ms() >= 1000 {
+            td.publish_curr_line(m);
         }
 
         let is_quiet_move = is_quiet(&td.pos, m);
@@ -1976,7 +2285,7 @@ fn alpha_beta<NT: NodeType>(
             && !in_check
             && !is_quiet_move
             && picker.in_bad_captures()
-            && best_score > -SCORE_MATE_IN_MAX
+            && !is_loss(best_score)
             && alpha.abs() < 2000
             && (m.move_type() == MT_EN_PASSANT || is_capture(&td.pos, m))
         {
@@ -2021,7 +2330,7 @@ fn alpha_beta<NT: NodeType>(
         if !NT::ROOT
             && !in_check
             && move_count > 1
-            && best_score > -SCORE_MATE_IN_MAX
+            && !is_loss(best_score)
             && !(follow_pv && NT::PV && is_quiet_move)
         {
             let threshold = if is_quiet_move {
@@ -2069,7 +2378,7 @@ fn alpha_beta<NT: NodeType>(
         if !NT::PV
             && !in_check
             && is_quiet_move
-            && best_score > -SCORE_MATE_IN_MAX
+            && !is_loss(best_score)
             && m != killers[0]
             && m != killers[1]
             && m != countermove
@@ -2107,7 +2416,7 @@ fn alpha_beta<NT: NodeType>(
         // Reference: CPW — Futility Pruning § Move Count Based Pruning
         if !NT::PV
             && !in_check
-            && best_score > -SCORE_MATE_IN_MAX
+            && !is_loss(best_score)
             && move_count as i32 >= (depth * depth + tune::LMP_BASE()) / (2 - improving as i32)
             && !move_gives_check(&td.pos)
         {
@@ -2144,7 +2453,7 @@ fn alpha_beta<NT: NodeType>(
         if !NT::PV
             && !in_check
             && is_quiet_move
-            && best_score > -SCORE_MATE_IN_MAX
+            && !is_loss(best_score)
             && depth <= tune::FP_MAX_DEPTH()
             && static_eval + tune::FP_COEFF() * depth - tune::FP_BASE() <= alpha
             && !move_gives_check(&td.pos)
@@ -2182,14 +2491,15 @@ fn alpha_beta<NT: NodeType>(
             && excluded == Move::NONE
             && depth >= tune::SE_MIN_DEPTH()
             && tt_depth >= depth - tune::SE_TT_DEPTH_MARGIN()
-            && tt_score.abs() < SCORE_MATE_IN_MAX
+            && !is_beyond_eval(tt_score)
             && (tt_bound == Bound::Lower || tt_bound == Bound::Exact)
             && (ply as i32) < 2 * td.root_depth
+            && !td.seek_mate
         {
             debug_assert!(excluded == Move::NONE, "SE: nested SE");
             debug_assert!(m == tt_move, "SE on non-TT move");
             debug_assert!(tt_score != SCORE_NONE, "SE: tt_score is SCORE_NONE");
-            debug_assert!(tt_score.abs() < SCORE_MATE_IN_MAX, "SE on mate score");
+            debug_assert!(!is_decisive(tt_score), "SE on a mate or tablebase score");
             debug_assert!(
                 tt_depth >= depth - tune::SE_TT_DEPTH_MARGIN(),
                 "SE: tt_depth {} below the margin {}",
@@ -2259,8 +2569,10 @@ fn alpha_beta<NT: NodeType>(
                         singular_ext = 3;
                     }
                 }
-            } else if se_score >= beta {
-                // Multi-cut: alternatives also beat beta — prune
+            } else if se_score >= beta && !is_beyond_eval(se_score) {
+                // Multi-cut: alternatives also beat beta — prune. A decisive
+                // se_score is a reduced-depth proof, not a softbound: fall
+                // through and let the full search establish it.
                 st!(td, s, s.se_multicut += 1;);
                 tree_ret!(td, ply, crate::tree::X_SE_MULTICUT, depth, se_score);
             } else if tt_score >= beta {
@@ -2325,7 +2637,21 @@ fn alpha_beta<NT: NodeType>(
         }
         td.pos.make_move(m);
         let gives_check = td.pos.in_check();
-        let total_ext = singular_ext + recapture_ext; // SE + recapture extension; no check ext
+        // One move above the loaded Nalimov frontier, a root check can force the
+        // exchange that makes the exact tables available. Search that forcing move
+        // one ply deeper: issue #23 sits precisely at six pieces with five-man tables,
+        // and an unextended checking line misses the perpetual by one iteration.
+        // Captures that already enter the tables need no help.
+        #[cfg(feature = "nalimov")]
+        let nalimov_frontier_check_ext = i32::from(
+            NT::ROOT
+                && gives_check
+                && crate::nalimov::available()
+                && td.pos.occupied().count_ones() == crate::nalimov::max_pieces() + 1,
+        );
+        #[cfg(not(feature = "nalimov"))]
+        let nalimov_frontier_check_ext = 0;
+        let total_ext = singular_ext + recapture_ext + nalimov_frontier_check_ext;
         let mut new_depth = (depth - 1 + total_ext).max(0);
 
         // Propagate double extension counter to child ply
@@ -2365,13 +2691,11 @@ fn alpha_beta<NT: NodeType>(
 
                 // PV: reduce less
                 if NT::PV {
-                    r -= tune::LMR_PV_BASE()
-                        + tune::LMR_PV_WINDOW_MUL() * (beta - alpha) / td.root_delta;
+                    r -= tune::LMR_PV_WINDOW_MUL() * (beta - alpha) / td.root_delta;
                 }
 
                 // tt_pv: reduce less (node was PV in prior iteration)
                 if tt_pv {
-                    r -= tune::LMR_TTPV_BASE();
                     r -= tune::LMR_TTPV_SCORE_MUL()
                         * (tt_score != SCORE_NONE && tt_score > alpha) as i32;
                     r -= tune::LMR_TTPV_DEPTH_MUL()
@@ -2383,23 +2707,16 @@ fn alpha_beta<NT: NodeType>(
                     r -= tune::LMR_TTPV_DEPTH_LIN() * depth;
                 }
 
-                // Cut node: reduce more
+                // Cut node depth gradient; the flat part is in the factorized term.
                 if !tt_pv && cut_node {
-                    r += tune::LMR_CUTNODE_BASE() + tune::LMR_CUTNODE_DEPTH() * depth / 1024;
-                    r += tune::LMR_CUTNODE_NOTM_MUL() * (tt_move == Move::NONE) as i32;
+                    r += tune::LMR_CUTNODE_DEPTH() * depth / 1024;
                 }
 
                 // Not improving: reduce more with magnitude
                 if !improving {
-                    r += (tune::LMR_NOT_IMPROVING_BASE()
-                        + tune::LMR_NOT_IMPROVING_DEPTH() * depth / 1024
+                    r += (tune::LMR_NOT_IMPROVING_DEPTH() * depth / 1024
                         - tune::LMR_NOT_IMPROVING_MUL() * improvement / 128)
                         .min(tune::LMR_NOT_IMPROVING_MAX());
-                }
-
-                // Gives check: reduce less (~1.3 ply)
-                if gives_check {
-                    r -= tune::LMR_CHECK_SUB();
                 }
 
                 // Recapture reduction: reduce less for noisy recaptures.
@@ -2426,6 +2743,48 @@ fn alpha_beta<NT: NodeType>(
                 // unreliable (large |correction_value| → hard-to-evaluate
                 // position → search deeper)
                 r -= tune::LMR_CORR_HIST_MUL() * correction_value.abs() / 1024;
+
+                // Terms the reference engine has and we did not. All default to
+                // zero, so they cost nothing until the tuner moves them.
+                if tt_move != Move::NONE && is_capture(&td.pos, tt_move) {
+                    r += tune::LMR_TTM_CAPTURE();
+                }
+                if m == killers[0] || m == killers[1] {
+                    // The reference excludes the countermove here, deliberately:
+                    // it tests both killer slots and not the refutation slot
+                    // sitting next to them in the same list.
+                    r -= tune::LMR_KILLER_SUB();
+                }
+                // Parent reduction, in plies, so this coefficient is the amount
+                // added per ply the parent was reduced — no /1024. Read from
+                // `prior_reduction` and not from the stack: the hindsight block at
+                // the top of the node consumes that field and zeroes it, so the
+                // stack slot is always 0 by the time the move loop runs.
+                r += tune::LMR_PARENT_RED_MUL() * prior_reduction;
+                if !is_quiet_move && picker.in_bad_captures() {
+                    r += tune::LMR_BADCAP_EXTRA();
+                }
+
+                // Context term: one weight per canonical subset of nine booleans,
+                // main effects, pairs and triples, summed over those the context
+                // satisfies. A sum of independent terms cannot express that a
+                // combination is worth anything but the sum of its parts; a full
+                // table could, but each of its cells would only learn from the
+                // nodes hitting it exactly. This is the middle path.
+                let ctx = crate::lmr_factorized::context_mask(
+                    NT::PV,
+                    cut_node,
+                    improving,
+                    tt_move != Move::NONE,
+                    tt_pv,
+                    is_quiet_move,
+                    gives_check,
+                    NT::ROOT,
+                    td.ss(ply).failhighs > 2,
+                );
+                r += crate::lmr_factorized::lmr_factorized(ctx);
+                // Once this node has found improvements, the rest is late.
+                r += tune::LMR_ALPHA_RAISE_MUL() * alpha_raises;
                 r
             };
 
@@ -2441,7 +2800,17 @@ fn alpha_beta<NT: NodeType>(
                     && move_count <= tune::LMR_OVEREXT_MAX_MC() as u32)
                     as i32;
                 debug_assert!(lmr_overext == 0 || lmr_overext == 1);
-                let reduced_depth = (new_depth - r / 1024).clamp(1, new_depth + 1 + lmr_overext);
+                // In the mate hunt the bonuses of a forced line (history at its
+                // limit, check, TT move) drive r below -1024 at every ply, and
+                // an extension per ply is a tree that never ends: cap at the
+                // nominal depth there.
+                let max_depth = if td.seek_mate {
+                    new_depth
+                } else {
+                    new_depth + 1 + lmr_overext
+                };
+                let reduced_depth = (new_depth - r / 1024).clamp(1, max_depth);
+                debug_assert!(reduced_depth >= 1 && reduced_depth <= max_depth);
 
                 // Store reduction in plies for hindsight adjustment in child nodes
                 td.ss_mut(ply).reduction = new_depth - reduced_depth;
@@ -2475,8 +2844,12 @@ fn alpha_beta<NT: NodeType>(
                             st_.do_shallower +=
                                 (s < best_score + tune::SHALLOWER_BASE() + reduced_depth) as u64;
                         });
-                        new_depth += (s > best_score + tune::DEEPER_BASE()) as i32;
-                        new_depth += (s > best_score + tune::DEEPER2_BASE()) as i32;
+                        // Not in the mate hunt: a decisive score beats any
+                        // margin, so every fail-high would deepen by two.
+                        if !td.seek_mate {
+                            new_depth += (s > best_score + tune::DEEPER_BASE()) as i32;
+                            new_depth += (s > best_score + tune::DEEPER2_BASE()) as i32;
+                        }
                         // Reduced-depth shallower: threshold proportional to
                         // reduced_depth — less aggressive if the move was already heavily reduced
                         new_depth -=
@@ -2529,6 +2902,29 @@ fn alpha_beta<NT: NodeType>(
             }
             score = s;
         }
+        let refutation = if NT::ROOT && td.report_refutations {
+            let mut line = [Move::NONE; MAX_PLY + 1];
+            line[0] = m;
+            let child_len = td.pv_len[ply + 1].min(MAX_PLY);
+            let len = if child_len > 0 {
+                line[1..=child_len].copy_from_slice(&td.pv[ply + 1][..child_len]);
+                child_len + 1
+            } else if let Some(reply) = shared
+                .tt
+                .probe(td.pos.key, (ply + 1) as i32, td.pos.halfmove_clock)
+                .map(|hit| hit.mv)
+                .filter(|&reply| reply != Move::NONE && movegen::is_legal(&td.pos, reply))
+            {
+                line[1] = reply;
+                2
+            } else {
+                1
+            };
+            Some((line, len))
+        } else {
+            None
+        };
+
         td.pos.unmake_move(m);
         if nnue::network::has_network() {
             td.nnue.pop();
@@ -2539,6 +2935,10 @@ fn alpha_beta<NT: NodeType>(
             && let Some(rm) = td.root_moves.iter_mut().find(|r| r.mv == m)
         {
             rm.nodes_spent += td.nodes - nodes_before;
+            if let Some((line, len)) = refutation {
+                rm.refutation = line;
+                rm.refutation_len = len;
+            }
         }
 
         if td.should_stop() {
@@ -2570,6 +2970,16 @@ fn alpha_beta<NT: NodeType>(
 
             if score > alpha {
                 alpha = score;
+                alpha_raises += 1;
+
+                // A root move overtaking the one the previous iteration liked is
+                // what time management calls instability. Counted on the first PV
+                // line only: the others are asked for by the host, not by doubt.
+                if NT::ROOT && move_count > 1 && td.pv_index == 0 {
+                    shared
+                        .best_move_changes
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
 
                 // Update PV (only at PV nodes)
                 if NT::PV {
@@ -2581,6 +2991,8 @@ fn alpha_beta<NT: NodeType>(
                 }
 
                 if score >= beta {
+                    let fh = td.ss(ply).failhighs;
+                    td.ss_mut(ply).failhighs = fh.saturating_add(1);
                     st!(td, s, {
                         s.cutoffs += 1;
                         if move_count == 1 {
@@ -2713,9 +3125,12 @@ fn alpha_beta<NT: NodeType>(
     // `excluded == Move::NONE` guard, so singular extension (SE) searches also
     // update the correction history tables. The TT store stays guarded to avoid
     // polluting the TT with partial SE results.
+    // A PV node whose only gain over alpha is the tablebase lower bound
+    // (`syzygy_min`, no searched move above it) has no move to store: keep
+    // it an upper bound rather than an exact entry without a move.
     let bound = if best_score >= beta {
         Bound::Lower
-    } else if NT::PV && best_score > orig_alpha {
+    } else if NT::PV && best_score > orig_alpha && best_move != Move::NONE {
         Bound::Exact
     } else {
         Bound::Upper
@@ -3128,7 +3543,7 @@ fn quiescence<NT: NodeType>(
 
         // TT stand-pat blending: use TT score as better position estimate when
         // the bound direction agrees.
-        if tt_score != SCORE_NONE && !is_mate_score(tt_score) {
+        if tt_score != SCORE_NONE && !is_beyond_eval(tt_score) {
             let use_tt = match tt_bound {
                 Bound::Exact => true,
                 Bound::Lower => tt_score > best_score,
@@ -3143,7 +3558,7 @@ fn quiescence<NT: NodeType>(
         if best_score >= beta {
             st!(td, s, s.qs_standpat_cutoffs += 1;);
             // Beta midpoint: reduce overestimation (½ blending)
-            let ret = if !is_mate_score(best_score) {
+            let ret = if !is_beyond_eval(best_score) && !is_beyond_eval(beta) {
                 (best_score + beta) / 2
             } else {
                 best_score
@@ -3300,7 +3715,7 @@ fn quiescence<NT: NodeType>(
         // Unified futility pruning: two-stage check merging
         // delta + futility. Stage 1 prunes by material, stage 2 by SEE with adaptive
         // threshold. Exempt recaptures (tactically sharp). (CPW: Futility Pruning)
-        if !in_check && !is_recapture && best_score > -SCORE_MATE_IN_MAX {
+        if !in_check && !is_recapture && !is_loss(best_score) {
             let futility_value = futility_base + capture_value(&td.pos, m);
             // Stage 1: material futility — capture can't raise score to alpha
             if futility_value <= alpha {
@@ -3346,7 +3761,7 @@ fn quiescence<NT: NodeType>(
 
         // SEE pruning in qsearch: threshold adjusted by the move's history score.
         // (CPW: Static Exchange Evaluation)
-        if best_score > -SCORE_MATE_IN_MAX
+        if !is_loss(best_score)
             && !crate::see::see(
                 &td.pos,
                 m,
@@ -3425,7 +3840,7 @@ fn quiescence<NT: NodeType>(
             best_move = m;
 
             // Once a quiet evasion improves position, skip remaining quiets
-            if in_check && best_score > -SCORE_MATE_IN_MAX && is_quiet(&td.pos, m) {
+            if in_check && !is_loss(best_score) && is_quiet(&td.pos, m) {
                 skip_quiet_evasions = true;
             }
 
@@ -3469,7 +3884,9 @@ fn quiescence<NT: NodeType>(
     );
 
     // Beta midpoint: reduce overestimation (½ blending)
-    if best_score >= beta && !is_mate_score(best_score) {
+    // Never against a bound that is not an evaluation either: with beta the
+    // unproven-loss sentinel the midpoint is a ghost score (issue #19).
+    if best_score >= beta && !is_beyond_eval(best_score) && !is_beyond_eval(beta) {
         best_score = (best_score + beta) / 2;
     }
 
@@ -3497,8 +3914,8 @@ mod tests {
     /// mean something the win-rate model cannot express, and must survive untouched.
     #[test]
     fn format_score_normalizes_only_plain_scores() {
-        let pos = Position::from_fen("rnb1kbnr/pp1ppppp/8/8/8/8/PP1PPPPP/RNB1KBNR w KQkq - 0 1")
-            .unwrap();
+        let pos =
+            Position::from_fen("rnb1kbnr/pp1ppppp/8/8/8/8/PP1PPPPP/RNB1KBNR w KQkq - 0 1").unwrap();
 
         assert_eq!(format_score(mate_in(5), &pos, true), "mate 3");
         assert_eq!(format_score(mate_in(5), &pos, false), "mate 3");
@@ -3506,6 +3923,11 @@ mod tests {
         let tb = crate::types::SCORE_TB_WIN_IN_MAX + 1;
         assert_eq!(format_score(tb, &pos, true), "cp 20000");
         assert_eq!(format_score(-tb, &pos, true), "cp -20000");
+
+        // A 400-move DTM used to leak as `cp 31200`. It must print as a TB score.
+        assert_eq!(format_score(dtm_score(0, 800), &pos, true), "cp 20000");
+        assert_eq!(format_score(dtm_score(0, -800), &pos, true), "cp -20000");
+        assert_eq!(format_score(dtm_score(0, 800), &pos, false), "cp 20000");
 
         assert_eq!(format_score(300, &pos, false), "cp 300");
         assert_eq!(
@@ -3516,8 +3938,8 @@ mod tests {
 
     #[test]
     fn the_wdl_suffix_is_empty_unless_asked_for() {
-        let pos = Position::from_fen("rnb1kbnr/pp1ppppp/8/8/8/8/PP1PPPPP/RNB1KBNR w KQkq - 0 1")
-            .unwrap();
+        let pos =
+            Position::from_fen("rnb1kbnr/pp1ppppp/8/8/8/8/PP1PPPPP/RNB1KBNR w KQkq - 0 1").unwrap();
         assert_eq!(wdl_suffix(120, &pos, false), "");
 
         let suffix = wdl_suffix(120, &pos, true);
@@ -3546,9 +3968,154 @@ mod tests {
         td.prepare_search(&pos, &SearchLimits::depth(depth));
         shared.tt.new_search();
         search(&mut td, &shared);
+        assert_eq!(
+            td.nmp_min_ply, 0,
+            "NMP verification state leaked out of search"
+        );
         let best = td.best_move;
         let score = td.best_score;
         (best, score)
+    }
+
+    #[cfg(feature = "nnue")]
+    #[test]
+    fn david_drawn_endgame_does_not_play_kd6() {
+        // A stronger engine and the game continuation agree that 64...Kd6? loses,
+        // while the position before it is drawn.  It is not reproduced with e017 but
+        // becomes the stable depth-23 choice with e044 when a deep null fail-high is
+        // accepted without the verification search.
+        let (best, _) = search_depth("8/4k1K1/N7/1p1p3b/p1pP4/P1P5/1P6/8 b - - 35 64", 23);
+        assert_ne!(best.to_uci(), "e7d6", "64...Kd6 throws away the draw");
+    }
+
+    /// The tester's game: 41...Qh6+ 42.Kg1 Qc1+ 43.Kh2 and now 43...Qh6+ recreates the
+    /// position after 41...Qh6+ — a second occurrence. White is winning and escaped
+    /// with 45.Qf1, yet the engine published 0.00 from depth 1 to 48 in one second,
+    /// the whole tree collapsing on a draw claim that needed a third occurrence.
+    #[cfg(feature = "nnue")]
+    #[test]
+    fn a_queen_check_that_repeats_once_is_not_scored_as_a_draw() {
+        let _guard = skill::lock_level();
+        let mut pos = Position::from_fen("8/2P2pkp/p2P2p1/p3p3/P4q2/6PQ/7K/8 b - - 0 40").unwrap();
+        for uci in ["f4d2", "h3g2", "d2h6", "h2g1", "h6c1", "g1h2"] {
+            let mut buf = ArrayBuf::<Move, MAX_MOVES>::new();
+            let count = crate::movegen::generate_legal_moves(&pos, &mut buf);
+            let m = (0..count)
+                .map(|i| buf[i])
+                .find(|m| m.to_uci() == uci)
+                .expect("legal");
+            pos.make_move(m);
+        }
+        let shared = SharedState::new(4, 1);
+        let mut td = ThreadData::new(0);
+        td.silent = true;
+        crate::threads::STOP.store(false, std::sync::atomic::Ordering::Relaxed);
+        td.prepare_search(&pos, &SearchLimits::depth(12));
+        shared.tt.new_search();
+        search(&mut td, &shared);
+        assert!(
+            td.best_score < 0,
+            "Black is lost here, got {}",
+            td.best_score
+        );
+        assert!(
+            td.root_moves[0].pv_len >= 2,
+            "a real search has a reply in its PV, got {} move(s)",
+            td.root_moves[0].pv_len
+        );
+    }
+
+    /// A mate in one must survive the tablebase probes that fire from depth 3 on:
+    /// the mated child used to come back from the tables as a draw, and the engine
+    /// then preferred any "mate in two" it could find — for forty-five moves in the
+    /// tester's game.
+    #[cfg(all(feature = "gaiatb", gaiatb_embedded))]
+    #[test]
+    fn a_table_mate_in_one_is_played_at_every_depth() {
+        assert!(crate::dtm::init(), "embedded tables must load");
+        for depth in 1..=8 {
+            let (best, score) = search_depth("7k/8/6K1/8/8/8/8/R7 w - - 0 1", depth);
+            assert_eq!(best.to_uci(), "a1a8", "depth {depth}: Ra8# is the move");
+            assert_eq!(score, mate_in(1), "depth {depth}: and it is a mate in one");
+        }
+    }
+
+    /// Same check on the disk tables, when the machine has them: `GAIA_NALIMOV` names
+    /// the 3-4-5 directory, otherwise the test is skipped. The second position is the
+    /// tester's last move: a mate in one at halfmove clock 99, once reported as 0.00.
+    #[cfg(feature = "nalimov")]
+    #[test]
+    fn nalimov_regressions_keep_mates_and_find_the_frontier_perpetual() {
+        let Ok(dir) = std::env::var("GAIA_NALIMOV") else {
+            eprintln!("skipped: GAIA_NALIMOV not set");
+            return;
+        };
+        if !std::path::Path::new(&dir).is_dir() {
+            eprintln!("skipped: {dir} is not a directory");
+            return;
+        }
+        assert!(crate::nalimov::init(&dir), "tables must load from {dir}");
+        for depth in 3..=8 {
+            let (best, score) = search_depth("7k/5R2/6K1/8/8/p7/p7/8 w - - 0 1", depth);
+            assert_eq!(best.to_uci(), "f7f8", "depth {depth}: Rf8# is the move");
+            assert_eq!(score, mate_in(1), "depth {depth}: and it is a mate in one");
+        }
+        let (best, score) = search_depth("8/k1K5/5p2/3R1P2/8/8/8/8 w - - 99 205", 8);
+        let cursed = Position::from_fen("8/8/7n/2B2k2/8/8/1K6/3B4 b - - 0 64").unwrap();
+        let cursed_score = crate::nalimov::probe_position(&cursed, 0);
+        // Issue #23: at six pieces with five-man tables, depth 13 used to stop one
+        // iteration before seeing the checking perpetual and chose 147...Qd4+, which
+        // loses immediately. The extra root-check ply must already keep 147...Qc3+.
+        let (frontier_best, _) = search_depth("8/7k/4QK2/2q4P/8/6P1/8/8 b - - 78 147", 13);
+        crate::nalimov::free();
+        assert_eq!(best.to_uci(), "d5a5", "Ra5# at halfmove clock 99");
+        assert_eq!(score, mate_in(1));
+        assert_eq!(
+            cursed_score, None,
+            "issue #24: DTM 138 does not prove KBBKN before the 50-move deadline"
+        );
+        assert_eq!(
+            frontier_best.to_uci(),
+            "c5c3",
+            "issue #23: only 147...Qc3+ keeps the draw"
+        );
+    }
+
+    /// A search stopped in the middle of an iteration plays and reports the deepest
+    /// completed result: the tester's engine once published depth 13 on one move,
+    /// then played another with its depth-12 score. The node budget lands inside an
+    /// aspiration re-search of this position (see the transcript test in uci.rs).
+    #[cfg(feature = "nnue")]
+    #[test]
+    fn a_stopped_iteration_keeps_the_deepest_completed_result() {
+        let _guard = skill::lock_level();
+        let pos = Position::from_fen("4K3/3Q4/2k5/2p5/1pPb4/1P6/8/8 b - - 7 70").unwrap();
+        let shared = SharedState::new(4, 1);
+        let mut td = ThreadData::new(0);
+        td.silent = true;
+        crate::threads::STOP.store(false, std::sync::atomic::Ordering::Relaxed);
+        td.prepare_search(&pos, &SearchLimits::nodes(100_000));
+        shared.tt.new_search();
+        search(&mut td, &shared);
+        let front = &td.root_moves[0];
+        assert_eq!(td.best_move, front.mv);
+        assert_eq!(td.best_score, front.score);
+        assert_eq!(
+            front.depth, td.completed_depth,
+            "the front line is the last completed one"
+        );
+        assert!(
+            td.root_moves
+                .iter()
+                .all(|rm| rm.depth <= td.completed_depth),
+            "a root move carries a score from an iteration that never completed"
+        );
+        assert!(
+            td.root_moves
+                .iter()
+                .all(|rm| rm.depth > 0 || rm.score == -SCORE_INFINITE),
+            "an unscored move must not carry a score"
+        );
     }
 
     /// Runs a search at a given level, leaving full strength in force afterwards.

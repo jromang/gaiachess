@@ -143,6 +143,12 @@ enum Cmd {
         /// UCI moves to apply after the FEN
         #[bpaf(short, long, fallback(String::new()))]
         moves: String,
+        /// Syzygy tablebase path: probe the tables in the tree during the dump, as a game would
+        #[bpaf(long)]
+        syzygy: Option<String>,
+        /// Load the embedded 3+4 piece DTM tables (GaiaTB), as the UCI loop does after `uciok`
+        #[bpaf(long)]
+        gaiatb: bool,
         /// FEN position or "startpos" (use quotes for multi-word FEN)
         #[bpaf(positional("FEN"))]
         fen: String,
@@ -505,8 +511,26 @@ fn real_main(cmd: Cmd, stdin: ProbedStdin) {
             qs_moves,
             max_mb,
             moves,
+            syzygy,
+            gaiatb,
             fen,
         } => {
+            #[cfg(feature = "syzygy")]
+            if let Some(ref path) = syzygy
+                && !tb::init(path)
+            {
+                eprintln!("WARNING: Failed to load Syzygy tablebases from {path}");
+            }
+            #[cfg(all(feature = "gaiatb", gaiatb_embedded))]
+            if gaiatb && !dtm::init() {
+                eprintln!("WARNING: failed to load the embedded GaiaTB tables");
+            }
+            #[cfg(not(all(feature = "gaiatb", gaiatb_embedded)))]
+            if gaiatb {
+                eprintln!(
+                    "WARNING: --gaiatb requires --features gaiatb with embedded tables (ignored)"
+                );
+            }
             let opts = dump::DumpOptions {
                 fen,
                 moves: moves.split_whitespace().map(String::from).collect(),
@@ -609,7 +633,7 @@ fn real_main(cmd: Cmd, stdin: ProbedStdin) {
                     "runtime"
                 };
                 println!("SIMD:        {simd} ({how})");
-                println!("Movegen:     magic, setwise per-piece loop");
+                println!("Movegen:     Hyperbola Quintessence (rbit), setwise per-piece loop");
             }
             #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
             {

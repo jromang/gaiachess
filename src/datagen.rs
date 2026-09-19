@@ -14,19 +14,19 @@ use time::OffsetDateTime;
 
 use indicatif::{ProgressBar, ProgressStyle};
 
-use viriformat::chess::board::{Board as ViriBoard, GameOutcome, DrawType, WinType};
+use viriformat::chess::board::{Board as ViriBoard, DrawType, GameOutcome, WinType};
 use viriformat::chess::chessmove::{Move as ViriMove, MoveFlags};
-use viriformat::chess::types::Square as ViriSquare;
 use viriformat::chess::piece::PieceType as ViriPieceType;
+use viriformat::chess::types::Square as ViriSquare;
 use viriformat::dataformat::Game;
 
 use crate::movegen;
 use crate::position::Position;
 use crate::search;
-use crate::threads::{SharedState, ThreadData, STOP};
+use crate::see;
+use crate::threads::{STOP, SharedState, ThreadData};
 use crate::timeman::SearchLimits;
 use crate::types::*;
-use crate::see;
 
 // ============================================================
 // Datagen configuration
@@ -132,8 +132,16 @@ fn seed_for_thread(run_seed: u64, thread_id: usize) -> u64 {
 
 /// The ten ways to place two knights on five squares, as (lower, higher) indices.
 const KNIGHT_PLACEMENTS: [(usize, usize); 10] = [
-    (0, 1), (0, 2), (0, 3), (0, 4), (1, 2),
-    (1, 3), (1, 4), (2, 3), (2, 4), (3, 4),
+    (0, 1),
+    (0, 2),
+    (0, 3),
+    (0, 4),
+    (1, 2),
+    (1, 3),
+    (1, 4),
+    (2, 3),
+    (2, 4),
+    (3, 4),
 ];
 
 /// Put `piece` on the `n`-th still-empty square of a back rank.
@@ -196,7 +204,10 @@ fn dfrc_start_fen(rng: &mut Rng) -> String {
         castling.push((first + files[0] as u8) as char);
     }
 
-    let black_rank: String = black.iter().map(|&c| c.to_ascii_lowercase() as char).collect();
+    let black_rank: String = black
+        .iter()
+        .map(|&c| c.to_ascii_lowercase() as char)
+        .collect();
     let white_rank: String = white.iter().map(|&c| c as char).collect();
     format!("{black_rank}/pppppppp/8/8/8/8/PPPPPPPP/{white_rank} w {castling} - 0 1")
 }
@@ -213,7 +224,8 @@ const DATAGEN_SEARCH_DEADLINE: u64 = 10_000; // 10 seconds
 fn prepare_datagen_search(td: &mut ThreadData, pos: &Position, limits: &SearchLimits) {
     td.prepare_search(pos, limits);
     // Override: prepare_search gives id!=0 infinite limits, we need real limits
-    td.tm = crate::timeman::TimeManager::new(limits);
+    let game_ply = td.pos.game_ply();
+    td.tm = crate::timeman::TimeManager::new(limits, game_ply, &mut td.original_time_adjust);
     // Per-thread deadline: caps explosion-prone searches without global STOP
     td.search_deadline = DATAGEN_SEARCH_DEADLINE;
     // Skip in-search TB probing and root TB ranking — datagen adjudicates via TB separately
@@ -336,8 +348,16 @@ fn play_game(
         } else {
             SearchLimits::depth(config.depth + 2)
         };
-        let td = if pos.side_to_move == Color::White { &mut *td_white } else { &mut *td_black };
-        let shared = if pos.side_to_move == Color::White { shared_white } else { shared_black };
+        let td = if pos.side_to_move == Color::White {
+            &mut *td_white
+        } else {
+            &mut *td_black
+        };
+        let shared = if pos.side_to_move == Color::White {
+            shared_white
+        } else {
+            shared_black
+        };
 
         STOP.store(false, Ordering::Relaxed);
         prepare_datagen_search(td, &pos, &limits);
@@ -387,7 +407,11 @@ fn play_game(
         if count == 0 {
             if pos.checkers != 0 {
                 // Checkmate: side to move loses
-                result = if pos.side_to_move == Color::White { 0 } else { 2 };
+                result = if pos.side_to_move == Color::White {
+                    0
+                } else {
+                    2
+                };
             } else {
                 // Stalemate
                 result = 1;
@@ -447,8 +471,11 @@ fn play_game(
         let best_move = td.best_move;
         let score = td.best_score;
         debug_assert!(score != SCORE_NONE, "datagen: SCORE_NONE from search");
-        debug_assert!(score.abs() <= SCORE_INFINITE,
-            "datagen: score {} out of range", score);
+        debug_assert!(
+            score.abs() <= SCORE_INFINITE,
+            "datagen: score {} out of range",
+            score
+        );
 
         if best_move == Move::NONE {
             result = 1; // Shouldn't happen, but safety
@@ -460,7 +487,11 @@ fn play_game(
         // when Black is to move to produce the STM-POV training target.
         // Writing an STM-relative score here flips the sign of ~50% of targets (gen0/gen1 bug).
         let viri_mv = to_viri_move(best_move, &pos);
-        let white_score = if pos.side_to_move == Color::White { score } else { -score };
+        let white_score = if pos.side_to_move == Color::White {
+            score
+        } else {
+            -score
+        };
         game.add_move(viri_mv, white_score as i16);
 
         // Win adjudication
@@ -469,7 +500,11 @@ fn play_game(
             if win_adj_count >= config.win_adj_plies {
                 // score is STM-relative, convert to white-relative
                 let stm_wins = score > 0;
-                let white_wins = if pos.side_to_move == Color::White { stm_wins } else { !stm_wins };
+                let white_wins = if pos.side_to_move == Color::White {
+                    stm_wins
+                } else {
+                    !stm_wins
+                };
                 result = if white_wins { 2 } else { 0 };
                 break;
             }
@@ -491,13 +526,21 @@ fn play_game(
         // Mate score: stop immediately
         if score.abs() > SCORE_MATE_IN_MAX {
             let stm_wins = score > 0;
-            let white_wins = if pos.side_to_move == Color::White { stm_wins } else { !stm_wins };
+            let white_wins = if pos.side_to_move == Color::White {
+                stm_wins
+            } else {
+                !stm_wins
+            };
             result = if white_wins { 2 } else { 0 };
             break;
         }
 
-        debug_assert!(best_move.from_sq().0 < 64 && best_move.to_sq().0 < 64,
-            "datagen: best_move squares OOB {} -> {}", best_move.from_sq().0, best_move.to_sq().0);
+        debug_assert!(
+            best_move.from_sq().0 < 64 && best_move.to_sq().0 < 64,
+            "datagen: best_move squares OOB {} -> {}",
+            best_move.from_sq().0,
+            best_move.to_sq().0
+        );
         pos.make_move(best_move);
         game_ply += 1;
 
@@ -587,9 +630,7 @@ fn worker(
     let mut td_white = Box::new(ThreadData::new(1));
     let mut td_black = Box::new(ThreadData::new(1));
 
-    while pb.position() < target_positions
-        && !DATAGEN_STOP.load(Ordering::Relaxed)
-    {
+    while pb.position() < target_positions && !DATAGEN_STOP.load(Ordering::Relaxed) {
         let game = play_game(
             &mut td_white,
             &mut td_black,
@@ -601,7 +642,9 @@ fn worker(
             explosion_fens,
         );
 
-        let Some(game) = game else { continue; };
+        let Some(game) = game else {
+            continue;
+        };
 
         game.serialise_into(&mut writer).expect("write failed");
 
@@ -622,7 +665,11 @@ fn worker(
             let new_pos = pb.position().saturating_sub(existing_positions);
             let pos_per_sec = new_pos as f64 / elapsed;
             let remaining = target_positions.saturating_sub(pb.position());
-            let eta_secs = if pos_per_sec > 0.0 { (remaining as f64 / pos_per_sec) as u64 } else { 0 };
+            let eta_secs = if pos_per_sec > 0.0 {
+                (remaining as f64 / pos_per_sec) as u64
+            } else {
+                0
+            };
             let tb_adj = TB_ADJUDICATIONS.load(Ordering::Relaxed);
             pb.set_message(format!(
                 "{games} games, {:.0} pos/s, {tb_adj} TB adj, ETA {} (fin ~{})",
@@ -664,7 +711,9 @@ pub fn run(
     book_path: Option<&str>,
 ) {
     let num_threads = match threads {
-        0 => std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1),
+        0 => std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1),
         n => n,
     };
 
@@ -686,8 +735,8 @@ pub fn run(
 
     // Load opening book if provided
     let book: Option<Arc<Vec<String>>> = book_path.map(|path| {
-        let file = std::fs::File::open(path)
-            .unwrap_or_else(|e| panic!("Failed to open book {path}: {e}"));
+        let file =
+            std::fs::File::open(path).unwrap_or_else(|e| panic!("Failed to open book {path}: {e}"));
         let lines: Vec<String> = std::io::BufReader::new(file)
             .lines()
             .map(|l| l.expect("Failed to read book line"))
@@ -761,22 +810,27 @@ pub fn run(
             }
         }
         if !existing.is_empty() {
-            let positions: u64 = existing.iter()
-                .map(|f| count_positions(f))
-                .sum();
+            let positions: u64 = existing.iter().map(|f| count_positions(f)).sum();
             eprintln!("WARNING: output files already exist:");
             for f in &existing {
                 let size = std::fs::metadata(f).map(|m| m.len()).unwrap_or(0);
                 let pos = size / 32;
-                eprintln!("  {f} ({:.1} MB, ~{pos} positions)", size as f64 / (1024.0 * 1024.0));
+                eprintln!(
+                    "  {f} ({:.1} MB, ~{pos} positions)",
+                    size as f64 / (1024.0 * 1024.0)
+                );
             }
             eprintln!("  Total: {positions} existing positions");
             if assume_yes {
-                eprintln!("New data will be APPENDED (target: {target_positions}). Continuing (--yes).");
+                eprintln!(
+                    "New data will be APPENDED (target: {target_positions}). Continuing (--yes)."
+                );
             } else {
                 eprint!("New data will be APPENDED (target: {target_positions}). Continue? [y/N] ");
                 let mut answer = String::new();
-                std::io::stdin().read_line(&mut answer).expect("failed to read stdin");
+                std::io::stdin()
+                    .read_line(&mut answer)
+                    .expect("failed to read stdin");
                 if !answer.trim().eq_ignore_ascii_case("y") {
                     eprintln!("Aborted.");
                     return;
@@ -790,12 +844,17 @@ pub fn run(
     };
 
     if existing_positions >= target_positions {
-        eprintln!("Already have {existing_positions} positions (target: {target_positions}). Nothing to do.");
+        eprintln!(
+            "Already have {existing_positions} positions (target: {target_positions}). Nothing to do."
+        );
         return;
     }
     if existing_positions > 0 {
         eprintln!("  Existing:   {existing_positions} positions");
-        eprintln!("  Remaining:  {} positions", target_positions - existing_positions);
+        eprintln!(
+            "  Remaining:  {} positions",
+            target_positions - existing_positions
+        );
         eprintln!();
     }
 
@@ -827,18 +886,23 @@ pub fn run(
             let pb = &pb;
             std::thread::Builder::new()
                 .spawn_scoped(s, move || {
-                    while !DATAGEN_STOP.load(Ordering::Relaxed)
-                        && pb.position() < target_positions
+                    while !DATAGEN_STOP.load(Ordering::Relaxed) && pb.position() < target_positions
                     {
-                        std::thread::sleep(std::time::Duration::from_secs(
-                            PROGRESS_LINE_SECONDS,
-                        ));
+                        std::thread::sleep(std::time::Duration::from_secs(PROGRESS_LINE_SECONDS));
                         let done = pb.position();
                         let elapsed = pb.elapsed().as_secs_f64();
                         let new_pos = done.saturating_sub(existing_positions);
-                        let rate = if elapsed > 0.0 { new_pos as f64 / elapsed } else { 0.0 };
+                        let rate = if elapsed > 0.0 {
+                            new_pos as f64 / elapsed
+                        } else {
+                            0.0
+                        };
                         let remaining = target_positions.saturating_sub(done);
-                        let eta = if rate > 0.0 { (remaining as f64 / rate) as u64 } else { 0 };
+                        let eta = if rate > 0.0 {
+                            (remaining as f64 / rate) as u64
+                        } else {
+                            0
+                        };
                         eprintln!(
                             "progress: {done}/{target_positions} ({:.1}%, {rate:.0} pos/s, \
                              ETA {}, {} games)",
@@ -859,7 +923,17 @@ pub fn run(
             std::thread::Builder::new()
                 .stack_size(32 * 1024 * 1024) // 32 MB (PGO inlining enlarges frames)
                 .spawn_scoped(s, move || {
-                    worker(thread_id, run_seed, target_positions, existing_positions, config, book_ref, output, pb, explosion_fens);
+                    worker(
+                        thread_id,
+                        run_seed,
+                        target_positions,
+                        existing_positions,
+                        config,
+                        book_ref,
+                        output,
+                        pb,
+                        explosion_fens,
+                    );
                 })
                 .expect("failed to spawn datagen worker");
         }
@@ -879,7 +953,9 @@ pub fn run(
 
     eprintln!();
     if existing_positions > 0 {
-        eprintln!("Done: {new_pos} new positions ({total_pos} total) from {total_games} games in {elapsed:.1}s");
+        eprintln!(
+            "Done: {new_pos} new positions ({total_pos} total) from {total_games} games in {elapsed:.1}s"
+        );
     } else {
         eprintln!("Done: {total_pos} positions from {total_games} games in {elapsed:.1}s");
     }
@@ -908,7 +984,9 @@ pub fn run(
     let num_explosions = EXPLOSIONS.load(Ordering::Relaxed);
     if num_explosions > 0 {
         eprintln!();
-        eprintln!("Explosions: {num_explosions} positions hit {DATAGEN_SEARCH_DEADLINE}ms deadline (skipped)");
+        eprintln!(
+            "Explosions: {num_explosions} positions hit {DATAGEN_SEARCH_DEADLINE}ms deadline (skipped)"
+        );
         if let Ok(fens) = explosion_fens.lock() {
             for fen in fens.iter() {
                 eprintln!("  {fen}");
@@ -932,7 +1010,9 @@ fn count_positions(path: &str) -> u64 {
     const HEADER: usize = 32;
     const MOVE_SIZE: usize = 4;
 
-    let Ok(file) = std::fs::File::open(path) else { return 0 };
+    let Ok(file) = std::fs::File::open(path) else {
+        return 0;
+    };
     let mut reader = std::io::BufReader::with_capacity(1 << 20, file);
     let mut buffer = Vec::new();
     let mut total = 0u64;
@@ -1013,10 +1093,17 @@ mod tests {
 
             let rooks: Vec<usize> = (0..8).filter(|&f| rank[f] == b'R').collect();
             let king = file_of(b'K');
-            assert!(rooks[0] < king && king < rooks[1], "id {id}: king outside its rooks");
+            assert!(
+                rooks[0] < king && king < rooks[1],
+                "id {id}: king outside its rooks"
+            );
 
             let bishops: Vec<usize> = (0..8).filter(|&f| rank[f] == b'B').collect();
-            assert_ne!(bishops[0] % 2, bishops[1] % 2, "id {id}: bishops on one colour");
+            assert_ne!(
+                bishops[0] % 2,
+                bishops[1] % 2,
+                "id {id}: bishops on one colour"
+            );
         }
     }
 

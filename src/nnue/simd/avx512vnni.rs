@@ -12,6 +12,9 @@
 
 pub use super::avx512::*;
 
+/// Native `vpdpbusd` is ~5 cycles: three independent chains hide that latency.
+pub const DPBUSD_CHAINS: usize = 3;
+
 use std::arch::x86_64::*;
 
 /// Dot product of unsigned bytes × signed bytes, accumulated into i32.

@@ -128,11 +128,15 @@ pub fn is_known(key: u64) -> bool {
 /// Uses `try_lock` to avoid blocking the search — silently drops if contended.
 fn submit_inner(key: u64, fen: String, priority: bool) {
     let s = state();
-    let Ok(mut pending) = s.pending.try_lock() else { return };
+    let Ok(mut pending) = s.pending.try_lock() else {
+        return;
+    };
     if !pending.insert(key) {
         return;
     }
-    let Ok(mut queue) = s.queue.try_lock() else { return };
+    let Ok(mut queue) = s.queue.try_lock() else {
+        return;
+    };
     if priority {
         queue.push_front(ProbeRequest { key, fen });
     } else {
@@ -148,10 +152,14 @@ fn submit_inner(key: u64, fen: String, priority: bool) {
 pub fn submit_pv_positions(pos: &Position, pv: &[Move], pv_len: usize) {
     let mut scratch = pos.clone();
     for &mv in pv.iter().take(pv_len) {
-        if mv == Move::NONE { break; }
+        if mv == Move::NONE {
+            break;
+        }
         scratch.make_move(mv);
         let pieces = scratch.occupied().count_ones();
-        if scratch.castling_rights != 0 { continue; }
+        if scratch.castling_rights != 0 {
+            continue;
+        }
 
         if pieces <= 7 {
             // Priority 1: direct PV position, TB-eligible
@@ -166,7 +174,10 @@ pub fn submit_pv_positions(pos: &Position, pv: &[Move], pv_len: usize) {
                 let cap = buf[j];
                 // Filter captures only (piece on destination, or en passant)
                 if scratch.board[cap.to_sq().index()] == Piece::NONE
-                    && cap.move_type() != MT_EN_PASSANT { continue; }
+                    && cap.move_type() != MT_EN_PASSANT
+                {
+                    continue;
+                }
                 let mut after = scratch.clone();
                 after.make_move(cap);
                 if after.occupied().count_ones() <= 7 && !is_known(after.key) {
@@ -199,8 +210,13 @@ fn cancel_worker() {
 ///
 /// Priority 1: PV positions (deep continuation) via `submit_pv_positions`.
 /// Priority 2: opponent replies sorted by ponder → captures MVV → promotions → quiets.
-pub fn start_prefetch(pos: Position, best_move: Move, ponder_move: Option<Move>,
-                      pv: &[Move], pv_len: usize) {
+pub fn start_prefetch(
+    pos: Position,
+    best_move: Move,
+    ponder_move: Option<Move>,
+    pv: &[Move],
+    pv_len: usize,
+) {
     let s = state();
 
     // Cancel any running worker
@@ -351,8 +367,7 @@ fn probe_lichess(fen: &str) -> Result<OnlineTbEntry, String> {
         .read_to_string()
         .map_err(|e| e.to_string())?;
 
-    let resp: LichessResponse =
-        serde_json::from_str(&body).map_err(|e| e.to_string())?;
+    let resp: LichessResponse = serde_json::from_str(&body).map_err(|e| e.to_string())?;
 
     let category = match resp.category.as_str() {
         "win" => TbCategory::Win,
@@ -361,7 +376,11 @@ fn probe_lichess(fen: &str) -> Result<OnlineTbEntry, String> {
     };
 
     Ok(OnlineTbEntry {
-        dtm: if category == TbCategory::Draw { Some(0) } else { resp.dtm },
+        dtm: if category == TbCategory::Draw {
+            Some(0)
+        } else {
+            resp.dtm
+        },
         category,
     })
 }

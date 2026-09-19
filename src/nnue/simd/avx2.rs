@@ -16,6 +16,9 @@ pub const I16_LANES: usize = 16;
 pub const I32_LANES: usize = 8;
 /// Number of f32 elements per SIMD register.
 pub const F32_LANES: usize = 8;
+/// Independent sparse-L1 dpbusd chains. Emulated maddubs is short enough
+/// that one chain wins; VNNI's 5-cycle `vpdpbusd` wants three.
+pub const DPBUSD_CHAINS: usize = 1;
 
 // ============================================================
 // i16 operations (accumulator, FT activation)

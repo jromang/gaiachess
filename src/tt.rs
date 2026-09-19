@@ -13,9 +13,11 @@
 use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicU8, Ordering};
 
-use crate::types::{Move, SCORE_MATE, SCORE_MATE_IN_MAX, SCORE_NONE, SCORE_TB_WIN, SCORE_TB_WIN_IN_MAX};
 #[cfg(test)]
 use crate::types::is_mate_score;
+use crate::types::{
+    Move, SCORE_MATE, SCORE_MATE_IN_MAX, SCORE_NONE, SCORE_TB_WIN, SCORE_TB_WIN_IN_MAX,
+};
 
 /// TT entry bound type.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -31,17 +33,22 @@ pub enum Bound {
 #[derive(Clone, Copy)]
 #[repr(C)]
 struct TTEntry {
-    key: u16,      // verification key (lower 16 bits of hash)
-    mv: u16,       // best move (raw u16)
-    score: i16,    // search score (mate-adjusted for storage)
-    eval: i16,     // static evaluation
-    depth: i8,     // search depth
-    flags: u8,     // bits 0-1: Bound, bits 3-7: age
+    key: u16,   // verification key (lower 16 bits of hash)
+    mv: u16,    // best move (raw u16)
+    score: i16, // search score (mate-adjusted for storage)
+    eval: i16,  // static evaluation
+    depth: i8,  // search depth
+    flags: u8,  // bits 0-1: Bound, bits 3-7: age
 }
 
 impl TTEntry {
     const EMPTY: TTEntry = TTEntry {
-        key: 0, mv: 0, score: 0, eval: 0, depth: 0, flags: 0,
+        key: 0,
+        mv: 0,
+        score: 0,
+        eval: 0,
+        depth: 0,
+        flags: 0,
     };
 
     #[inline]
@@ -86,9 +93,18 @@ impl Cluster {
 }
 
 // Compile-time size/alignment checks
-const _: () = assert!(std::mem::size_of::<TTEntry>() == 10, "TTEntry must be 10 bytes");
-const _: () = assert!(std::mem::size_of::<Cluster>() == 32, "Cluster must be 32 bytes");
-const _: () = assert!(std::mem::align_of::<Cluster>() == 32, "Cluster must be 32-byte aligned");
+const _: () = assert!(
+    std::mem::size_of::<TTEntry>() == 10,
+    "TTEntry must be 10 bytes"
+);
+const _: () = assert!(
+    std::mem::size_of::<Cluster>() == 32,
+    "Cluster must be 32 bytes"
+);
+const _: () = assert!(
+    std::mem::align_of::<Cluster>() == 32,
+    "Cluster must be 32-byte aligned"
+);
 
 const AGE_CYCLE: u8 = 32;
 const AGE_MASK: u8 = 31;
@@ -127,7 +143,9 @@ impl TT {
         let bytes = mb * 1024 * 1024;
         let num_clusters = (bytes / std::mem::size_of::<Cluster>()).max(1);
         TT {
-            clusters: (0..num_clusters).map(|_| UnsafeCell::new(Cluster::EMPTY)).collect(),
+            clusters: (0..num_clusters)
+                .map(|_| UnsafeCell::new(Cluster::EMPTY))
+                .collect(),
             age: AtomicU8::new(0),
         }
     }
@@ -137,7 +155,9 @@ impl TT {
     pub fn resize(&mut self, mb: usize) {
         let bytes = mb * 1024 * 1024;
         let num_clusters = (bytes / std::mem::size_of::<Cluster>()).max(1);
-        self.clusters = (0..num_clusters).map(|_| UnsafeCell::new(Cluster::EMPTY)).collect();
+        self.clusters = (0..num_clusters)
+            .map(|_| UnsafeCell::new(Cluster::EMPTY))
+            .collect();
         *self.age.get_mut() = 0;
     }
 
@@ -163,7 +183,7 @@ impl TT {
     pub fn prefetch(&self, key: u64) {
         #[cfg(target_arch = "x86_64")]
         unsafe {
-            use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+            use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
             let idx = self.index(key);
             let ptr = self.clusters[idx].get() as *const i8;
             _mm_prefetch::<{ _MM_HINT_T0 }>(ptr);
@@ -216,11 +236,18 @@ impl TT {
         pv: bool,
     ) {
         debug_assert!((0..256).contains(&ply), "TT store: ply {} OOB", ply);
-        debug_assert!(score.abs() <= SCORE_MATE_IN_MAX + 512,
-            "TT store: score {} too large", score);
+        debug_assert!(
+            score.abs() <= SCORE_MATE_IN_MAX + 512,
+            "TT store: score {} too large",
+            score
+        );
         debug_assert!((-5..=256).contains(&depth), "TT store: depth {} OOB", depth);
-        debug_assert!(mv == Move::NONE || (mv.from_sq().0 < 64 && mv.to_sq().0 < 64),
-            "TT store: move squares OOB from={} to={}", mv.from_sq().0, mv.to_sq().0);
+        debug_assert!(
+            mv == Move::NONE || (mv.from_sq().0 < 64 && mv.to_sq().0 < 64),
+            "TT store: move squares OOB from={} to={}",
+            mv.from_sq().0,
+            mv.to_sq().0
+        );
         let idx = self.index(key);
         // SAFETY: Racy writes are acceptable; key16 verification catches corruption.
         let cluster = unsafe { &mut *self.clusters[idx].get() };
@@ -311,8 +338,11 @@ fn verification_key(key: u64) -> u16 {
 #[inline]
 fn score_to_tt(score: i32, ply: i32) -> i32 {
     debug_assert!(score != SCORE_NONE, "score_to_tt: SCORE_NONE");
-    debug_assert!(score.abs() <= SCORE_MATE_IN_MAX + 512,
-        "score_to_tt: score {} too large", score);
+    debug_assert!(
+        score.abs() <= SCORE_MATE_IN_MAX + 512,
+        "score_to_tt: score {} too large",
+        score
+    );
     if score >= SCORE_TB_WIN_IN_MAX {
         score + ply
     } else if score <= -SCORE_TB_WIN_IN_MAX {
@@ -439,8 +469,11 @@ mod tests {
         let mate_in_8 = SCORE_MATE - 16;
         tt.store(key, 20, 0, mate_in_8, Bound::Exact, Move::NONE, 0, false);
         let hit = tt.probe(key, 0, 88).unwrap();
-        assert!(!is_mate_score(hit.score),
-            "M8 with hmc=88 must be downgraded, got {}", hit.score);
+        assert!(
+            !is_mate_score(hit.score),
+            "M8 with hmc=88 must be downgraded, got {}",
+            hit.score
+        );
         assert_eq!(hit.score, SCORE_TB_WIN_IN_MAX - 1);
     }
 
@@ -453,8 +486,11 @@ mod tests {
         let mate_in_8 = SCORE_MATE - 16;
         tt.store(key, 20, 0, mate_in_8, Bound::Exact, Move::NONE, 0, false);
         let hit = tt.probe(key, 0, 0).unwrap();
-        assert!(is_mate_score(hit.score),
-            "M8 with hmc=0 must NOT be downgraded, got {}", hit.score);
+        assert!(
+            is_mate_score(hit.score),
+            "M8 with hmc=0 must NOT be downgraded, got {}",
+            hit.score
+        );
     }
 
     #[test]
@@ -466,8 +502,11 @@ mod tests {
         let mate_in_1 = SCORE_MATE - 2;
         tt.store(key, 20, 0, mate_in_1, Bound::Exact, Move::NONE, 0, false);
         let hit = tt.probe(key, 0, 98).unwrap();
-        assert!(is_mate_score(hit.score),
-            "M1 with hmc=98 must NOT be downgraded, got {}", hit.score);
+        assert!(
+            is_mate_score(hit.score),
+            "M1 with hmc=98 must NOT be downgraded, got {}",
+            hit.score
+        );
     }
 
     #[test]
@@ -479,8 +518,11 @@ mod tests {
         let mated_in_10 = -(SCORE_MATE - 20);
         tt.store(key, 20, 0, mated_in_10, Bound::Exact, Move::NONE, 0, false);
         let hit = tt.probe(key, 0, 85).unwrap();
-        assert!(!is_mate_score(hit.score),
-            "Mated-in-10 with hmc=85 must be downgraded, got {}", hit.score);
+        assert!(
+            !is_mate_score(hit.score),
+            "Mated-in-10 with hmc=85 must be downgraded, got {}",
+            hit.score
+        );
         assert_eq!(hit.score, -(SCORE_TB_WIN_IN_MAX - 1));
     }
 }

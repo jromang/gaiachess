@@ -7,8 +7,8 @@
 //! may only move along their pin ray.
 
 use crate::bitboard::*;
-use crate::types::*;
 use crate::position::Position;
+use crate::types::*;
 
 /// Append a move to the raw buffer.
 #[inline(always)]
@@ -49,8 +49,11 @@ pub fn generate_legal_moves(pos: &Position, buf: &mut ArrayBuf<Move, MAX_MOVES>)
     // Post: all remaining moves must be legal
     #[cfg(debug_assertions)]
     for i in 0..count {
-        debug_assert!(is_legal(pos, buf[i]),
-            "generate_legal_moves: illegal move {} survived filtering", buf[i].to_uci());
+        debug_assert!(
+            is_legal(pos, buf[i]),
+            "generate_legal_moves: illegal move {} survived filtering",
+            buf[i].to_uci()
+        );
     }
     count
 }
@@ -93,8 +96,16 @@ pub fn generate_captures(pos: &Position, buf: &mut ArrayBuf<ScoredMove, MAX_MOVE
         Color::Black => RANK_1,
     };
     let push_dir = pawn_push(us);
-    let east_dir: i8 = if us == Color::White { NORTH_EAST } else { SOUTH_EAST };
-    let west_dir: i8 = if us == Color::White { NORTH_WEST } else { SOUTH_WEST };
+    let east_dir: i8 = if us == Color::White {
+        NORTH_EAST
+    } else {
+        SOUTH_EAST
+    };
+    let west_dir: i8 = if us == Color::White {
+        NORTH_WEST
+    } else {
+        SOUTH_WEST
+    };
 
     // Pawn captures
     let cap_east = pawn_attack_east(pawns, us) & their_pieces & check_mask;
@@ -104,12 +115,20 @@ pub fn generate_captures(pos: &Position, buf: &mut ArrayBuf<ScoredMove, MAX_MOVE
     let mut bb = cap_east & !promo_rank;
     while bb != 0 {
         let to = pop_lsb(&mut bb);
-        emit_scored(buf, &mut count, Move::new(Square((to.0 as i8 - east_dir) as u8), to));
+        emit_scored(
+            buf,
+            &mut count,
+            Move::new(Square((to.0 as i8 - east_dir) as u8), to),
+        );
     }
     let mut bb = cap_west & !promo_rank;
     while bb != 0 {
         let to = pop_lsb(&mut bb);
-        emit_scored(buf, &mut count, Move::new(Square((to.0 as i8 - west_dir) as u8), to));
+        emit_scored(
+            buf,
+            &mut count,
+            Move::new(Square((to.0 as i8 - west_dir) as u8), to),
+        );
     }
 
     // Promotion captures (all 4 types)
@@ -117,19 +136,51 @@ pub fn generate_captures(pos: &Position, buf: &mut ArrayBuf<ScoredMove, MAX_MOVE
     while bb != 0 {
         let to = pop_lsb(&mut bb);
         let from = Square((to.0 as i8 - east_dir) as u8);
-        emit_scored(buf, &mut count, Move::new_promotion(from, to, PieceType::Queen));
-        emit_scored(buf, &mut count, Move::new_promotion(from, to, PieceType::Rook));
-        emit_scored(buf, &mut count, Move::new_promotion(from, to, PieceType::Bishop));
-        emit_scored(buf, &mut count, Move::new_promotion(from, to, PieceType::Knight));
+        emit_scored(
+            buf,
+            &mut count,
+            Move::new_promotion(from, to, PieceType::Queen),
+        );
+        emit_scored(
+            buf,
+            &mut count,
+            Move::new_promotion(from, to, PieceType::Rook),
+        );
+        emit_scored(
+            buf,
+            &mut count,
+            Move::new_promotion(from, to, PieceType::Bishop),
+        );
+        emit_scored(
+            buf,
+            &mut count,
+            Move::new_promotion(from, to, PieceType::Knight),
+        );
     }
     let mut bb = cap_west & promo_rank;
     while bb != 0 {
         let to = pop_lsb(&mut bb);
         let from = Square((to.0 as i8 - west_dir) as u8);
-        emit_scored(buf, &mut count, Move::new_promotion(from, to, PieceType::Queen));
-        emit_scored(buf, &mut count, Move::new_promotion(from, to, PieceType::Rook));
-        emit_scored(buf, &mut count, Move::new_promotion(from, to, PieceType::Bishop));
-        emit_scored(buf, &mut count, Move::new_promotion(from, to, PieceType::Knight));
+        emit_scored(
+            buf,
+            &mut count,
+            Move::new_promotion(from, to, PieceType::Queen),
+        );
+        emit_scored(
+            buf,
+            &mut count,
+            Move::new_promotion(from, to, PieceType::Rook),
+        );
+        emit_scored(
+            buf,
+            &mut count,
+            Move::new_promotion(from, to, PieceType::Bishop),
+        );
+        emit_scored(
+            buf,
+            &mut count,
+            Move::new_promotion(from, to, PieceType::Knight),
+        );
     }
 
     // Queen push-promotions only (underpromotions go to generate_quiets)
@@ -139,7 +190,11 @@ pub fn generate_captures(pos: &Position, buf: &mut ArrayBuf<ScoredMove, MAX_MOVE
     while bb != 0 {
         let to = pop_lsb(&mut bb);
         let from = Square((to.0 as i8 - push_dir) as u8);
-        emit_scored(buf, &mut count, Move::new_promotion(from, to, PieceType::Queen));
+        emit_scored(
+            buf,
+            &mut count,
+            Move::new_promotion(from, to, PieceType::Queen),
+        );
     }
 
     // En passant
@@ -148,13 +203,22 @@ pub fn generate_captures(pos: &Position, buf: &mut ArrayBuf<ScoredMove, MAX_MOVE
         let mut ep_pawns = pawn_attacks(ep, them) & pawns;
         while ep_pawns != 0 {
             let from = pop_lsb(&mut ep_pawns);
-            emit_scored(buf, &mut count, Move::new_with_type(from, ep, MT_EN_PASSANT));
+            emit_scored(
+                buf,
+                &mut count,
+                Move::new_with_type(from, ep, MT_EN_PASSANT),
+            );
         }
     }
 
     // Piece captures
     let capture_targets = their_pieces & check_mask;
-    for pt in [PieceType::Knight, PieceType::Bishop, PieceType::Rook, PieceType::Queen] {
+    for pt in [
+        PieceType::Knight,
+        PieceType::Bishop,
+        PieceType::Rook,
+        PieceType::Queen,
+    ] {
         let mut bb = pos.piece_type_bb(pt, us);
         while bb != 0 {
             let from = pop_lsb(&mut bb);
@@ -186,8 +250,12 @@ pub fn generate_captures(pos: &Position, buf: &mut ArrayBuf<ScoredMove, MAX_MOVE
         let m = buf[i].mv;
         if m.move_type() != MT_EN_PASSANT && m.move_type() != MT_PROMOTION {
             let dest = pos.board[m.to_sq().index()];
-            debug_assert!(dest == Piece::NONE || dest.piece_type() != PieceType::King,
-                "generate_captures: king capture {} at to={}", m.to_uci(), m.to_sq().0);
+            debug_assert!(
+                dest == Piece::NONE || dest.piece_type() != PieceType::King,
+                "generate_captures: king capture {} at to={}",
+                m.to_uci(),
+                m.to_sq().0
+            );
         }
     }
     count
@@ -237,14 +305,22 @@ pub fn generate_quiets(pos: &Position, buf: &mut ArrayBuf<ScoredMove, MAX_MOVES>
     let mut bb = single_push & !promo_rank & check_mask;
     while bb != 0 {
         let to = pop_lsb(&mut bb);
-        emit_scored(buf, &mut count, Move::new(Square((to.0 as i8 - push_dir) as u8), to));
+        emit_scored(
+            buf,
+            &mut count,
+            Move::new(Square((to.0 as i8 - push_dir) as u8), to),
+        );
     }
 
     // Double push
     let mut bb = pawn_push_bb(single_push & third_rank, us) & empty & check_mask;
     while bb != 0 {
         let to = pop_lsb(&mut bb);
-        emit_scored(buf, &mut count, Move::new(Square((to.0 as i8 - 2 * push_dir) as u8), to));
+        emit_scored(
+            buf,
+            &mut count,
+            Move::new(Square((to.0 as i8 - 2 * push_dir) as u8), to),
+        );
     }
 
     // Push underpromotions (R/B/N) — queen already in generate_captures
@@ -253,14 +329,31 @@ pub fn generate_quiets(pos: &Position, buf: &mut ArrayBuf<ScoredMove, MAX_MOVES>
     while bb != 0 {
         let to = pop_lsb(&mut bb);
         let from = Square((to.0 as i8 - push_dir) as u8);
-        emit_scored(buf, &mut count, Move::new_promotion(from, to, PieceType::Rook));
-        emit_scored(buf, &mut count, Move::new_promotion(from, to, PieceType::Bishop));
-        emit_scored(buf, &mut count, Move::new_promotion(from, to, PieceType::Knight));
+        emit_scored(
+            buf,
+            &mut count,
+            Move::new_promotion(from, to, PieceType::Rook),
+        );
+        emit_scored(
+            buf,
+            &mut count,
+            Move::new_promotion(from, to, PieceType::Bishop),
+        );
+        emit_scored(
+            buf,
+            &mut count,
+            Move::new_promotion(from, to, PieceType::Knight),
+        );
     }
 
     // Piece quiet moves
     let quiet_targets = empty & check_mask;
-    for pt in [PieceType::Knight, PieceType::Bishop, PieceType::Rook, PieceType::Queen] {
+    for pt in [
+        PieceType::Knight,
+        PieceType::Bishop,
+        PieceType::Rook,
+        PieceType::Queen,
+    ] {
         let mut bb = pos.piece_type_bb(pt, us);
         while bb != 0 {
             let from = pop_lsb(&mut bb);
@@ -302,8 +395,11 @@ fn generate_moves(pos: &Position, buf: &mut ArrayBuf<Move, MAX_MOVES>, count: &m
     let empty = !occupied;
     let ksq = pos.king_sq(us);
     debug_assert!(ksq.0 < 64, "generate_moves: king_sq invalid {}", ksq.0);
-    debug_assert!(popcount(pos.checkers) <= 2,
-        "generate_moves: {} checkers", popcount(pos.checkers));
+    debug_assert!(
+        popcount(pos.checkers) <= 2,
+        "generate_moves: {} checkers",
+        popcount(pos.checkers)
+    );
     #[cfg(debug_assertions)]
     let count_before = *count;
 
@@ -325,11 +421,58 @@ fn generate_moves(pos: &Position, buf: &mut ArrayBuf<Move, MAX_MOVES>, count: &m
         check_mask = !0u64; // no check, all targets valid
     }
 
-    generate_pawn_moves(pos, buf, count, us, them, our_pieces, their_pieces, occupied, empty, check_mask);
-    generate_piece_moves(pos, buf, count, us, our_pieces, occupied, check_mask, PieceType::Knight);
-    generate_piece_moves(pos, buf, count, us, our_pieces, occupied, check_mask, PieceType::Bishop);
-    generate_piece_moves(pos, buf, count, us, our_pieces, occupied, check_mask, PieceType::Rook);
-    generate_piece_moves(pos, buf, count, us, our_pieces, occupied, check_mask, PieceType::Queen);
+    generate_pawn_moves(
+        pos,
+        buf,
+        count,
+        us,
+        them,
+        our_pieces,
+        their_pieces,
+        occupied,
+        empty,
+        check_mask,
+    );
+    generate_piece_moves(
+        pos,
+        buf,
+        count,
+        us,
+        our_pieces,
+        occupied,
+        check_mask,
+        PieceType::Knight,
+    );
+    generate_piece_moves(
+        pos,
+        buf,
+        count,
+        us,
+        our_pieces,
+        occupied,
+        check_mask,
+        PieceType::Bishop,
+    );
+    generate_piece_moves(
+        pos,
+        buf,
+        count,
+        us,
+        our_pieces,
+        occupied,
+        check_mask,
+        PieceType::Rook,
+    );
+    generate_piece_moves(
+        pos,
+        buf,
+        count,
+        us,
+        our_pieces,
+        occupied,
+        check_mask,
+        PieceType::Queen,
+    );
     generate_king_moves(pos, buf, count, us, ksq, our_pieces);
 
     // Castling (only when not in check)
@@ -342,8 +485,12 @@ fn generate_moves(pos: &Position, buf: &mut ArrayBuf<Move, MAX_MOVES>, count: &m
     for i in count_before..*count {
         let m = buf[i];
         let dest = pos.board[m.to_sq().index()];
-        debug_assert!(dest == Piece::NONE || dest.piece_type() != PieceType::King,
-            "generate_moves: king capture {} at to={}", m.to_uci(), m.to_sq().0);
+        debug_assert!(
+            dest == Piece::NONE || dest.piece_type() != PieceType::King,
+            "generate_moves: king capture {} at to={}",
+            m.to_uci(),
+            m.to_sq().0
+        );
     }
 }
 
@@ -351,10 +498,16 @@ fn generate_moves(pos: &Position, buf: &mut ArrayBuf<Move, MAX_MOVES>, count: &m
 /// all bitboards in registers, and a struct would put them behind a pointer.
 #[allow(clippy::too_many_arguments)]
 fn generate_pawn_moves(
-    pos: &Position, buf: &mut ArrayBuf<Move, MAX_MOVES>, count: &mut usize,
-    us: Color, them: Color,
-    our_pieces: u64, their_pieces: u64,
-    _occupied: u64, empty: u64, check_mask: u64,
+    pos: &Position,
+    buf: &mut ArrayBuf<Move, MAX_MOVES>,
+    count: &mut usize,
+    us: Color,
+    them: Color,
+    our_pieces: u64,
+    their_pieces: u64,
+    _occupied: u64,
+    empty: u64,
+    check_mask: u64,
 ) {
     let pawns = pos.piece_type_bb(PieceType::Pawn, us) & our_pieces;
     let (promo_rank, third_rank) = match us {
@@ -397,7 +550,11 @@ fn generate_pawn_moves(
     }
 
     // Normal captures east
-    let east_dir: i8 = if us == Color::White { NORTH_EAST } else { SOUTH_EAST };
+    let east_dir: i8 = if us == Color::White {
+        NORTH_EAST
+    } else {
+        SOUTH_EAST
+    };
     let mut bb = normal_cap_east;
     while bb != 0 {
         let to = pop_lsb(&mut bb);
@@ -406,7 +563,11 @@ fn generate_pawn_moves(
     }
 
     // Normal captures west
-    let west_dir: i8 = if us == Color::White { NORTH_WEST } else { SOUTH_WEST };
+    let west_dir: i8 = if us == Color::White {
+        NORTH_WEST
+    } else {
+        SOUTH_WEST
+    };
     let mut bb = normal_cap_west;
     while bb != 0 {
         let to = pop_lsb(&mut bb);
@@ -460,9 +621,14 @@ fn generate_pawn_moves(
 
 #[allow(clippy::too_many_arguments)]
 fn generate_piece_moves(
-    pos: &Position, buf: &mut ArrayBuf<Move, MAX_MOVES>, count: &mut usize,
-    us: Color, our_pieces: u64, occupied: u64,
-    check_mask: u64, pt: PieceType,
+    pos: &Position,
+    buf: &mut ArrayBuf<Move, MAX_MOVES>,
+    count: &mut usize,
+    us: Color,
+    our_pieces: u64,
+    occupied: u64,
+    check_mask: u64,
+    pt: PieceType,
 ) {
     let mut bb = pos.piece_type_bb(pt, us);
     let targets = !our_pieces & check_mask;
@@ -485,8 +651,12 @@ fn generate_piece_moves(
 }
 
 fn generate_king_moves(
-    _pos: &Position, buf: &mut ArrayBuf<Move, MAX_MOVES>, count: &mut usize,
-    _us: Color, ksq: Square, our_pieces: u64,
+    _pos: &Position,
+    buf: &mut ArrayBuf<Move, MAX_MOVES>,
+    count: &mut usize,
+    _us: Color,
+    ksq: Square,
+    our_pieces: u64,
 ) {
     let mut attacks = king_attacks(ksq) & !our_pieces;
     while attacks != 0 {
@@ -501,7 +671,10 @@ fn can_castle(pos: &Position, us: Color, right: u8, occupied: u64) -> Option<Mov
     }
     let idx = castling_idx(right);
     let rook_from = pos.castling_rook[idx];
-    debug_assert!(rook_from.0 < 64, "can_castle: rook square unset for right {right}");
+    debug_assert!(
+        rook_from.0 < 64,
+        "can_castle: rook square unset for right {right}"
+    );
     if pos.pinned & rook_from.bb() != 0 {
         return None;
     }
@@ -514,8 +687,11 @@ fn can_castle(pos: &Position, us: Color, right: u8, occupied: u64) -> Option<Mov
 }
 
 fn generate_castling(
-    pos: &Position, buf: &mut ArrayBuf<Move, MAX_MOVES>, count: &mut usize,
-    us: Color, occupied: u64,
+    pos: &Position,
+    buf: &mut ArrayBuf<Move, MAX_MOVES>,
+    count: &mut usize,
+    us: Color,
+    occupied: u64,
 ) {
     let (oo, ooo) = castling_rights_for(us);
     for right in [oo, ooo] {
@@ -526,8 +702,11 @@ fn generate_castling(
 }
 
 fn generate_castling_scored(
-    pos: &Position, buf: &mut ArrayBuf<ScoredMove, MAX_MOVES>, count: &mut usize,
-    us: Color, occupied: u64,
+    pos: &Position,
+    buf: &mut ArrayBuf<ScoredMove, MAX_MOVES>,
+    count: &mut usize,
+    us: Color,
+    occupied: u64,
 ) {
     let (oo, ooo) = castling_rights_for(us);
     for right in [oo, ooo] {
@@ -542,8 +721,12 @@ fn generate_castling_scored(
 // ============================================================
 
 pub fn is_legal(pos: &Position, m: Move) -> bool {
-    debug_assert!(m.from_sq().0 < 64 && m.to_sq().0 < 64,
-        "is_legal: squares OOB from={} to={}", m.from_sq().0, m.to_sq().0);
+    debug_assert!(
+        m.from_sq().0 < 64 && m.to_sq().0 < 64,
+        "is_legal: squares OOB from={} to={}",
+        m.from_sq().0,
+        m.to_sq().0
+    );
     let us = pos.side_to_move;
     let from = m.from_sq();
     let to = m.to_sq();
@@ -558,10 +741,10 @@ pub fn is_legal(pos: &Position, m: Move) -> bool {
         let cap_sq = Square((to.0 as i8 - pawn_push(us)) as u8);
         let occ = (pos.occupied() ^ from.bb() ^ cap_sq.bb()) | to.bb();
         let them = !us;
-        let their_bq = pos.piece_type_bb(PieceType::Bishop, them)
-            | pos.piece_type_bb(PieceType::Queen, them);
-        let their_rq = pos.piece_type_bb(PieceType::Rook, them)
-            | pos.piece_type_bb(PieceType::Queen, them);
+        let their_bq =
+            pos.piece_type_bb(PieceType::Bishop, them) | pos.piece_type_bb(PieceType::Queen, them);
+        let their_rq =
+            pos.piece_type_bb(PieceType::Rook, them) | pos.piece_type_bb(PieceType::Queen, them);
         return (bishop_attacks(ksq, occ) & their_bq) == 0
             && (rook_attacks(ksq, occ) & their_rq) == 0;
     }
@@ -570,9 +753,17 @@ pub fn is_legal(pos: &Position, m: Move) -> bool {
         // Check that king doesn't pass through attacked squares
         let them = !us;
         let right = if to.file() > from.file() {
-            if us == Color::White { WHITE_OO } else { BLACK_OO }
+            if us == Color::White {
+                WHITE_OO
+            } else {
+                BLACK_OO
+            }
         } else {
-            if us == Color::White { WHITE_OOO } else { BLACK_OOO }
+            if us == Color::White {
+                WHITE_OOO
+            } else {
+                BLACK_OOO
+            }
         };
         debug_assert!(pos.castling_rights & right != 0);
         debug_assert!(to == pos.castle_rook_sq(right));
@@ -615,8 +806,12 @@ pub fn is_pseudo_legal(pos: &Position, m: Move) -> bool {
     if m == Move::NONE || m == Move::NULL {
         return false;
     }
-    debug_assert!(m.from_sq().0 < 64 && m.to_sq().0 < 64,
-        "is_pseudo_legal: squares OOB from={} to={}", m.from_sq().0, m.to_sq().0);
+    debug_assert!(
+        m.from_sq().0 < 64 && m.to_sq().0 < 64,
+        "is_pseudo_legal: squares OOB from={} to={}",
+        m.from_sq().0,
+        m.to_sq().0
+    );
 
     let us = pos.side_to_move;
     let them = !us;
@@ -636,9 +831,17 @@ pub fn is_pseudo_legal(pos: &Position, m: Move) -> bool {
             return false;
         }
         let right = if to.file() > from.file() {
-            if us == Color::White { WHITE_OO } else { BLACK_OO }
+            if us == Color::White {
+                WHITE_OO
+            } else {
+                BLACK_OO
+            }
         } else {
-            if us == Color::White { WHITE_OOO } else { BLACK_OOO }
+            if us == Color::White {
+                WHITE_OOO
+            } else {
+                BLACK_OOO
+            }
         };
         if pos.castling_rights & right == 0 {
             return false;

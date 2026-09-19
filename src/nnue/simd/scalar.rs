@@ -12,6 +12,7 @@ pub const I16_LANES: usize = 1;
 pub const I32_LANES: usize = 1;
 /// Number of f32 elements per "register".
 pub const F32_LANES: usize = 1;
+pub const DPBUSD_CHAINS: usize = 1;
 
 // ============================================================
 // i16 operations

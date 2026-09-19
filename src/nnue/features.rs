@@ -83,11 +83,19 @@ mod tests {
     fn test_feature_index_symmetric() {
         // A white pawn on e2, from White's perspective with king on e1
         let idx1 = feature_index(
-            Color::White, PieceType::Pawn, Square::E2, Square::E1, Color::White,
+            Color::White,
+            PieceType::Pawn,
+            Square::E2,
+            Square::E1,
+            Color::White,
         );
         // Same pawn, king on d1 (no mirror) — should give different bucket
         let idx2 = feature_index(
-            Color::White, PieceType::Pawn, Square::E2, Square::D1, Color::White,
+            Color::White,
+            PieceType::Pawn,
+            Square::E2,
+            Square::D1,
+            Color::White,
         );
         assert_ne!(idx1, idx2);
     }
@@ -96,10 +104,18 @@ mod tests {
     fn test_feature_index_mirror() {
         // King on e1 (file 4 >= 4, so mirror): pawn on e2 should map same as pawn on d2 with king on d1
         let idx_mirrored = feature_index(
-            Color::White, PieceType::Pawn, Square::E2, Square::E1, Color::White,
+            Color::White,
+            PieceType::Pawn,
+            Square::E2,
+            Square::E1,
+            Color::White,
         );
         let idx_natural = feature_index(
-            Color::White, PieceType::Pawn, Square::D2, Square::D1, Color::White,
+            Color::White,
+            PieceType::Pawn,
+            Square::D2,
+            Square::D1,
+            Color::White,
         );
         assert_eq!(idx_mirrored, idx_natural);
     }
@@ -137,9 +153,8 @@ mod tests {
                                 4 => PieceType::Queen,
                                 _ => PieceType::King,
                             };
-                            let idx = feature_index(
-                                color, pt_enum, Square(sq), Square(king), persp,
-                            );
+                            let idx =
+                                feature_index(color, pt_enum, Square(sq), Square(king), persp);
                             assert!(idx < FT_SIZE, "idx={idx} >= FT_SIZE={FT_SIZE}");
                         }
                     }
