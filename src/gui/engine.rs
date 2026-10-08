@@ -38,49 +38,54 @@ const RATE_WINDOW_MS: u64 = 500;
 
 /// How fast the engine is searching, read off the wall clock.
 ///
-/// The node counter only ever climbs, so what is shown is how far it climbed over the
-/// last window rather than a total divided by its age: a figure taken the second way
-/// settles on the average of the whole search and stops moving. A window that ends
-/// with nothing in it shows nothing at all, which is what an idle engine reads as.
+/// What is shown is how many nodes were searched over the last window rather than a
+/// total divided by its age: a figure taken the second way settles on the average of
+/// the whole search and stops moving. A window that ends with nothing in it shows
+/// nothing at all, which is what an idle engine reads as.
+///
+/// The engine thread publishes its count every 512 nodes, and the count starts again
+/// from zero with every search; the meter adds up how far it moved between readings,
+/// taking a fall as a new search.
 #[cfg(feature = "gui")]
 struct Rate {
+    counter: std::sync::Arc<crate::threads::NodeCounter>,
     opened: crate::time::Instant,
-    nodes_at_open: u64,
+    last: u64,
+    searched: u64,
     shown: Option<u32>,
 }
 
 #[cfg(feature = "gui")]
 impl Rate {
-    fn new() -> Rate {
-        use std::sync::atomic::Ordering;
-
+    fn new(counter: std::sync::Arc<crate::threads::NodeCounter>) -> Rate {
+        let last = counter.get();
         Rate {
+            counter,
             opened: crate::time::Instant::now(),
-            // Where the counter stands now, not zero: it is process-wide and outlives
-            // any one game, so a meter opening on nothing would report every node of the
-            // game before as if it had been searched in the next half second.
-            nodes_at_open: crate::threads::NODES_SEARCHED.load(Ordering::Relaxed),
+            last,
+            searched: 0,
             shown: None,
         }
     }
 
-    /// Closes the window if it has run its length, and opens the next one.
+    /// Takes a reading, and closes the window if it has run its length.
     fn sample(&mut self) {
-        use std::sync::atomic::Ordering;
+        let nodes = self.counter.get();
+        self.searched += if nodes >= self.last {
+            nodes - self.last
+        } else {
+            nodes
+        };
+        self.last = nodes;
 
         let now = crate::time::Instant::now();
         let span = now.duration_since(self.opened).as_millis() as u64;
         if span < RATE_WINDOW_MS {
             return;
         }
-        let nodes = crate::threads::NODES_SEARCHED.load(Ordering::Relaxed);
-        // Saturating because the bench monitor zeroes the same counter. The two never
-        // run at once, but a rate that reads as nothing beats one that reads as a
-        // billion.
-        let searched = nodes.saturating_sub(self.nodes_at_open);
+        let searched = std::mem::take(&mut self.searched);
         self.shown = (searched > 0).then(|| (searched * 1000 / span).min(u32::MAX as u64) as u32);
         self.opened = now;
-        self.nodes_at_open = nodes;
     }
 }
 
@@ -99,11 +104,10 @@ mod desktop {
     use crate::position::Position;
     use crate::search;
     use crate::skill;
-    use crate::threads::{
-        PONDER, STOP, SharedState, ThreadData, close_node_meter, open_node_meter,
-    };
+    use crate::threads::{NodeCounter, PONDER, STOP, SharedState, ThreadData};
     use crate::timeman::SearchLimits;
     use crate::types::Move;
+    use std::sync::Arc;
 
     /// Stack size for the search thread. Deep recursion with inlined frames needs it.
     const SEARCH_STACK: usize = 32 * 1024 * 1024;
@@ -159,16 +163,13 @@ mod desktop {
         pub fn spawn() -> Engine {
             let (tx, commands) = channel::<Command>();
             let (answers, rx) = channel::<Answer>();
+            // The engine thread publishes its node count here, and the meter reads it.
+            let counter = Arc::new(NodeCounter::default());
+            let published = Arc::clone(&counter);
             let worker = std::thread::Builder::new()
                 .stack_size(SEARCH_STACK)
-                .spawn(move || run_worker(&commands, &answers))
+                .spawn(move || run_worker(&commands, &answers, &published))
                 .expect("failed to spawn the engine thread");
-            // Somebody is watching the rate for as long as there is a board on the
-            // screen, so the meter is opened once here rather than around every search:
-            // it costs one atomic every 512 nodes and nothing else. Closed again when
-            // this engine is dropped, and counted rather than flagged so that an engine
-            // outliving another does not lose the counter with it.
-            open_node_meter();
             Engine {
                 tx,
                 rx,
@@ -176,7 +177,7 @@ mod desktop {
                 generation: 0,
                 busy: Busy::Idle,
                 pondered: 0,
-                rate: Rate::new(),
+                rate: Rate::new(counter),
             }
         }
 
@@ -330,6 +331,12 @@ mod desktop {
         pub fn nps(&self) -> Option<u32> {
             self.rate.shown
         }
+
+        /// The engine thread's node count for its current search, as last published.
+        #[cfg(test)]
+        pub(crate) fn published_nodes(&self) -> u64 {
+            self.rate.counter.get()
+        }
     }
 
     impl Drop for Engine {
@@ -341,11 +348,14 @@ mod desktop {
                 // promptly even from the middle of a deep search.
                 let _ = worker.join();
             }
-            close_node_meter();
         }
     }
 
-    fn run_worker(commands: &Receiver<Command>, answers: &Sender<Answer>) {
+    fn run_worker(
+        commands: &Receiver<Command>,
+        answers: &Sender<Answer>,
+        counter: &Arc<NodeCounter>,
+    ) {
         // The DTM tablebases, same as the UCI path loads: the rungs were calibrated
         // over an engine that probes them, so a game here must probe them too. Done on
         // this thread, where decompressing the blob costs a beat nobody sees, not a
@@ -360,6 +370,7 @@ mod desktop {
         // Taking a helper's id instead would buy the silence at the price of the rest.
         let mut td = ThreadData::new(0);
         td.silent = true;
+        td.node_counter = Arc::clone(counter);
 
         while let Ok(command) = commands.recv() {
             match command {
@@ -368,6 +379,7 @@ mod desktop {
                     shared = SharedState::new(TT_MB, 1);
                     td = ThreadData::new(0);
                     td.silent = true;
+                    td.node_counter = Arc::clone(counter);
                 }
                 Command::Search {
                     pos,
@@ -781,24 +793,22 @@ mod ponder_tests {
     /// was searched is a different fault from one that stayed quiet while the counter
     /// climbed, and the message says which.
     fn watch(engine: &mut Engine, what: &str, ready: impl Fn(&Engine) -> bool) {
-        use crate::threads::NODES_SEARCHED;
-        use std::sync::atomic::Ordering;
-
         let budget = std::time::Duration::from_secs(30);
         let start = std::time::Instant::now();
-        let nodes_at_start = NODES_SEARCHED.load(Ordering::Relaxed);
+        let mut searched = 0u64;
+        let mut last = engine.published_nodes();
         let mut turns = 0u32;
         while start.elapsed() < budget {
             engine.tick();
+            let now = engine.published_nodes();
+            searched += if now >= last { now - last } else { now };
+            last = now;
             turns += 1;
             if ready(engine) {
                 return;
             }
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
-        let searched = NODES_SEARCHED
-            .load(Ordering::Relaxed)
-            .saturating_sub(nodes_at_start);
         panic!(
             "{what} (waited {:.1}s over {turns} turns; the node counter moved by {searched})",
             start.elapsed().as_secs_f32()

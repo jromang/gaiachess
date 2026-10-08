@@ -8,9 +8,7 @@ use crate::progress::{ProgressBar, ProgressStyle};
 
 use crate::position::Position;
 use crate::search;
-use crate::threads::{
-    NODES_SEARCHED, STOP, SharedState, ThreadData, ThreadPool, close_node_meter, open_node_meter,
-};
+use crate::threads::{STOP, SharedState, ThreadData, ThreadPool};
 use crate::timeman::SearchLimits;
 /// 27 unique positions from gaia3.0's profile() function (gaia3.0/src/util.c:328).
 pub(crate) const POSITIONS: [&str; 27] = [
@@ -69,8 +67,6 @@ pub fn run(depth_override: Option<i32>, threads: Option<usize>) {
     #[cfg(feature = "stats")]
     let mut agg_stats = crate::stats::SearchStats::zeroed();
 
-    open_node_meter();
-
     let pb = ProgressBar::new(total);
     pb.set_style(
         ProgressStyle::with_template(
@@ -86,7 +82,6 @@ pub fn run(depth_override: Option<i32>, threads: Option<usize>) {
         let limits = SearchLimits::depth(depth);
 
         STOP.store(false, Ordering::Relaxed);
-        NODES_SEARCHED.store(0, Ordering::Relaxed);
 
         // Prepare search — override tm since prepare_search gives infinite
         // limits to id!=0 (same pattern as datagen.rs:prepare_datagen_search)
@@ -107,8 +102,6 @@ pub fn run(depth_override: Option<i32>, threads: Option<usize>) {
         agg_stats.add(&td.stats);
         pb.set_position(i as u64 + 1);
     }
-
-    close_node_meter();
 
     // Final summary
     let avg_nps = if total_time_ms > 0 {
@@ -148,9 +141,8 @@ pub fn run(depth_override: Option<i32>, threads: Option<usize>) {
 /// **aggregate** NPS — every thread's nodes over the wall clock — and the
 /// node-identity contract stays with the single-threaded bench.
 ///
-/// No meter is opened on the node counter: it would add an atomic increment every 512
-/// nodes on every thread, and measuring contention with a counter that manufactures its
-/// own is not a measurement.
+/// Every thread publishes its node count on a cache line of its own, so the counters
+/// manufacture no contention of their own.
 fn run_threaded(depth: i32, threads: usize) {
     let total = POSITIONS.len() as u64;
     let mut pool = ThreadPool::new(threads, BENCH_HASH_MB);
@@ -219,8 +211,6 @@ pub fn run_stats(depth_override: Option<i32>, num_runs: u32, verbose: bool) {
     let mut shared = SharedState::new(BENCH_HASH_MB, 1);
     let mut td = ThreadData::new(1);
 
-    open_node_meter();
-
     // Storage: per-position NPS across measured runs, plus overall NPS per run
     let mut nps_per_position: Vec<Vec<f64>> = vec![Vec::with_capacity(num_runs); num_positions];
     let mut nps_overall: Vec<f64> = Vec::with_capacity(num_runs);
@@ -255,7 +245,6 @@ pub fn run_stats(depth_override: Option<i32>, num_runs: u32, verbose: bool) {
             let limits = SearchLimits::depth(depth);
 
             STOP.store(false, Ordering::Relaxed);
-            NODES_SEARCHED.store(0, Ordering::Relaxed);
 
             td.prepare_search(&pos, &limits);
             let game_ply = td.pos.game_ply();
@@ -293,7 +282,6 @@ pub fn run_stats(depth_override: Option<i32>, num_runs: u32, verbose: bool) {
         }
     }
 
-    close_node_meter();
     pb.finish_with_message("done");
 
     // Compute statistics

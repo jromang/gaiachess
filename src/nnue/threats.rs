@@ -34,7 +34,7 @@ use crate::types::{
 
 use super::accumulator::AccDelta;
 use super::kernels::dispatch::threat_batch;
-use super::network::{self, Aligned};
+use super::network::{self, Aligned, NNUEParams};
 use super::pawn_pairs;
 use super::{L1_SIZE, OUTPUT_BUCKETS, THREAT_FEATURE_COUNT, THREAT_OFFSET};
 
@@ -538,7 +538,14 @@ impl DirtyFeatures {
 pub fn compute_full_threats(
     pos: &Position,
 ) -> (Aligned<[[i16; L1_SIZE]; 2]>, [[i32; OUTPUT_BUCKETS]; 2]) {
-    let params = network::params();
+    compute_full_threats_with(network::params(), pos)
+}
+
+/// [`compute_full_threats`] on a given copy of the network.
+pub fn compute_full_threats_with(
+    params: &NNUEParams,
+    pos: &Position,
+) -> (Aligned<[[i16; L1_SIZE]; 2]>, [[i32; OUTPUT_BUCKETS]; 2]) {
     let mut result = Aligned([[0i16; L1_SIZE]; 2]);
     let mut psqt = [[0i32; OUTPUT_BUCKETS]; 2];
 
@@ -707,8 +714,8 @@ impl ThreatAccumulator {
     }
 
     /// Full recompute from scratch (no parent available).
-    pub fn update_full(&mut self, pos: &Position) {
-        let (values, psqt) = compute_full_threats(pos);
+    pub fn update_full(&mut self, params: &NNUEParams, pos: &Position) {
+        let (values, psqt) = compute_full_threats_with(params, pos);
         self.values = values;
         self.psqt = psqt;
         let king_sq = [pos.king_sq(Color::White), pos.king_sq(Color::Black)];
@@ -729,6 +736,7 @@ impl ThreatAccumulator {
     /// to avoid double-counting.
     pub(super) fn update_incremental(
         &mut self,
+        params: &NNUEParams,
         new: &BoardView,
         old: &BoardView,
         parent: &ThreatAccumulator,
@@ -776,7 +784,6 @@ impl ThreatAccumulator {
         }
         let changed_sq_bb = remove_bb | add_bb;
 
-        let params = network::params();
         let weights_base = params.ft_threat_weights.0.as_ptr();
 
         // One enumeration serves both perspectives: an attack is the same fact seen

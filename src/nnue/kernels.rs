@@ -155,11 +155,11 @@ macro_rules! nnue_kernels {
         $(#[$tf])?
         #[inline]
         pub unsafe fn propagate_l1(
+            params: &network::NNUEParams,
             ft_out: &Aligned<[u8; L1_SIZE]>,
             nnz: &[u16],
             bucket: usize,
         ) -> Aligned<[f32; 2 * L2_SIZE]> {
-            let params = network::params();
 
             let packed = ft_out.0.as_ptr() as *const i32;
             let n_vecs = L2_SIZE / simd::F32_LANES;
@@ -272,10 +272,10 @@ macro_rules! nnue_kernels {
         $(#[$tf])?
         #[inline]
         pub unsafe fn propagate_l2(
+            params: &network::NNUEParams,
             l1_out: &Aligned<[f32; 2 * L2_SIZE]>,
             bucket: usize,
         ) -> Aligned<[f32; L3_SIZE]> {
-            let params = network::params();
             let mut output = Aligned([0.0f32; L3_SIZE]);
 
             if simd::F32_LANES == 1 {
@@ -332,11 +332,11 @@ macro_rules! nnue_kernels {
         $(#[$tf])?
         #[inline]
         pub unsafe fn propagate_l3(
+            params: &network::NNUEParams,
             l2_out: &Aligned<[f32; L3_SIZE]>,
             l1_out: &Aligned<[f32; 2 * L2_SIZE]>,
             bucket: usize,
         ) -> f32 {
-            let params = network::params();
 
             let l2_ptr = l2_out.0.as_ptr();
             let l1_ptr = l1_out.0.as_ptr();
@@ -384,6 +384,7 @@ macro_rules! nnue_kernels {
         $(#[$tf])?
         #[inline]
         pub unsafe fn forward_dense(
+            params: &network::NNUEParams,
             pst_acc: &Accumulator,
             combined: &Aligned<[[i16; L1_SIZE]; 2]>,
             stm: Color,
@@ -403,9 +404,9 @@ macro_rules! nnue_kernels {
                 not(all(target_feature = "avx512bw", target_feature = "avx512vbmi2"))
             ))]
             let (nnz_indices, nnz_count) = (crate::cpu::get().find_nnz)(&ft_out);
-            let l1_out = propagate_l1(&ft_out, &nnz_indices[..nnz_count], bucket);
-            let l2_out = propagate_l2(&l1_out, bucket);
-            propagate_l3(&l2_out, &l1_out, bucket)
+            let l1_out = propagate_l1(params, &ft_out, &nnz_indices[..nnz_count], bucket);
+            let l2_out = propagate_l2(params, &l1_out, bucket);
+            propagate_l3(params, &l2_out, &l1_out, bucket)
         }
 
         // ============================================================
@@ -415,9 +416,15 @@ macro_rules! nnue_kernels {
         /// Normal move: one feature added, one removed.
         $(#[$tf])?
         #[inline]
-        pub unsafe fn acc_add1_sub1(prev: *const i16, out: *mut i16, add1: usize, sub1: usize) {
-            let vadd = network::params().ft_pst_weights.0[add1].as_ptr();
-            let vsub = network::params().ft_pst_weights.0[sub1].as_ptr();
+        pub unsafe fn acc_add1_sub1(
+            params: &network::NNUEParams,
+            prev: *const i16,
+            out: *mut i16,
+            add1: usize,
+            sub1: usize,
+        ) {
+            let vadd = params.ft_pst_weights.0[add1].as_ptr();
+            let vsub = params.ft_pst_weights.0[sub1].as_ptr();
             for i in (0..L1_SIZE).step_by(simd::I16_LANES) {
                 let mut v = *prev.add(i).cast();
                 v = simd::add_i16(v, *vadd.add(i).cast());
@@ -430,15 +437,16 @@ macro_rules! nnue_kernels {
         $(#[$tf])?
         #[inline]
         pub unsafe fn acc_add1_sub2(
+            params: &network::NNUEParams,
             prev: *const i16,
             out: *mut i16,
             add1: usize,
             sub1: usize,
             sub2: usize,
         ) {
-            let vadd = network::params().ft_pst_weights.0[add1].as_ptr();
-            let vsub1 = network::params().ft_pst_weights.0[sub1].as_ptr();
-            let vsub2 = network::params().ft_pst_weights.0[sub2].as_ptr();
+            let vadd = params.ft_pst_weights.0[add1].as_ptr();
+            let vsub1 = params.ft_pst_weights.0[sub1].as_ptr();
+            let vsub2 = params.ft_pst_weights.0[sub2].as_ptr();
             for i in (0..L1_SIZE).step_by(simd::I16_LANES) {
                 let mut v = *prev.add(i).cast();
                 v = simd::add_i16(v, *vadd.add(i).cast());
@@ -452,6 +460,7 @@ macro_rules! nnue_kernels {
         $(#[$tf])?
         #[inline]
         pub unsafe fn acc_add2_sub2(
+            params: &network::NNUEParams,
             prev: *const i16,
             out: *mut i16,
             add1: usize,
@@ -459,10 +468,10 @@ macro_rules! nnue_kernels {
             sub1: usize,
             sub2: usize,
         ) {
-            let vadd1 = network::params().ft_pst_weights.0[add1].as_ptr();
-            let vadd2 = network::params().ft_pst_weights.0[add2].as_ptr();
-            let vsub1 = network::params().ft_pst_weights.0[sub1].as_ptr();
-            let vsub2 = network::params().ft_pst_weights.0[sub2].as_ptr();
+            let vadd1 = params.ft_pst_weights.0[add1].as_ptr();
+            let vadd2 = params.ft_pst_weights.0[add2].as_ptr();
+            let vsub1 = params.ft_pst_weights.0[sub1].as_ptr();
+            let vsub2 = params.ft_pst_weights.0[sub2].as_ptr();
             for i in (0..L1_SIZE).step_by(simd::I16_LANES) {
                 let mut v = *prev.add(i).cast();
                 v = simd::add_i16(v, *vadd1.add(i).cast());
@@ -483,7 +492,12 @@ macro_rules! nnue_kernels {
         /// adds/subs, then stores back. This minimizes memory round-trips.
         $(#[$tf])?
         #[inline]
-        pub unsafe fn finny_apply(values: *mut i16, adds: &[usize], subs: &[usize]) {
+        pub unsafe fn finny_apply(
+            params: &network::NNUEParams,
+            values: *mut i16,
+            adds: &[usize],
+            subs: &[usize],
+        ) {
             const REGS: usize = crate::nnue::kernels::FINNY_REGISTERS;
             let mut regs: [_; REGS] = std::mem::zeroed();
 
@@ -497,7 +511,7 @@ macro_rules! nnue_kernels {
 
                 // Apply all additions
                 for &idx in adds {
-                    let w = network::params().ft_pst_weights.0[idx].as_ptr().add(offset);
+                    let w = params.ft_pst_weights.0[idx].as_ptr().add(offset);
                     for (i, r) in regs.iter_mut().enumerate() {
                         *r = simd::add_i16(*r, *w.add(i * simd::I16_LANES).cast());
                     }
@@ -505,7 +519,7 @@ macro_rules! nnue_kernels {
 
                 // Apply all subtractions
                 for &idx in subs {
-                    let w = network::params().ft_pst_weights.0[idx].as_ptr().add(offset);
+                    let w = params.ft_pst_weights.0[idx].as_ptr().add(offset);
                     for (i, r) in regs.iter_mut().enumerate() {
                         *r = simd::sub_i16(*r, *w.add(i * simd::I16_LANES).cast());
                     }
@@ -858,17 +872,22 @@ pub mod arm {
     use super::{k_dotprod, k_neon};
     use crate::nnue::L1_SIZE;
     use crate::nnue::accumulator::Accumulator;
-    use crate::nnue::network::Aligned;
+    use crate::nnue::network::{Aligned, NNUEParams};
     use crate::types::Color;
     use std::sync::OnceLock;
 
     pub struct Table {
-        pub forward_dense:
-            unsafe fn(&Accumulator, &Aligned<[[i16; L1_SIZE]; 2]>, Color, usize) -> f32,
-        pub acc_add1_sub1: unsafe fn(*const i16, *mut i16, usize, usize),
-        pub acc_add1_sub2: unsafe fn(*const i16, *mut i16, usize, usize, usize),
-        pub acc_add2_sub2: unsafe fn(*const i16, *mut i16, usize, usize, usize, usize),
-        pub finny_apply: unsafe fn(*mut i16, &[usize], &[usize]),
+        pub forward_dense: unsafe fn(
+            &NNUEParams,
+            &Accumulator,
+            &Aligned<[[i16; L1_SIZE]; 2]>,
+            Color,
+            usize,
+        ) -> f32,
+        pub acc_add1_sub1: unsafe fn(&NNUEParams, *const i16, *mut i16, usize, usize),
+        pub acc_add1_sub2: unsafe fn(&NNUEParams, *const i16, *mut i16, usize, usize, usize),
+        pub acc_add2_sub2: unsafe fn(&NNUEParams, *const i16, *mut i16, usize, usize, usize, usize),
+        pub finny_apply: unsafe fn(&NNUEParams, *mut i16, &[usize], &[usize]),
         pub threat_batch: unsafe fn(*const i16, *mut i16, *const [i8; L1_SIZE], &[u32], &[u32]),
         pub dotprod: bool,
         #[allow(dead_code)]
@@ -973,12 +992,13 @@ pub mod arm {
 pub(crate) mod dispatch {
     use crate::nnue::L1_SIZE;
     use crate::nnue::accumulator::Accumulator;
-    use crate::nnue::network::Aligned;
+    use crate::nnue::network::{Aligned, NNUEParams};
     use crate::types::Color;
 
     /// Forward pass through the dense layers, on the resolved tier.
     #[inline(always)]
     pub unsafe fn forward_dense(
+        params: &NNUEParams,
         pst_acc: &Accumulator,
         combined: &Aligned<[[i16; L1_SIZE]; 2]>,
         stm: Color,
@@ -987,53 +1007,60 @@ pub(crate) mod dispatch {
         #[cfg(target_arch = "x86_64")]
         {
             if super::STATIC_TOP {
-                super::k::forward_dense(pst_acc, combined, stm, bucket)
+                super::k::forward_dense(params, pst_acc, combined, stm, bucket)
             } else {
-                (crate::cpu::get().forward_dense)(pst_acc, combined, stm, bucket)
+                (crate::cpu::get().forward_dense)(params, pst_acc, combined, stm, bucket)
             }
         }
         #[cfg(target_arch = "aarch64")]
         {
             if super::STATIC_TOP {
-                super::k::forward_dense(pst_acc, combined, stm, bucket)
+                super::k::forward_dense(params, pst_acc, combined, stm, bucket)
             } else {
-                (super::arm::get().forward_dense)(pst_acc, combined, stm, bucket)
+                (super::arm::get().forward_dense)(params, pst_acc, combined, stm, bucket)
             }
         }
         #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
         {
-            super::k::forward_dense(pst_acc, combined, stm, bucket)
+            super::k::forward_dense(params, pst_acc, combined, stm, bucket)
         }
     }
 
     /// Normal move: one feature added, one removed.
     #[inline(always)]
-    pub unsafe fn acc_add1_sub1(prev: *const i16, out: *mut i16, add1: usize, sub1: usize) {
+    pub unsafe fn acc_add1_sub1(
+        params: &NNUEParams,
+        prev: *const i16,
+        out: *mut i16,
+        add1: usize,
+        sub1: usize,
+    ) {
         #[cfg(target_arch = "x86_64")]
         {
             if super::STATIC_TOP {
-                super::k::acc_add1_sub1(prev, out, add1, sub1)
+                super::k::acc_add1_sub1(params, prev, out, add1, sub1)
             } else {
-                (crate::cpu::get().acc_add1_sub1)(prev, out, add1, sub1)
+                (crate::cpu::get().acc_add1_sub1)(params, prev, out, add1, sub1)
             }
         }
         #[cfg(target_arch = "aarch64")]
         {
             if super::STATIC_TOP {
-                super::k::acc_add1_sub1(prev, out, add1, sub1)
+                super::k::acc_add1_sub1(params, prev, out, add1, sub1)
             } else {
-                (super::arm::get().acc_add1_sub1)(prev, out, add1, sub1)
+                (super::arm::get().acc_add1_sub1)(params, prev, out, add1, sub1)
             }
         }
         #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
         {
-            super::k::acc_add1_sub1(prev, out, add1, sub1)
+            super::k::acc_add1_sub1(params, prev, out, add1, sub1)
         }
     }
 
     /// Capture / EP: one feature added, two removed.
     #[inline(always)]
     pub unsafe fn acc_add1_sub2(
+        params: &NNUEParams,
         prev: *const i16,
         out: *mut i16,
         add1: usize,
@@ -1043,28 +1070,29 @@ pub(crate) mod dispatch {
         #[cfg(target_arch = "x86_64")]
         {
             if super::STATIC_TOP {
-                super::k::acc_add1_sub2(prev, out, add1, sub1, sub2)
+                super::k::acc_add1_sub2(params, prev, out, add1, sub1, sub2)
             } else {
-                (crate::cpu::get().acc_add1_sub2)(prev, out, add1, sub1, sub2)
+                (crate::cpu::get().acc_add1_sub2)(params, prev, out, add1, sub1, sub2)
             }
         }
         #[cfg(target_arch = "aarch64")]
         {
             if super::STATIC_TOP {
-                super::k::acc_add1_sub2(prev, out, add1, sub1, sub2)
+                super::k::acc_add1_sub2(params, prev, out, add1, sub1, sub2)
             } else {
-                (super::arm::get().acc_add1_sub2)(prev, out, add1, sub1, sub2)
+                (super::arm::get().acc_add1_sub2)(params, prev, out, add1, sub1, sub2)
             }
         }
         #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
         {
-            super::k::acc_add1_sub2(prev, out, add1, sub1, sub2)
+            super::k::acc_add1_sub2(params, prev, out, add1, sub1, sub2)
         }
     }
 
     /// Castling: two features added, two removed.
     #[inline(always)]
     pub unsafe fn acc_add2_sub2(
+        params: &NNUEParams,
         prev: *const i16,
         out: *mut i16,
         add1: usize,
@@ -1075,47 +1103,52 @@ pub(crate) mod dispatch {
         #[cfg(target_arch = "x86_64")]
         {
             if super::STATIC_TOP {
-                super::k::acc_add2_sub2(prev, out, add1, add2, sub1, sub2)
+                super::k::acc_add2_sub2(params, prev, out, add1, add2, sub1, sub2)
             } else {
-                (crate::cpu::get().acc_add2_sub2)(prev, out, add1, add2, sub1, sub2)
+                (crate::cpu::get().acc_add2_sub2)(params, prev, out, add1, add2, sub1, sub2)
             }
         }
         #[cfg(target_arch = "aarch64")]
         {
             if super::STATIC_TOP {
-                super::k::acc_add2_sub2(prev, out, add1, add2, sub1, sub2)
+                super::k::acc_add2_sub2(params, prev, out, add1, add2, sub1, sub2)
             } else {
-                (super::arm::get().acc_add2_sub2)(prev, out, add1, add2, sub1, sub2)
+                (super::arm::get().acc_add2_sub2)(params, prev, out, add1, add2, sub1, sub2)
             }
         }
         #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
         {
-            super::k::acc_add2_sub2(prev, out, add1, add2, sub1, sub2)
+            super::k::acc_add2_sub2(params, prev, out, add1, add2, sub1, sub2)
         }
     }
 
     /// Finny-table register-blocked batch apply.
     #[inline(always)]
-    pub unsafe fn finny_apply(values: *mut i16, adds: &[usize], subs: &[usize]) {
+    pub unsafe fn finny_apply(
+        params: &NNUEParams,
+        values: *mut i16,
+        adds: &[usize],
+        subs: &[usize],
+    ) {
         #[cfg(target_arch = "x86_64")]
         {
             if super::STATIC_TOP {
-                super::k::finny_apply(values, adds, subs)
+                super::k::finny_apply(params, values, adds, subs)
             } else {
-                (crate::cpu::get().finny_apply)(values, adds, subs)
+                (crate::cpu::get().finny_apply)(params, values, adds, subs)
             }
         }
         #[cfg(target_arch = "aarch64")]
         {
             if super::STATIC_TOP {
-                super::k::finny_apply(values, adds, subs)
+                super::k::finny_apply(params, values, adds, subs)
             } else {
-                (super::arm::get().finny_apply)(values, adds, subs)
+                (super::arm::get().finny_apply)(params, values, adds, subs)
             }
         }
         #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
         {
-            super::k::finny_apply(values, adds, subs)
+            super::k::finny_apply(params, values, adds, subs)
         }
     }
 

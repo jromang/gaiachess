@@ -7,7 +7,7 @@ default-members = ["."]
 
 [package]
 name = "gaiachess"
-version = "4.3.2"
+version = "4.3.3"
 edition = "2024"
 rust-version = "1.98"
 authors = ["Jean-François Romang", "David Rabel"]
@@ -80,6 +80,9 @@ sys-locale = { version = "0.3", optional = true }
 # lock file as a dependency of ctrlc, so this costs no new crate.
 [target.'cfg(target_os = "linux")'.dependencies]
 nix = { version = "0.31", features = ["fs", "mman", "socket", "uio"] }
+# Thread affinity and huge pages (src/numa.rs, src/largemem.rs): the affinity masks are
+# sized at run time, which nix's fixed CpuSet cannot do. Already in the lock file.
+libc = "0.2"
 
 # On Haiku the PNG codec that macroquad carries everywhere else: the embedded sheets
 # still have to be decoded, and the headless captures written out.

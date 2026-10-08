@@ -218,7 +218,7 @@ pub fn propagate_l1(
     nnz: &[u16],
     bucket: usize,
 ) -> Aligned<[f32; 2 * L2_SIZE]> {
-    unsafe { k::propagate_l1(ft_out, nnz, bucket) }
+    unsafe { k::propagate_l1(super::network::params(), ft_out, nnz, bucket) }
 }
 
 /// L2 dense layer: f32 matmul + bias → squared activation.
@@ -227,7 +227,7 @@ pub fn propagate_l2(
     l1_out: &Aligned<[f32; 2 * L2_SIZE]>,
     bucket: usize,
 ) -> Aligned<[f32; L3_SIZE]> {
-    unsafe { k::propagate_l2(l1_out, bucket) }
+    unsafe { k::propagate_l2(super::network::params(), l1_out, bucket) }
 }
 
 /// L3 output layer: `dot(concat(l2_out, l1_out), l3_weights) + bias` → scalar.
@@ -237,7 +237,7 @@ pub fn propagate_l3(
     l1_out: &Aligned<[f32; 2 * L2_SIZE]>,
     bucket: usize,
 ) -> f32 {
-    unsafe { k::propagate_l3(l2_out, l1_out, bucket) }
+    unsafe { k::propagate_l3(super::network::params(), l2_out, l1_out, bucket) }
 }
 
 // ============================================================

@@ -25,7 +25,7 @@ use crate::nnue::L1_SIZE;
 use crate::nnue::accumulator::Accumulator;
 use crate::nnue::forward::{self, NNZ_SIZE};
 use crate::nnue::kernels::{self, k_avx2, k_avx512, k_scalar, k_vnni512, threat512};
-use crate::nnue::network::{Aligned, PermKind};
+use crate::nnue::network::{Aligned, NNUEParams, PermKind};
 use crate::types::Color;
 
 // ============================================================
@@ -100,12 +100,13 @@ impl NnzKind {
 /// Function pointers into the resolved kernel instance, plus the metadata the
 /// loader (`perm`) and the `info` report need.
 pub struct CpuDispatch {
-    pub forward_dense: unsafe fn(&Accumulator, &Aligned<[[i16; L1_SIZE]; 2]>, Color, usize) -> f32,
+    pub forward_dense:
+        unsafe fn(&NNUEParams, &Accumulator, &Aligned<[[i16; L1_SIZE]; 2]>, Color, usize) -> f32,
     pub find_nnz: unsafe fn(&Aligned<[u8; L1_SIZE]>) -> ([u16; NNZ_SIZE], usize),
-    pub acc_add1_sub1: unsafe fn(*const i16, *mut i16, usize, usize),
-    pub acc_add1_sub2: unsafe fn(*const i16, *mut i16, usize, usize, usize),
-    pub acc_add2_sub2: unsafe fn(*const i16, *mut i16, usize, usize, usize, usize),
-    pub finny_apply: unsafe fn(*mut i16, &[usize], &[usize]),
+    pub acc_add1_sub1: unsafe fn(&NNUEParams, *const i16, *mut i16, usize, usize),
+    pub acc_add1_sub2: unsafe fn(&NNUEParams, *const i16, *mut i16, usize, usize, usize),
+    pub acc_add2_sub2: unsafe fn(&NNUEParams, *const i16, *mut i16, usize, usize, usize, usize),
+    pub finny_apply: unsafe fn(&NNUEParams, *mut i16, &[usize], &[usize]),
     pub threat_batch: unsafe fn(*const i16, *mut i16, *const [i8; L1_SIZE], &[u32], &[u32]),
     pub tier: SimdTier,
     pub nnz: NnzKind,

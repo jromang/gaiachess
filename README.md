@@ -137,7 +137,8 @@ The neural network and the GaiaTB tablebases are embedded — no external file n
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | Hash | spin | 16 | Transposition table size in MB (1–1048576) |
-| Threads | spin | 1 | Number of search threads (1–256) |
+| Threads | spin | 1 | Number of search threads (1–1024) |
+| NumaPolicy | string | auto | Thread placement on multi-node machines: `auto` (pin and spread threads when that pays), `system`, `hardware`, `none`, or a processor list such as `0-15:16-31` |
 | EvalFile | string | \<internal\> | Path to a NNUE network file |
 | Ponder | check | true | Enable pondering |
 | MultiPV | spin | 1 | Number of principal variations (1–256) |
@@ -148,6 +149,14 @@ The neural network and the GaiaTB tablebases are embedded — no external file n
 | OwnBook | check | true | Vary the openings played below full strength |
 | Skill Level | spin | 20 | Playing strength, 1 (a beginner's opponent) to 20 (full strength) |
 | Skill Seed | spin | 0 | Which weakened opponent a level is; 0 keeps the built-in one |
+| SharedNetwork | check | true | Share one copy of the network weights between engine processes (Linux, Windows) |
+
+On machines with several memory nodes, `NumaPolicy auto` pins the search threads to
+groups of processors sharing a last-level cache, gives every memory node its own copy of
+the network weights, and spreads the transposition table over the nodes. Large tables use
+large pages where the system provides them; on Windows this needs the
+"Lock pages in memory" right for the account running the engine, and falls back to
+ordinary pages otherwise.
 
 ## The Story
 

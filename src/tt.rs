@@ -5,13 +5,14 @@
 //! each plus 2 bytes padding. Indexed via Lemire fast-modulo reduction.
 //! Replacement policy: same-key or empty first, then lowest quality (depth - 4*age).
 //!
-//! Thread-safe for Lazy SMP: `probe(&self)` and `store(&self)` use interior
-//! mutability via `UnsafeCell`. Concurrent writes may race, but the 16-bit
+//! Thread-safe for Lazy SMP: `probe(&self)` and `store(&self)` write through raw
+//! pointers into the shared table. Concurrent writes may race, but the 16-bit
 //! verification key detects most corruptions. This is the standard lockless TT
 //! approach used by all modern chess engines.
 
-use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicU8, Ordering};
+
+use crate::largemem::LargeMem;
 
 #[cfg(test)]
 use crate::types::is_mate_score;
@@ -42,6 +43,7 @@ struct TTEntry {
 }
 
 impl TTEntry {
+    #[cfg(test)]
     const EMPTY: TTEntry = TTEntry {
         key: 0,
         mv: 0,
@@ -86,6 +88,8 @@ struct Cluster {
 }
 
 impl Cluster {
+    /// The empty cluster: all zero bytes, which is what fresh table memory holds.
+    #[cfg(test)]
     const EMPTY: Cluster = Cluster {
         entries: [TTEntry::EMPTY; 3],
         _padding: [0; 2],
@@ -124,11 +128,17 @@ pub struct TTHit {
 
 /// The transposition table.
 ///
-/// Thread-safe for Lazy SMP via interior mutability (`UnsafeCell`).
-/// Multiple threads may read and write concurrently; the 16-bit key
-/// detects most corruptions from data races.
+/// Thread-safe for Lazy SMP via interior mutability: multiple threads may read and
+/// write concurrently; the 16-bit key detects most corruptions from data races.
+///
+/// The clusters live on large pages, straight from the operating system: a fresh
+/// table is all zeros, which is the empty cluster, and each page is placed on the
+/// memory node of the thread that first writes it. The thread pool clears a new table
+/// in parallel so that every node holds its share.
 pub struct TT {
-    clusters: Vec<UnsafeCell<Cluster>>,
+    mem: LargeMem,
+    /// Clusters in `mem`.
+    len: usize,
     age: AtomicU8,
 }
 
@@ -137,15 +147,18 @@ pub struct TT {
 // lockless TT approach used by all modern chess engines.
 unsafe impl Sync for TT {}
 
+/// Clusters in a table of `mb` megabytes.
+fn clusters_for(mb: usize) -> usize {
+    (mb * 1024 * 1024 / std::mem::size_of::<Cluster>()).max(1)
+}
+
 impl TT {
     /// Create a new TT with the given size in megabytes.
     pub fn new(mb: usize) -> TT {
-        let bytes = mb * 1024 * 1024;
-        let num_clusters = (bytes / std::mem::size_of::<Cluster>()).max(1);
+        let len = clusters_for(mb);
         TT {
-            clusters: (0..num_clusters)
-                .map(|_| UnsafeCell::new(Cluster::EMPTY))
-                .collect(),
+            mem: LargeMem::zeroed(len * std::mem::size_of::<Cluster>(), false),
+            len,
             age: AtomicU8::new(0),
         }
     }
@@ -153,21 +166,63 @@ impl TT {
     /// Resize the TT to the given size in megabytes. Clears all entries.
     /// Must only be called when no search is running.
     pub fn resize(&mut self, mb: usize) {
-        let bytes = mb * 1024 * 1024;
-        let num_clusters = (bytes / std::mem::size_of::<Cluster>()).max(1);
-        self.clusters = (0..num_clusters)
-            .map(|_| UnsafeCell::new(Cluster::EMPTY))
-            .collect();
+        self.reallocate(mb, false);
+    }
+
+    /// Replace the table with a fresh one of `mb` megabytes, all empty and not yet
+    /// touched. `giga_pages` asks for 1 GiB pages. The old table is released first, so
+    /// the two never coexist. Must only be called when no search is running.
+    pub fn reallocate(&mut self, mb: usize, giga_pages: bool) {
+        let len = clusters_for(mb);
+        self.mem = LargeMem::zeroed(1, false);
+        self.mem = LargeMem::zeroed(len * std::mem::size_of::<Cluster>(), giga_pages);
+        self.len = len;
         *self.age.get_mut() = 0;
+    }
+
+    /// Size in megabytes.
+    pub fn size_mb(&self) -> usize {
+        self.len * std::mem::size_of::<Cluster>() / (1024 * 1024)
+    }
+
+    pub fn backing(&self) -> crate::largemem::Backing {
+        self.mem.backing()
     }
 
     /// Clear all entries and reset age.
     /// Must only be called when no search is running.
     pub fn clear(&mut self) {
-        for cell in &mut self.clusters {
-            *cell.get_mut() = Cluster::EMPTY;
-        }
+        self.clear_part(0, 1);
         *self.age.get_mut() = 0;
+    }
+
+    /// Empty the `part`-th of `parts` contiguous slices of the table, so that several
+    /// threads clear it together, each its own slice. Must only be called when no
+    /// search is running; the age is reset by [`TT::reset_age`].
+    pub fn clear_part(&self, part: usize, parts: usize) {
+        debug_assert!(part < parts, "TT::clear_part: part {part} of {parts}");
+        let stride = self.len / parts;
+        let start = stride * part;
+        let end = if part + 1 == parts {
+            self.len
+        } else {
+            start + stride
+        };
+        // SAFETY: the range lies within the table, and callers clear disjoint slices
+        // while no search reads them. An all-zero cluster is the empty cluster.
+        unsafe { std::ptr::write_bytes(self.cluster_ptr(start), 0, end - start) };
+    }
+
+    /// Reset the age counter (with a full clear).
+    pub fn reset_age(&mut self) {
+        *self.age.get_mut() = 0;
+    }
+
+    #[inline]
+    fn cluster_ptr(&self, idx: usize) -> *mut Cluster {
+        debug_assert!(idx <= self.len, "TT: cluster {idx} out of {}", self.len);
+        // SAFETY: within (or one past) the allocation.
+        unsafe { self.mem.as_ptr().cast::<Cluster>().add(idx) }
     }
 
     /// Increment the age counter (called at the start of each new search).
@@ -185,13 +240,13 @@ impl TT {
         unsafe {
             use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
             let idx = self.index(key);
-            let ptr = self.clusters[idx].get() as *const i8;
+            let ptr = self.cluster_ptr(idx) as *const i8;
             _mm_prefetch::<{ _MM_HINT_T0 }>(ptr);
         }
         #[cfg(target_arch = "aarch64")]
         unsafe {
             let idx = self.index(key);
-            let ptr = self.clusters[idx].get() as *const u8;
+            let ptr = self.cluster_ptr(idx) as *const u8;
             std::arch::asm!("prfm pldl1keep, [{ptr}]", ptr = in(reg) ptr);
         }
     }
@@ -203,7 +258,7 @@ impl TT {
     pub fn probe(&self, key: u64, ply: i32, halfmove_clock: u8) -> Option<TTHit> {
         debug_assert!((0..256).contains(&ply), "TT probe: ply {} OOB", ply);
         // SAFETY: Racy reads are acceptable; key16 verification catches corruption.
-        let cluster = unsafe { &*self.clusters[self.index(key)].get() };
+        let cluster = unsafe { &*self.cluster_ptr(self.index(key)) };
         let verify = verification_key(key);
 
         for entry in &cluster.entries {
@@ -250,7 +305,7 @@ impl TT {
         );
         let idx = self.index(key);
         // SAFETY: Racy writes are acceptable; key16 verification catches corruption.
-        let cluster = unsafe { &mut *self.clusters[idx].get() };
+        let cluster = unsafe { &mut *self.cluster_ptr(idx) };
         let verify = verification_key(key);
         let tt_age = self.age.load(Ordering::Relaxed);
 
@@ -298,12 +353,12 @@ impl TT {
 
     /// Returns hash table usage in permille (0-1000).
     pub fn hashfull(&self) -> usize {
-        let sample = self.clusters.len().min(1000);
+        let sample = self.len.min(1000);
         let age = self.age.load(Ordering::Relaxed);
         let mut used = 0;
         for i in 0..sample {
             // SAFETY: Read-only sampling, racy reads acceptable.
-            let cluster = unsafe { &*self.clusters[i].get() };
+            let cluster = unsafe { &*self.cluster_ptr(i) };
             for entry in &cluster.entries {
                 if !entry.is_empty() && entry.age() == age {
                     used += 1;
@@ -316,7 +371,7 @@ impl TT {
     /// Lemire fast-modulo index from hash key.
     #[inline]
     fn index(&self, key: u64) -> usize {
-        ((key as u128).wrapping_mul(self.clusters.len() as u128) >> 64) as usize
+        ((key as u128).wrapping_mul(self.len as u128) >> 64) as usize
     }
 }
 
@@ -383,6 +438,27 @@ fn score_from_tt(score: i32, ply: i32, halfmove_clock: u8) -> i32 {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn the_empty_cluster_is_all_zero_bytes() {
+        let empty = Cluster::EMPTY;
+        // SAFETY: a Cluster is plain bytes, read here as such.
+        let bytes: [u8; 32] = unsafe { std::mem::transmute(empty) };
+        assert!(bytes.iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn a_table_cleared_in_parts_is_empty() {
+        let mut tt = TT::new(1);
+        let key = 0x1234_5678_9abc_def0;
+        tt.store(key, 5, 100, 150, Bound::Exact, Move::NONE, 0, false);
+        assert!(tt.probe(key, 0, 0).is_some());
+        for part in 0..3 {
+            tt.clear_part(part, 3);
+        }
+        tt.reset_age();
+        assert!(tt.probe(key, 0, 0).is_none());
+    }
     use super::*;
     use crate::types::Square;
 

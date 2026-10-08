@@ -405,13 +405,14 @@ dependencies = [
 
 [[package]]
 name = "gaiachess"
-version = "4.3.2"
+version = "4.3.3"
 dependencies = [
  "bpaf",
  "cc",
  "cpu-time",
  "ctrlc",
  "indicatif",
+ "libc",
  "macroquad",
  "nalimov",
  "nix",

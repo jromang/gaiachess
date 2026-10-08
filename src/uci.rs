@@ -341,7 +341,10 @@ impl UciSession {
         out!("id name Gaia {}", env!("CARGO_PKG_VERSION"));
         out!("id author Jean-Francois Romang, David Rabel");
         out!("option name Hash type spin default 16 min 1 max 1048576");
-        out!("option name Threads type spin default 1 min 1 max 256");
+        out!(
+            "option name Threads type spin default 1 min 1 max {}",
+            crate::threads::MAX_THREADS
+        );
         out!("option name EvalFile type string default <internal>");
         out!("option name Ponder type check default true");
         out!("option name OwnBook type check default true");
@@ -354,8 +357,10 @@ impl UciSession {
         out!("option name UseSoftNodes type check default false");
         out!("option name Debug Log File type string default");
         out!("option name Clear Hash type button");
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", windows))]
         out!("option name SharedNetwork type check default true");
+        #[cfg(not(target_arch = "wasm32"))]
+        out!("option name NumaPolicy type string default auto");
         out!("option name UCI_Chess960 type check default false");
         out!(
             "option name UCI_EngineAbout type string default Gaia {} by Jean-Francois Romang, David Rabel, GPL-3.0-or-later, https://github.com/jromang/gaiachess",
@@ -614,9 +619,19 @@ fn parse_setoption(
         }
         "threads" => {
             if let Ok(n) = value.parse::<usize>() {
-                pool.resize_threads(n.clamp(1, 256));
+                pool.resize_threads(n.clamp(1, crate::threads::MAX_THREADS));
+                out!("info string {}", pool.numa_summary());
             }
         }
+        "numapolicy" => match crate::numa::NumaPolicy::parse(&value) {
+            Some(policy) => {
+                pool.set_numa_policy(policy);
+                out!("info string {}", pool.numa_summary());
+            }
+            None => {
+                out!("info string NumaPolicy: invalid value '{value}', keeping the previous one")
+            }
+        },
         "ponder" => {
             *ponder_enabled = value.eq_ignore_ascii_case("true");
         }

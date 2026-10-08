@@ -30,58 +30,31 @@ jobs:
           # full text, so the loss happened past the shell. --notes-file round-trips
           # byte for byte.
           cat > "$RUNNER_TEMP/release-notes.md" <<'NOTES'
-          ## What's new in 4.3.2
+          ## What's new in 4.3.3
 
-          A maintenance release built on a month of tournament and analysis reports.
-          Most of the changes below were found by playing the engine under Fritz,
-          in blitz and in permanent brain, and each one comes with a test that pins
-          the game where it was seen.
+          **Search parameters retuned.** All 214 tunable search parameters, tuned together
+          over 432 000 games.
 
-          **New default network: `gaianet-t2b-e044`**, +4.8 ±3.6 Elo over e017 in a
-          decided SPRT (18 420 games). Same data and recipe, stricter training filter.
+          **Fixes**
+          - En passant captures passed every SEE threshold, which could prune a winning
+            quiet move at every depth.
+          - A Syzygy draw at the root is shown as `0.00` instead of the search evaluation.
 
-          **Time management rewritten.** In blitz the engine used a third of its clock
-          and finished games with most of its time unspent. The allocation follows the
-          usual shape now: a horizon of about fifty moves, more time early, and per-move
-          adjustments from score drops and best-move stability. `Move Overhead` is
-          exposed as an option and defaults to 40 ms (100 ms was silently applied
-          before).
+          **Large machines**
+          - New option `NumaPolicy` (default `auto`). On machines with several memory nodes,
+            threads are pinned to groups of processors sharing a cache, each node gets its
+            own copy of the network, and the hash table is spread over the nodes. Measured
+            on a dual-socket, 192-thread machine: +16 % (opening) to +92 % (endgame) nodes
+            per second.
+          - `Threads` goes up to 1024.
+          - The hash and history tables use large pages where available. On Windows this
+            needs the "Lock pages in memory" right; without it the engine falls back to
+            ordinary pages.
+          - `SharedNetwork` now works on Windows too: engine processes share one copy of
+            the network weights.
+          - The hash table is cleared in parallel.
 
-          **Tablebases.** A Nalimov "mated in zero" was scored as a draw, so a mate in
-          two could be announced for fifteen moves without ever being played. Mates
-          longer than 128 plies printed as `+312` instead of `mate N`. DTM scores now
-          honour the fifty-move rule, and Syzygy cursed wins and blessed losses at the
-          root are no longer reported as certain results. Analysing a seven-piece
-          position with WDL-only tables could freeze the output for over a minute and
-          flicker between `+2` and `+200`; the in-tree probing stops one piece below the
-          largest table, and aspiration bounds are no longer published once the root has
-          a tablebase score. New option `NalimovCache` (MiB, default 256).
-
-          **Search.** A position seen for the second time was scored `0.00` as if it
-          were the third — the repetition test looked at the current position instead of
-          the one the move would recreate, and a won game was thrown away that way. The
-          move played and the final line now always come from the last completed
-          iteration (a `mate 25` proved at depth 21 could be dropped for a depth-19 line
-          at the stop). On the losing side of a decided position the search could run
-          to ply 127 and announce a mate in 36 where the mate was in 6; the mate-seeking
-          mode arms from depth 8 and caps the reductions there, and the ghost scores
-          around `-101.61` that leaked from that window are gone. Null-move pruning is
-          held back in sparse minor-piece endings where passing looks better than
-          moving, and its entry margin and ProbCut were brought to conventional values
-          after audits of two lost games.
-
-          **UCI.** A progress line is printed after one second without output, so GUIs
-          no longer see a silent engine during a long iteration. `UCI_ShowCurrLine`,
-          `UCI_ShowRefutations` and `cpuload` are supported. The final `info` line before
-          `bestmove` is the elected thread's exact line. `Debug Log File` appends
-          instead of overwriting and timestamps to the millisecond.
-
-          **Speed.** The AVX2 network path is 12 % faster (threat rows kept in
-          registers, one L1 chain). Move generation tables were reworked on AVX2, and
-          ARM64 uses hyperbola quintessence for sliders.
-
-          Co-authored with **David Rabel**, whose tournament logs and analyses drove
-          this release.
+          Thanks to David Rabel for the games and analyses behind both fixes.
 
           ## Download
 

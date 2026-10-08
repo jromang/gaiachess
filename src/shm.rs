@@ -30,6 +30,9 @@
 //!
 //! The blob is sealed against writes before it is shared, so a mapping handed
 //! out here cannot be modified by anyone, including its builder.
+//!
+//! Windows has neither memfd nor abstract sockets; there the blob is a named,
+//! pagefile-backed file mapping guarded by a named mutex (see the Windows `imp`).
 
 /// Where a mapping came from, for the message the engine prints.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -756,10 +759,167 @@ mod imp {
 }
 
 // ============================================================
+// Windows: named file mappings
+// ============================================================
+
+/// Windows shares a blob through a named, pagefile-backed file mapping in the
+/// session namespace. The first process to take the mapping's mutex and find no
+/// "initialised" marker builds the blob; everyone else maps the same pages. Large
+/// pages are tried first, as for the engine's other big tables. The mapping lives
+/// as long as one process holds a handle to it, and nothing touches the disk.
+#[cfg(windows)]
+mod imp {
+    use super::{Mapped, Origin};
+    use std::ffi::c_void;
+
+    pub const SUPPORTED: bool = true;
+
+    type Handle = *mut c_void;
+
+    const INVALID_HANDLE_VALUE: Handle = -1isize as Handle;
+    const PAGE_READWRITE: u32 = 0x04;
+    const SEC_COMMIT: u32 = 0x0800_0000;
+    const SEC_LARGE_PAGES: u32 = 0x8000_0000;
+    const FILE_MAP_ALL_ACCESS: u32 = 0x000f_001f;
+    const INFINITE: u32 = 0xffff_ffff;
+    const WAIT_OBJECT_0: u32 = 0;
+    const WAIT_ABANDONED: u32 = 0x80;
+
+    /// Written after the blob, once it is complete.
+    const READY: u64 = 0x4741_4941_5348_4d31; // "GAIASHM1"
+    const TRAILER: usize = 64;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn CreateFileMappingA(
+            file: Handle,
+            attributes: *mut c_void,
+            protect: u32,
+            size_high: u32,
+            size_low: u32,
+            name: *const u8,
+        ) -> Handle;
+        fn MapViewOfFile(
+            mapping: Handle,
+            access: u32,
+            offset_high: u32,
+            offset_low: u32,
+            size: usize,
+        ) -> *mut c_void;
+        fn CreateMutexA(attributes: *mut c_void, initial_owner: i32, name: *const u8) -> Handle;
+        fn WaitForSingleObject(handle: Handle, millis: u32) -> u32;
+        fn ReleaseMutex(mutex: Handle) -> i32;
+        fn CloseHandle(handle: Handle) -> i32;
+        fn GetLastError() -> u32;
+    }
+
+    pub fn peers() -> usize {
+        // Windows keeps no directory of who holds a mapping.
+        0
+    }
+
+    fn create(name: &std::ffi::CStr, size: usize) -> Handle {
+        let large = crate::largemem::with_large_page_privilege(|page| {
+            let total = size.div_ceil(page) * page;
+            // SAFETY: a pagefile-backed mapping; the name is NUL-terminated.
+            let h = unsafe {
+                CreateFileMappingA(
+                    INVALID_HANDLE_VALUE,
+                    std::ptr::null_mut(),
+                    PAGE_READWRITE | SEC_COMMIT | SEC_LARGE_PAGES,
+                    (total as u64 >> 32) as u32,
+                    total as u32,
+                    name.as_ptr().cast(),
+                )
+            };
+            (!h.is_null()).then_some(h)
+        });
+        if let Some(h) = large {
+            return h;
+        }
+        // SAFETY: as above, ordinary pages.
+        unsafe {
+            CreateFileMappingA(
+                INVALID_HANDLE_VALUE,
+                std::ptr::null_mut(),
+                PAGE_READWRITE,
+                (size as u64 >> 32) as u32,
+                size as u32,
+                name.as_ptr().cast(),
+            )
+        }
+    }
+
+    pub fn acquire(
+        name: &str,
+        len: usize,
+        build: &mut dyn FnMut(&mut [u8]),
+    ) -> Result<Mapped, String> {
+        let size = len + TRAILER;
+        let map_name = std::ffi::CString::new(format!("Local\\gaiachess-{name}"))
+            .map_err(|_| String::from("bad image name"))?;
+        let mutex_name = std::ffi::CString::new(format!("Local\\gaiachess-{name}$mutex"))
+            .map_err(|_| String::from("bad image name"))?;
+
+        let mapping = create(&map_name, size);
+        if mapping.is_null() {
+            // SAFETY: no arguments.
+            return Err(format!("CreateFileMapping failed ({})", unsafe {
+                GetLastError()
+            }));
+        }
+        // SAFETY: the mapping is at least `size` bytes.
+        let view = unsafe { MapViewOfFile(mapping, FILE_MAP_ALL_ACCESS, 0, 0, size) };
+        if view.is_null() {
+            // SAFETY: closing the handle opened above.
+            let err = unsafe { GetLastError() };
+            unsafe { CloseHandle(mapping) };
+            return Err(format!("MapViewOfFile failed ({err})"));
+        }
+
+        // SAFETY: a named mutex; the name is NUL-terminated.
+        let mutex = unsafe { CreateMutexA(std::ptr::null_mut(), 0, mutex_name.as_ptr().cast()) };
+        if mutex.is_null() {
+            return Err(String::from("CreateMutex failed"));
+        }
+        // SAFETY: waiting on the mutex just opened.
+        let waited = unsafe { WaitForSingleObject(mutex, INFINITE) };
+        if waited != WAIT_OBJECT_0 && waited != WAIT_ABANDONED {
+            unsafe { CloseHandle(mutex) };
+            return Err(String::from("waiting for the image lock failed"));
+        }
+
+        let base = view.cast::<u8>();
+        // SAFETY: the view is `size` bytes; the marker sits in the trailer.
+        let marker = unsafe { base.add(len).cast::<u64>() };
+        let origin = if unsafe { marker.read_volatile() } == READY {
+            Origin::Received
+        } else {
+            // SAFETY: `len` bytes of the view, owned while the lock is held.
+            build(unsafe { std::slice::from_raw_parts_mut(base, len) });
+            unsafe { marker.write_volatile(READY) };
+            Origin::Built
+        };
+        // SAFETY: releasing and closing the mutex taken above.
+        unsafe {
+            ReleaseMutex(mutex);
+            CloseHandle(mutex);
+        }
+        // The mapping handle and the view are kept for the life of the process: the
+        // engine hands out `&'static` references into it.
+        Ok(Mapped {
+            ptr: base,
+            len,
+            origin,
+        })
+    }
+}
+
+// ============================================================
 // Everywhere else: no sharing, same signatures
 // ============================================================
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", windows)))]
 mod imp {
     use super::Mapped;
 

@@ -434,14 +434,32 @@ fn syzygy_extend_pv(
     }
 }
 
+/// Score and depth published for one root line. `tb_score` is `Some` when the
+/// root is in the tables: it then replaces any search score short of a mate,
+/// a table draw (0) included. `None` means the line has nothing to report.
+fn displayed_root_score(
+    search: Option<(i32, i32)>,
+    tb_score: Option<i32>,
+    completed_depth: i32,
+) -> Option<(i32, i32)> {
+    debug_assert!(
+        search.is_none_or(|(_, d)| d > 0),
+        "a searched line has a depth"
+    );
+    match (search, tb_score) {
+        (Some((s, d)), Some(tb)) if !is_mate_score(s) => Some((tb, d)),
+        (Some(line), _) => Some(line),
+        (None, Some(tb)) => Some((tb, completed_depth.max(1))),
+        (None, None) => None,
+    }
+}
+
 /// Print UCI info lines for all PV lines at the current depth.
 pub(crate) fn print_multi_pv_info(td: &ThreadData, shared: &SharedState, multi_pv: usize) {
     let elapsed = td.tm.total_elapsed_ms().max(1);
-    // With helpers running, the shared counter (to the nearest 512 per thread) is the
-    // search's total; alone, the thread's own count is exact and never smaller.
-    let nodes = td
-        .nodes
-        .max(crate::threads::NODES_SEARCHED.load(std::sync::atomic::Ordering::Relaxed));
+    // With helpers running, the pool's counters (to the nearest 512 per thread) give
+    // the search's total; alone, the thread's own count is exact and never smaller.
+    let nodes = td.nodes.max(shared.nodes_searched());
     let nps = nodes * 1000 / elapsed;
     let hashfull = shared.tt.hashfull();
     let cpuload = shared.cpu_load(td.thread_count);
@@ -457,21 +475,19 @@ pub(crate) fn print_multi_pv_info(td: &ThreadData, shared: &SharedState, multi_p
             None
         };
 
-        // TB score override: prefer TB score over search score
+        // TB score override: prefer TB score over search score. A table draw
+        // (tb_score == 0) is overridden too: with every root move drawing, the
+        // search score is only the eval of a position the tables have settled.
         #[cfg(feature = "syzygy")]
-        let use_tb = td.tb_config.root_in_tb && rm.tb_score != 0;
+        let use_tb = td.tb_config.root_in_tb;
         #[cfg(not(feature = "syzygy"))]
         let use_tb = false;
 
-        let (score, d) = if let Some((s, d)) = search_score {
-            if use_tb && !is_mate_score(s) {
-                (rm.tb_score, d)
-            } else {
-                (s, d)
-            }
-        } else if use_tb {
-            (rm.tb_score, td.completed_depth.max(1))
-        } else {
+        let Some((score, d)) = displayed_root_score(
+            search_score,
+            use_tb.then_some(rm.tb_score),
+            td.completed_depth,
+        ) else {
             continue;
         };
 
@@ -559,22 +575,16 @@ fn print_bound_line(
     if td.root_moves.is_empty() {
         return;
     }
-    // Aspiration bounds are centipawn windows. On a TB win/loss the GUI (Fritz)
-    // treats them as the eval, so the display flickers +2 / +200. Exact `info`
-    // already publishes tb_score; skip the transient bound.
+    // Aspiration bounds are centipawn windows. With the root in the tables the
+    // GUI (Fritz) treats them as the eval, so the display flickers +2 / +200 on a
+    // win, or shows the eval of a table draw. Exact `info` already publishes
+    // tb_score; skip the transient bound.
     #[cfg(feature = "syzygy")]
-    if td.tb_config.root_in_tb
-        && td
-            .root_moves
-            .get(td.pv_index)
-            .is_some_and(|rm| rm.tb_score != 0)
-    {
+    if td.tb_config.root_in_tb {
         return;
     }
     let elapsed = td.tm.total_elapsed_ms().max(1);
-    let nodes = td
-        .nodes
-        .max(crate::threads::NODES_SEARCHED.load(std::sync::atomic::Ordering::Relaxed));
+    let nodes = td.nodes.max(shared.nodes_searched());
     let nps = nodes * 1000 / elapsed;
     let idx = td.pv_index.min(td.root_moves.len() - 1);
     let use_search_pv = fail_high && td.pv_len[0] > 0;
@@ -1205,7 +1215,7 @@ fn alpha_beta<NT: NodeType>(
     td.ss_mut(ply).static_eval = SCORE_NONE;
 
     // Check time limits
-    td.check_limits();
+    td.check_limits(shared);
     if td.should_stop() {
         return 0;
     }
@@ -1606,19 +1616,14 @@ fn alpha_beta<NT: NodeType>(
         } else {
             // Pawn correction history (weighted sum / 65536)
             let stm = td.pos.side_to_move;
-            let pawn_entry = shared.corr.get(CorrKind::Pawn, td.pos.pawn_key, stm) as i64;
+            let corr = shared.corr_of(td.numa_node);
+            let pawn_entry = corr.get(CorrKind::Pawn, td.pos.pawn_key, stm) as i64;
             // Non-pawn correction: sum of both colors' non-pawn keys
-            let non_pawn_entry =
-                shared
-                    .corr
-                    .get(CorrKind::NonPawnWhite, td.pos.non_pawn_key[0], stm)
-                    as i64
-                    + shared
-                        .corr
-                        .get(CorrKind::NonPawnBlack, td.pos.non_pawn_key[1], stm)
-                        as i64;
+            let non_pawn_entry = corr.get(CorrKind::NonPawnWhite, td.pos.non_pawn_key[0], stm)
+                as i64
+                + corr.get(CorrKind::NonPawnBlack, td.pos.non_pawn_key[1], stm) as i64;
             // Minor piece correction: N+B+K combined key
-            let minor_entry = shared.corr.get(CorrKind::Minor, td.pos.minor_key, stm) as i64;
+            let minor_entry = corr.get(CorrKind::Minor, td.pos.minor_key, stm) as i64;
             // Continuation correction history: subtable[ply-offset] indexed by move at ply-1
             let cont_corr = {
                 let base = ply + SS_OFFSET;
@@ -3220,26 +3225,23 @@ fn alpha_beta<NT: NodeType>(
             let bonus = ((best_score - static_eval) * depth * tune::CORR_UPDATE_FACTOR() / 1024)
                 .clamp(-CORRHIST_LIMIT / 4, CORRHIST_LIMIT / 4);
             let corr_stm = td.pos.side_to_move;
-            shared
-                .corr
-                .update(CorrKind::Pawn, td.pos.pawn_key, corr_stm, bonus);
+            let corr = shared.corr_of(td.numa_node);
+            corr.update(CorrKind::Pawn, td.pos.pawn_key, corr_stm, bonus);
             // Non-pawn correction: update both colors' tables
-            shared.corr.update(
+            corr.update(
                 CorrKind::NonPawnWhite,
                 td.pos.non_pawn_key[0],
                 corr_stm,
                 bonus,
             );
-            shared.corr.update(
+            corr.update(
                 CorrKind::NonPawnBlack,
                 td.pos.non_pawn_key[1],
                 corr_stm,
                 bonus,
             );
             // Minor piece correction
-            shared
-                .corr
-                .update(CorrKind::Minor, td.pos.minor_key, corr_stm, bonus);
+            corr.update(CorrKind::Minor, td.pos.minor_key, corr_stm, bonus);
             // Continuation correction: update subtables at offsets 2 and 4
             let base = ply + SS_OFFSET;
             for &offset in &[2, 4] {
@@ -3360,7 +3362,7 @@ fn quiescence<NT: NodeType>(
         ply
     );
 
-    td.check_limits();
+    td.check_limits(shared);
     if td.should_stop() {
         return 0;
     }
@@ -3482,17 +3484,12 @@ fn quiescence<NT: NodeType>(
         } else {
             // Stand-pat with correction history
             let qs_stm = td.pos.side_to_move;
-            let pawn_entry = shared.corr.get(CorrKind::Pawn, td.pos.pawn_key, qs_stm) as i64;
-            let non_pawn_entry =
-                shared
-                    .corr
-                    .get(CorrKind::NonPawnWhite, td.pos.non_pawn_key[0], qs_stm)
-                    as i64
-                    + shared
-                        .corr
-                        .get(CorrKind::NonPawnBlack, td.pos.non_pawn_key[1], qs_stm)
-                        as i64;
-            let minor_entry = shared.corr.get(CorrKind::Minor, td.pos.minor_key, qs_stm) as i64;
+            let corr = shared.corr_of(td.numa_node);
+            let pawn_entry = corr.get(CorrKind::Pawn, td.pos.pawn_key, qs_stm) as i64;
+            let non_pawn_entry = corr.get(CorrKind::NonPawnWhite, td.pos.non_pawn_key[0], qs_stm)
+                as i64
+                + corr.get(CorrKind::NonPawnBlack, td.pos.non_pawn_key[1], qs_stm) as i64;
+            let minor_entry = corr.get(CorrKind::Minor, td.pos.minor_key, qs_stm) as i64;
             let cont_corr = {
                 let base = ply + SS_OFFSET;
                 let mut cc = 0i64;
@@ -3907,6 +3904,36 @@ fn quiescence<NT: NodeType>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Issue #28: with the root in the tables every non-mate line shows the table
+    /// score. A table draw (0) used to fall through to the search eval, so a
+    /// five-man draw with a material edge printed +4.
+    #[test]
+    fn a_table_draw_at_the_root_prints_zero_not_the_eval() {
+        let mate = mate_in(3);
+        assert_eq!(
+            displayed_root_score(Some((785, 20)), Some(0), 20),
+            Some((0, 20))
+        );
+        assert_eq!(
+            displayed_root_score(Some((-240, 18)), Some(0), 20),
+            Some((0, 18))
+        );
+        assert_eq!(
+            displayed_root_score(Some((300, 20)), Some(SCORE_TB_WIN), 20),
+            Some((SCORE_TB_WIN, 20))
+        );
+        assert_eq!(
+            displayed_root_score(Some((mate, 20)), Some(0), 20),
+            Some((mate, 20))
+        );
+        assert_eq!(displayed_root_score(None, Some(0), 7), Some((0, 7)));
+        assert_eq!(
+            displayed_root_score(Some((785, 20)), None, 20),
+            Some((785, 20))
+        );
+        assert_eq!(displayed_root_score(None, None, 20), None);
+    }
     use crate::threads::SharedState;
     use crate::timeman::SearchLimits;
 

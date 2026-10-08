@@ -427,6 +427,7 @@ pub fn backing() -> Option<NetBacking> {
 /// optimisation for test lanes, never a condition for playing chess.
 fn materialise(data: &[u8], content_hash: u64) -> &'static NNUEParams {
     let len = size_of::<NNUEParams>();
+    MASTER_HASH.store(content_hash, Ordering::Relaxed);
 
     let mut private_reason = if crate::shm::supported() {
         String::from("sharing turned off")
@@ -515,7 +516,10 @@ static DEFAULT_PARAMS: OnceLock<&'static NNUEParams> = OnceLock::new();
 #[cfg(not(all(feature = "nnue", net_embedded)))]
 static DEFAULT_PARAMS_ZEROED: OnceLock<Box<NNUEParams>> = OnceLock::new();
 
-/// Get the active network parameters (runtime-loaded or default).
+/// Get the active network parameters (runtime-loaded or default): the one shared copy.
+///
+/// A search pinned to a NUMA node evaluates with its node's copy instead, which its
+/// per-thread state holds (see [`replica`] and `Network::use_params`).
 #[inline]
 pub fn params() -> &'static NNUEParams {
     let ptr = RUNTIME_PARAMS.load(Ordering::Relaxed);
@@ -581,7 +585,7 @@ pub fn set_shared(enabled: bool) -> Result<NetBacking, String> {
     let policy = shared_policy();
     if !crate::shm::supported() {
         return Err(String::from(
-            "sharing needs memfd and abstract sockets (Linux)",
+            "no sharing on this platform (Linux and Windows only)",
         ));
     }
     if policy.load(Ordering::Relaxed) == enabled {
@@ -609,6 +613,7 @@ pub fn set_shared(enabled: bool) -> Result<NetBacking, String> {
         params as *const NNUEParams as *mut NNUEParams,
         Ordering::Release,
     );
+    refresh_replicas();
     backing().ok_or_else(|| String::from("no backing recorded"))
 }
 
@@ -655,8 +660,124 @@ pub fn load_from_bytes(data: &[u8]) -> Result<super::integrity::Provenance, Stri
 
     // Increment generation so Finny table caches are invalidated.
     NETWORK_GENERATION.fetch_add(1, Ordering::Release);
+    refresh_replicas();
 
     Ok(provenance)
+}
+
+// ============================================================
+// One copy per memory node
+// ============================================================
+
+/// Content hash of the network last materialised, which names its node images.
+static MASTER_HASH: AtomicU64 = AtomicU64::new(0);
+
+/// Node copies ever built: `(master copy, hardware node, replica)`. Never freed — a
+/// thread may hold a reference into any of them — and reused when the same network
+/// is replicated on the same node again, so switching layouts back and forth costs
+/// nothing.
+static REPLICA_CACHE: Mutex<Vec<(usize, usize, usize)>> = Mutex::new(Vec::new());
+
+/// The layout replicas are wanted for, and the copy for each hardware node in use.
+struct ReplicaSet {
+    config: Option<crate::numa::NumaConfig>,
+    active: Vec<(usize, usize)>,
+}
+
+static REPLICAS: Mutex<ReplicaSet> = Mutex::new(ReplicaSet {
+    config: None,
+    active: Vec::new(),
+});
+
+/// Copies the network onto every hardware memory node of `config` that a logical node
+/// uses, each copy built by a thread pinned there so that its pages are local. `None`,
+/// or a layout that needs no replication, leaves every thread on the shared copy.
+pub fn replicate(config: Option<&crate::numa::NumaConfig>) {
+    let mut set = REPLICAS.lock().unwrap_or_else(|e| e.into_inner());
+    set.config = config.filter(|c| c.requires_replication()).cloned();
+    set.active = build_replicas(set.config.as_ref());
+}
+
+/// Rebuild the copies after the network itself changed.
+fn refresh_replicas() {
+    let mut set = REPLICAS.lock().unwrap_or_else(|e| e.into_inner());
+    set.active = build_replicas(set.config.as_ref());
+}
+
+fn build_replicas(config: Option<&crate::numa::NumaConfig>) -> Vec<(usize, usize)> {
+    let Some(config) = config else {
+        return Vec::new();
+    };
+    let master = params() as *const NNUEParams as usize;
+    let mut cache = REPLICA_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    let mut active = Vec::new();
+    for sys in config.system_nodes() {
+        if let Some(&(_, _, p)) = cache.iter().find(|&&(m, n, _)| m == master && n == sys) {
+            active.push((sys, p));
+            continue;
+        }
+        let Some(logical) = (0..config.node_count()).find(|&n| config.system_node_of(n) == sys)
+        else {
+            continue;
+        };
+        let p = crate::numa::run_on_node(config, logical, || {
+            build_replica(master, sys) as *const NNUEParams as usize
+        });
+        cache.push((master, sys, p));
+        active.push((sys, p));
+    }
+    active
+}
+
+/// A copy of the master network made on the calling thread's node: shared with the
+/// other processes on that node when sharing is on, private otherwise.
+fn build_replica(master: usize, sys_node: usize) -> &'static NNUEParams {
+    let len = size_of::<NNUEParams>();
+    // SAFETY: the master copy is never freed or written once published.
+    let src = unsafe { std::slice::from_raw_parts(master as *const u8, len) };
+    if shared_policy().load(Ordering::Relaxed) {
+        let name = format!(
+            "{}-{:06x}n{sys_node}",
+            image_name(MASTER_HASH.load(Ordering::Relaxed)),
+            crate::numa::hardware_signature() & 0xff_ffff
+        );
+        if let Ok(mapped) = crate::shm::acquire(&name, len, &mut |dst| dst.copy_from_slice(src)) {
+            let bytes = mapped.bytes();
+            if bytes == src {
+                // SAFETY: one aligned, immutable NNUEParams that is never unmapped.
+                return unsafe { &*(bytes.as_ptr() as *const NNUEParams) };
+            }
+        }
+    }
+    let mem = crate::largemem::LargeMem::zeroed(len, false);
+    debug_assert_eq!(mem.as_ptr() as usize % align_of::<NNUEParams>(), 0);
+    // SAFETY: the block is `len` bytes, page aligned, and freshly allocated.
+    unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), mem.as_ptr(), len) };
+    let ptr = mem.as_ptr() as *const NNUEParams;
+    // Never released: search threads hold `&'static` references into it.
+    std::mem::forget(mem);
+    // SAFETY: an initialised copy of the master network that lives forever.
+    unsafe { &*ptr }
+}
+
+/// The copy on hardware node `sys_node`, if one was made; `None` means the shared copy.
+pub fn replica(sys_node: usize) -> Option<&'static NNUEParams> {
+    let set = REPLICAS.lock().unwrap_or_else(|e| e.into_inner());
+    set.active
+        .iter()
+        .find(|&&(n, _)| n == sys_node)
+        // SAFETY: replicas are never freed, and are identical to the shared copy.
+        .map(|&(_, p)| unsafe { &*(p as *const NNUEParams) })
+}
+
+/// How many node copies are in use (1 when every thread reads the shared copy).
+pub fn replica_count() -> usize {
+    REPLICAS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .active
+        .len()
+        .max(1)
 }
 
 // ============================================================
@@ -698,6 +819,7 @@ pub fn publish_reserved() -> Result<(), String> {
     repermute_ft(params);
     RUNTIME_PARAMS.store(ptr, Ordering::Release);
     NETWORK_GENERATION.fetch_add(1, Ordering::Release);
+    refresh_replicas();
     Ok(())
 }
 

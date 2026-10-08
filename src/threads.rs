@@ -15,7 +15,12 @@ use crate::history::{
     ButterflyHistory, CaptureHistory, ContCorrectionHistory, ContinuationHistory, Countermoves,
     Killers, PawnHistory, PieceToCorrTable, PieceToTable, SharedCorrectionHistory,
 };
+use crate::largemem::LargeBox;
 use crate::nnue;
+use crate::numa::{self, NumaConfig, NumaPolicy};
+
+/// Upper bound of the UCI `Threads` option.
+pub const MAX_THREADS: usize = 1024;
 
 /// Global stop flag, accessible from any thread (stdin reader, search, etc.).
 ///
@@ -39,40 +44,27 @@ impl Drop for SearchingGuard {
     }
 }
 
-/// How many watchers are reading how fast the search goes. At zero — which is how every
-/// ordinary search runs — [`ThreadData::check_limits`] does not touch the counter below
-/// at all, so nobody pays for a figure nobody is reading.
+/// One thread's node count, published for the others to read.
 ///
-/// A count and not a flag, because more than one watcher can be alive at once: the
-/// interface builds the next screen before dropping the one it replaces, so two engines
-/// briefly overlap, and a test suite runs several side by side. With a flag, whichever
-/// watcher closed first turned the counter off under everyone else, and the rate they
-/// were reading silently went to nothing.
-static NODE_WATCHERS: AtomicUsize = AtomicUsize::new(0);
+/// Every search thread writes only its own counter — a plain store every 512 nodes,
+/// on a cache line of its own — and whoever wants the total adds them up. A single
+/// shared counter bumped by every thread would bounce one cache line between all the
+/// cores, and across sockets, hundreds of times a millisecond.
+#[repr(align(64))]
+#[derive(Default)]
+pub struct NodeCounter(AtomicU64);
 
-/// Starts reading the node counter. Balance with [`close_node_meter`].
-pub fn open_node_meter() {
-    NODE_WATCHERS.fetch_add(1, Ordering::Relaxed);
+impl NodeCounter {
+    #[inline]
+    pub fn get(&self) -> u64 {
+        self.0.load(Ordering::Relaxed)
+    }
+
+    #[inline]
+    fn set(&self, nodes: u64) {
+        self.0.store(nodes, Ordering::Relaxed);
+    }
 }
-
-/// Stops reading it. Saturating: an unbalanced close must not wrap the count into
-/// "watched by four billion", which no later close could undo.
-pub fn close_node_meter() {
-    let _ = NODE_WATCHERS.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-        Some(n.saturating_sub(1))
-    });
-}
-
-/// Whether anyone is reading the node counter.
-#[inline]
-pub fn counting_nodes() -> bool {
-    NODE_WATCHERS.load(Ordering::Relaxed) > 0
-}
-
-/// Nodes searched, to the nearest 512, by every thread while anyone is watching.
-/// Read by the bench monitor and by the interface's rate display; it only ever climbs,
-/// so a reader wanting a rate takes the difference over a window of its own.
-pub static NODES_SEARCHED: AtomicU64 = AtomicU64::new(0);
 
 /// Milliseconds into the search at which the main thread last printed anything.
 ///
@@ -200,7 +192,7 @@ struct CurrLineReporter {
 
 #[cfg(not(target_arch = "wasm32"))]
 impl CurrLineReporter {
-    fn start(threads: &[ThreadData]) -> Option<Self> {
+    fn start(threads: &[LargeBox<ThreadData>]) -> Option<Self> {
         if threads.first().is_none_or(|td| !td.report_curr_line) {
             return None;
         }
@@ -405,7 +397,10 @@ unsafe impl Send for StackEntry {}
 /// The stop flag is the global [`STOP`] atomic (not in this struct).
 pub struct SharedState {
     pub tt: TT,
-    pub corr: SharedCorrectionHistory,
+    /// One correction table per logical NUMA node, indexed by
+    /// [`ThreadData::numa_node`]: a node's threads pool what they learn, and read it
+    /// from their own memory. Unpinned there is a single table for every thread.
+    pub corr: Vec<SharedCorrectionHistory>,
     cpu_load: crate::cpuload::CpuLoad,
     /// Root best-move changes of the current search, summed over every thread.
     /// Time management reads it: a root that keeps changing its mind is a root
@@ -413,6 +408,9 @@ pub struct SharedState {
     /// thread takes and zeroes it once per iteration; a root best-move change is
     /// rare enough that the atomic is never contended.
     pub best_move_changes: AtomicU32,
+    /// The node counters of the pool's threads, summed by [`SharedState::nodes_searched`].
+    /// Empty for a thread searching alone.
+    node_counters: Vec<Arc<NodeCounter>>,
 }
 
 impl SharedState {
@@ -422,10 +420,28 @@ impl SharedState {
     pub fn new(hash_mb: usize, threads: usize) -> Self {
         SharedState {
             tt: TT::new(hash_mb),
-            corr: SharedCorrectionHistory::new(threads),
+            corr: vec![SharedCorrectionHistory::new(threads)],
             cpu_load: crate::cpuload::CpuLoad::new(),
             best_move_changes: AtomicU32::new(0),
+            node_counters: Vec::new(),
         }
+    }
+
+    /// Nodes searched by the whole pool, each thread counted to its last 512.
+    pub fn nodes_searched(&self) -> u64 {
+        self.node_counters.iter().map(|c| c.get()).sum()
+    }
+
+    /// The correction table of logical node `node`.
+    #[inline]
+    pub fn corr_of(&self, node: usize) -> &SharedCorrectionHistory {
+        debug_assert!(
+            node < self.corr.len(),
+            "corr_of: node {node} of {}",
+            self.corr.len()
+        );
+        // SAFETY: the pool gives every thread a node below the table count.
+        unsafe { self.corr.get_unchecked(node) }
     }
 
     pub fn cpu_load(&self, threads: usize) -> Option<u32> {
@@ -435,7 +451,9 @@ impl SharedState {
     /// Clear everything shared (`ucinewgame`, and between bench runs).
     pub fn clear(&mut self) {
         self.tt.clear();
-        self.corr.clear();
+        for corr in &mut self.corr {
+            corr.clear();
+        }
         self.best_move_changes.store(0, Ordering::Relaxed);
     }
 }
@@ -451,6 +469,9 @@ impl SharedState {
 /// are shared (via `&SharedState`).
 pub struct ThreadData {
     pub id: usize,
+    /// Logical NUMA node this thread is pinned to, which selects its correction table
+    /// and its copy of the network weights. Zero when the pool is not pinned.
+    pub numa_node: usize,
     /// Keeps this thread from writing to stdout. Thread 0 owns the clock, the root
     /// reporting and the tablebase lookups; a caller that wants those but not the
     /// output — a graphical interface driving the engine in-process — sets this rather
@@ -458,6 +479,8 @@ pub struct ThreadData {
     pub silent: bool,
     pub pos: Position,
     pub nodes: u64,
+    /// `nodes`, published every 512 nodes for readers on other threads.
+    pub node_counter: Arc<NodeCounter>,
     /// Quiescence search node counter (diagnostic).
     pub qs_nodes: u64,
     pub history: ButterflyHistory,
@@ -632,9 +655,11 @@ impl ThreadData {
 
         ThreadData {
             id,
+            numa_node: 0,
             silent: false,
             pos: Position::from_fen(STARTPOS).expect("startpos"),
             nodes: 0,
+            node_counter: Arc::new(NodeCounter::default()),
             qs_nodes: 0,
             history: ButterflyHistory::new(),
             pawn_history: PawnHistory::new(),
@@ -742,13 +767,11 @@ impl ThreadData {
     /// For helper threads (infinite limits), this is effectively a no-op.
     /// During pondering, time/node limits are suspended until `ponderhit`.
     #[inline]
-    pub fn check_limits(&mut self) {
+    pub fn check_limits(&mut self, shared: &SharedState) {
         if self.nodes & 511 == 0 {
-            // Feed whoever is watching the rate: the bench monitor, or the interface
-            // showing what the engine is doing on the player's time.
-            if counting_nodes() {
-                NODES_SEARCHED.fetch_add(512, Ordering::Relaxed);
-            }
+            // Publish the count for whoever adds them up: the main thread's info
+            // lines, or the interface showing what the engine is doing.
+            self.node_counter.set(self.nodes);
 
             // The interface must never see a mute engine: after a second without a
             // line, the main thread says where it is. One clock read per 512 nodes,
@@ -760,7 +783,7 @@ impl ThreadData {
                     LAST_INFO_MS.load(Ordering::Relaxed),
                     HEARTBEAT_MS.load(Ordering::Relaxed),
                 ) {
-                    self.print_heartbeat(now);
+                    self.print_heartbeat(now, shared);
                 }
             }
 
@@ -813,8 +836,8 @@ impl ThreadData {
     /// Progress line for a long iteration: depth, selective depth, the root move
     /// under search and the counters — everything but a score and a PV, which the
     /// iteration has not produced yet.
-    fn print_heartbeat(&self, now_ms: u64) {
-        let nodes = self.nodes.max(NODES_SEARCHED.load(Ordering::Relaxed));
+    fn print_heartbeat(&self, now_ms: u64, shared: &SharedState) {
+        let nodes = self.nodes.max(shared.nodes_searched());
         let nps = nodes * 1000 / now_ms.max(1);
         let currmove = if self.root_move != Move::NONE {
             format!(
@@ -870,6 +893,7 @@ impl ThreadData {
     ) {
         self.pos = pos.clone();
         self.nodes = 0;
+        self.node_counter.set(0);
         // Read the handicap once, here: the level is set before a search is asked for,
         // never during one.
         self.skill = crate::skill::snapshot();
@@ -1007,56 +1031,267 @@ impl ThreadData {
 // ThreadPool
 // ============================================================
 
+/// Builds `thread_node.len()` threads, each by a thread of its own — pinned to its node
+/// when `bound` — so that its tables are first written, and placed, where it will run.
+fn build_threads(
+    numa: &NumaConfig,
+    thread_node: &[usize],
+    bound: bool,
+) -> Vec<LargeBox<ThreadData>> {
+    let n = thread_node.len();
+    if n == 1 && !bound || cfg!(target_arch = "wasm32") {
+        return (0..n).map(|i| LargeBox::new(ThreadData::new(i))).collect();
+    }
+    std::thread::scope(|s| {
+        let handles: Vec<_> = (0..n)
+            .map(|i| {
+                std::thread::Builder::new()
+                    .stack_size(32 * 1024 * 1024)
+                    .spawn_scoped(s, move || {
+                        if bound {
+                            numa::bind_current_thread(numa, thread_node[i]);
+                        }
+                        LargeBox::new(ThreadData::new(i))
+                    })
+                    .expect("failed to spawn a thread-building thread")
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("building a search thread panicked"))
+            .collect()
+    })
+}
+
 /// Pool of search threads with shared transposition table.
+///
+/// On a machine with several memory nodes the threads are pinned and spread over the
+/// nodes when that pays (see [`crate::numa`]): each thread's own tables are allocated
+/// and first written by the thread itself, each node gets its own correction table,
+/// and every shared table is cleared in parallel so that each node holds its share.
 pub struct ThreadPool {
     pub shared: SharedState,
-    pub threads: Vec<ThreadData>,
+    pub threads: Vec<LargeBox<ThreadData>>,
     /// UCI MultiPV option (default 1).
     pub multi_pv: usize,
     /// Index of the best thread from the last search (for PV extraction).
     pub last_best_idx: usize,
+    numa_policy: NumaPolicy,
+    /// The machine as the policy sees it.
+    numa: NumaConfig,
+    /// Whether the threads are pinned to their nodes.
+    bound: bool,
 }
 
 impl ThreadPool {
     /// Create a new thread pool.
     pub fn new(num_threads: usize, hash_mb: usize) -> Self {
-        let n = num_threads.max(1);
-        let mut threads: Vec<ThreadData> = (0..n).map(ThreadData::new).collect();
-        for td in &mut threads {
-            td.thread_count = n;
-        }
-        ThreadPool {
-            shared: SharedState::new(hash_mb, n),
-            threads,
+        let mut pool = ThreadPool {
+            shared: SharedState::new(hash_mb, 1),
+            threads: Vec::new(),
             multi_pv: 1,
             last_best_idx: 0,
-        }
+            numa_policy: NumaPolicy::Auto,
+            numa: NumaConfig::single(1),
+            bound: false,
+        };
+        pool.rebuild(num_threads);
+        pool
     }
 
-    /// Change the number of search threads.
+    /// Change the number of search threads. Every thread starts afresh and the
+    /// transposition table is reallocated, so that its pages follow the threads.
     pub fn resize_threads(&mut self, n: usize) {
-        let n = n.max(1);
-        self.threads.resize_with(n, || ThreadData::new(n));
-        // Fix ids, and tell every thread how many of them there are
-        for (i, td) in self.threads.iter_mut().enumerate() {
-            td.id = i;
-            td.thread_count = n;
-        }
-        // The shared correction tables are sized by the thread count.
-        self.shared.corr.resize(n);
+        self.rebuild(n);
+    }
+
+    /// Change how the threads are laid out on the machine (UCI `NumaPolicy`).
+    pub fn set_numa_policy(&mut self, policy: NumaPolicy) {
+        self.numa_policy = policy;
+        let n = self.threads.len();
+        self.rebuild(n);
     }
 
     /// Resize the TT (must not be called during search).
     pub fn resize_hash(&mut self, mb: usize) {
-        self.shared.tt.resize(mb);
+        self.reallocate_tt(mb);
+        self.parallel_clear(true, false);
     }
 
     /// Clear the shared state and all per-thread histories (`ucinewgame`).
     pub fn clear(&mut self) {
-        self.shared.clear();
-        for td in &mut self.threads {
-            td.clear_histories();
-            td.new_game();
+        self.parallel_clear(true, true);
+    }
+
+    /// One line describing the layout, for an `info string`.
+    pub fn numa_summary(&self) -> String {
+        let threads = self.threads.len();
+        if !self.bound {
+            return format!(
+                "NUMA: {} node(s) available ({}), {threads} thread(s) not pinned",
+                self.numa.node_count(),
+                self.numa
+            );
+        }
+        let mut per_node = vec![0usize; self.numa.node_count()];
+        for td in &self.threads {
+            per_node[td.numa_node] += 1;
+        }
+        let counts: Vec<String> = per_node.iter().map(usize::to_string).collect();
+        format!(
+            "NUMA: {threads} threads pinned over {} node(s) ({}) as {}, {} network cop{}",
+            self.numa.node_count(),
+            self.numa,
+            counts.join("/"),
+            nnue::replica_count(),
+            if nnue::replica_count() == 1 {
+                "y"
+            } else {
+                "ies"
+            },
+        )
+    }
+
+    /// Lay the pool out again for `n` threads under the current policy.
+    fn rebuild(&mut self, n: usize) {
+        let n = n.clamp(1, MAX_THREADS);
+        let numa = self.numa_policy.config();
+        let bound = self.numa_policy.binds(&numa, n);
+        let thread_node = if bound {
+            numa.distribute(n)
+        } else {
+            vec![0; n]
+        };
+        let nodes = if bound { numa.node_count() } else { 1 };
+        let mut per_node = vec![0usize; nodes];
+        for &node in &thread_node {
+            per_node[node] += 1;
+        }
+
+        // Release everything before allocating its replacement.
+        self.threads.clear();
+        self.shared.corr.clear();
+
+        // A correction table per node, sized for that node's threads and allocated on
+        // it (Windows commits large pages at allocation).
+        self.shared.corr = (0..nodes)
+            .map(|node| {
+                let count = per_node[node].max(1);
+                if bound {
+                    numa::run_on_node(&numa, node, || SharedCorrectionHistory::new(count))
+                } else {
+                    SharedCorrectionHistory::new(count)
+                }
+            })
+            .collect();
+
+        self.threads = build_threads(&numa, &thread_node, bound);
+        for (i, td) in self.threads.iter_mut().enumerate() {
+            td.id = i;
+            td.thread_count = n;
+            td.numa_node = thread_node[i];
+        }
+        // The info lines report the pool's total: register every thread's counter.
+        self.shared.node_counters = self
+            .threads
+            .iter()
+            .map(|td| Arc::clone(&td.node_counter))
+            .collect();
+        debug_assert!(
+            self.threads
+                .iter()
+                .all(|td| td.numa_node < self.shared.corr.len()),
+            "rebuild: a thread has no correction table"
+        );
+
+        self.numa = numa;
+        self.bound = bound;
+        nnue::replicate(if bound { Some(&self.numa) } else { None });
+
+        let mb = self.shared.tt.size_mb().max(1);
+        self.reallocate_tt(mb);
+        self.parallel_clear(true, true);
+    }
+
+    /// A fresh, untouched table; 1 GiB pages once there are at least eight per node.
+    fn reallocate_tt(&mut self, mb: usize) {
+        let nodes = if self.bound {
+            self.numa.node_count()
+        } else {
+            1
+        };
+        let giga = mb.saturating_mul(1024 * 1024) >= nodes * crate::largemem::GIGA_PAGE * 8;
+        self.shared.tt.reallocate(mb, giga);
+    }
+
+    /// Clears in parallel, every thread on its own node: its own histories and its
+    /// share of its node's correction table (`histories`), and one contiguous slice of
+    /// the transposition table (`tt`) — the threads sorted by node, so that each node
+    /// receives one region. Writing a fresh page is what places it.
+    fn parallel_clear(&mut self, tt: bool, histories: bool) {
+        let n = self.threads.len();
+        let mut order: Vec<usize> = (0..n).collect();
+        order.sort_by_key(|&i| self.threads[i].numa_node);
+        let mut rank = vec![0usize; n];
+        for (r, &i) in order.iter().enumerate() {
+            rank[i] = r;
+        }
+        let mut per_node = vec![0usize; self.shared.corr.len()];
+        let mut node_rank = vec![0usize; n];
+        for i in 0..n {
+            let node = self.threads[i].numa_node;
+            node_rank[i] = per_node[node];
+            per_node[node] += 1;
+        }
+
+        let ThreadPool {
+            shared,
+            threads,
+            numa,
+            bound,
+            ..
+        } = self;
+        let shared = &*shared;
+        let (numa, bound) = (&*numa, *bound);
+        let job = |i: usize, td: &mut ThreadData| {
+            if histories {
+                td.clear_histories();
+                td.new_game();
+                let node = td.numa_node;
+                shared.corr[node].clear_part(node_rank[i], per_node[node]);
+            }
+            if tt {
+                shared.tt.clear_part(rank[i], n);
+            }
+        };
+
+        if n == 1 && !bound || cfg!(target_arch = "wasm32") {
+            for (i, td) in threads.iter_mut().enumerate() {
+                job(i, td);
+            }
+        } else {
+            std::thread::scope(|s| {
+                for (i, td) in threads.iter_mut().enumerate() {
+                    let job = &job;
+                    std::thread::Builder::new()
+                        .stack_size(1024 * 1024)
+                        .spawn_scoped(s, move || {
+                            if bound {
+                                numa::bind_current_thread(numa, td.numa_node);
+                            }
+                            job(i, td);
+                        })
+                        .expect("failed to spawn a clearing thread");
+                }
+            });
+        }
+
+        // A table no thread is assigned to (more nodes than threads) is never written.
+        if tt {
+            self.shared.tt.reset_age();
+        }
+        if histories {
+            self.shared.best_move_changes.store(0, Ordering::Relaxed);
         }
     }
 
@@ -1080,15 +1315,19 @@ impl ThreadPool {
         SEARCHING.store(true, Ordering::Relaxed);
         let _searching = SearchingGuard;
         self.shared.tt.new_search();
-        // The info lines report the whole search, not the main thread's share: with
-        // helpers running, every thread feeds the shared counter, zeroed here so a
-        // single-thread search that follows never reads a stale total.
-        NODES_SEARCHED.store(0, Ordering::Relaxed);
         LAST_INFO_MS.store(0, Ordering::Relaxed);
 
-        // Prepare all threads
+        // Prepare all threads. A pinned thread evaluates with its node's copy of the
+        // network, chosen here, before the root refresh, so that a network loaded since
+        // the last search is the one used.
         for td in &mut self.threads {
             td.multi_pv = self.multi_pv;
+            let replica = if self.bound {
+                nnue::replica(self.numa.system_node_of(td.numa_node))
+            } else {
+                None
+            };
+            td.nnue.use_params(replica);
             td.prepare_search_filtered(pos, &limits, search_moves);
         }
         let report_curr_line = crate::uci::show_curr_line() && !self.threads[0].silent;
@@ -1118,7 +1357,9 @@ impl ThreadPool {
         // A handicapped engine searches on one thread whatever the machine has, so a
         // given skill level plays the same everywhere. Extra cores would otherwise
         // quietly make a "weak" opponent stronger.
-        if self.threads.len() == 1 || crate::skill::level() < crate::skill::FULL_STRENGTH {
+        if (self.threads.len() == 1 && !self.bound)
+            || crate::skill::level() < crate::skill::FULL_STRENGTH
+        {
             // Single-thread fast path: no spawning overhead
             search::search(&mut self.threads[0], &self.shared);
             self.last_best_idx = 0;
@@ -1128,36 +1369,58 @@ impl ThreadPool {
         }
 
         // Multi-thread: scope ensures all threads join before we return
-        // The info lines report the whole search, so the shared counter has to be live
-        // while helpers run. A watcher, not a flag: another watcher may already be
-        // reading, and closing is balanced so the count never leaks.
-        open_node_meter();
+        let bound = self.bound;
+        let numa = &self.numa;
         std::thread::scope(|s| {
             let (main_td, helpers) = self.threads.split_first_mut().unwrap();
+            let main_td: &mut ThreadData = main_td;
+            let main_node = main_td.numa_node;
             let shared = &self.shared;
 
-            // Spawn helper threads with 32 MB stack (PGO inlining enlarges frames)
+            // Spawn helper threads with 32 MB stack (PGO inlining enlarges frames).
+            // Pinned threads read the network copy of their own node (set in `prepare`).
             for td in helpers.iter_mut() {
+                let td: &mut ThreadData = td;
                 std::thread::Builder::new()
                     .stack_size(32 * 1024 * 1024)
                     .spawn_scoped(s, move || {
+                        if bound {
+                            numa::bind_current_thread(numa, td.numa_node);
+                        }
                         search::search(td, shared);
                     })
                     .expect("failed to spawn search thread");
             }
 
-            // Main thread runs search (blocks until time/depth limit)
-            search::search(main_td, shared);
-
+            // Main thread runs search (blocks until time/depth limit).
             // Main thread finished → stop all helpers. Unless the node budget was
             // split: each helper then owns a share, and cutting it short here would
             // hand an idle machine more work per move than a busy one — exactly what
             // a fixed-node lane at several threads exists to avoid.
-            if !main_td.per_thread_nodes {
-                STOP.store(true, Ordering::Relaxed);
+            let mut main_job = move || {
+                search::search(main_td, shared);
+                if !main_td.per_thread_nodes {
+                    STOP.store(true, Ordering::Relaxed);
+                }
+            };
+            if bound {
+                // Pinned, the main search gets a thread of its own too: pinning the
+                // caller would leave the UCI thread confined to one node.
+                let node = main_node;
+                std::thread::Builder::new()
+                    .stack_size(32 * 1024 * 1024)
+                    .spawn_scoped(s, move || {
+                        numa::bind_current_thread(numa, node);
+                        main_job();
+                    })
+                    .expect("failed to spawn the main search thread");
+            } else {
+                main_job();
             }
         });
-        close_node_meter();
+        for td in &self.threads {
+            td.node_counter.set(td.nodes);
+        }
 
         // Select best thread via weighted vote aggregation
         let best_idx = self.select_best_thread();
@@ -1430,6 +1693,34 @@ mod tests {
             total >= BUDGET && total < BUDGET + 2048 * THREADS as u64,
             "pool searched {total} nodes for a budget of {BUDGET}"
         );
+    }
+
+    #[test]
+    fn the_pool_reports_every_threads_nodes() {
+        let _guard = crate::skill::lock_level();
+        STOP.store(false, Ordering::Relaxed);
+
+        let pos = Position::from_fen(MIDGAME).unwrap();
+        let mut pool = ThreadPool::new(4, 4);
+        for td in pool.threads.iter_mut() {
+            td.silent = true;
+        }
+        pool.start_search(&pos, SearchLimits::nodes(40_000));
+
+        // After the join every counter holds its thread's exact count, so the total
+        // the info lines print is the sum over the pool, not the main thread's share.
+        let sum: u64 = pool.threads.iter().map(|td| td.nodes).sum();
+        assert_eq!(pool.shared.nodes_searched(), sum);
+        assert!(sum > pool.threads[0].nodes, "only the main thread was counted");
+
+        // A resize registers the new threads' counters, not the old ones'.
+        pool.resize_threads(2);
+        for td in pool.threads.iter_mut() {
+            td.silent = true;
+        }
+        pool.start_search(&pos, SearchLimits::nodes(20_000));
+        let sum: u64 = pool.threads.iter().map(|td| td.nodes).sum();
+        assert_eq!(pool.shared.nodes_searched(), sum);
     }
 
     #[test]

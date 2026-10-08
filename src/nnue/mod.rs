@@ -38,6 +38,8 @@ pub mod pawn_pairs;
 pub mod simd;
 pub mod threats;
 
+pub use network::{replica, replica_count, replicate};
+
 /// SIMD backend actually running, for the UCI `info` line.
 ///
 /// On aarch64 this is the runtime election (NEON vs NEON+DOTPROD). Other
@@ -151,6 +153,12 @@ pub struct Network {
     cache: FinnyTable,
     /// Threat accumulator stack: one per ply (pre-allocated).
     threat_acc: Box<[ThreatAccumulator]>,
+    /// The copy of the network this state evaluates with: the replica of its thread's
+    /// node when the search is pinned, `None` for the shared copy. Set once per search
+    /// by [`Network::use_params`], so no node ever pays for finding it — a thread-local
+    /// read is a function call on some targets, and the kernels need the weights
+    /// several times per node.
+    params: Option<&'static network::NNUEParams>,
 }
 
 /// The board a chain slot names: the position itself, or one of the rebuilt plies.
@@ -185,6 +193,22 @@ impl Network {
             accumulators,
             cache: FinnyTable::new(),
             threat_acc,
+            params: None,
+        }
+    }
+
+    /// Evaluate with `params` (a node replica), or with the shared copy when `None`.
+    /// Called before every search, so a network loaded since is never missed.
+    pub fn use_params(&mut self, params: Option<&'static network::NNUEParams>) {
+        self.params = params;
+    }
+
+    /// The weights this state evaluates with.
+    #[inline]
+    fn params(&self) -> &'static network::NNUEParams {
+        match self.params {
+            Some(p) => p,
+            None => network::params(),
         }
     }
 
@@ -192,14 +216,15 @@ impl Network {
     /// Must be called before the first search.
     pub fn refresh(&mut self, pos: &Position) {
         self.index = 0;
-        self.accumulators[0].refresh_with_cache(pos, Color::White, &mut self.cache);
-        self.accumulators[0].refresh_with_cache(pos, Color::Black, &mut self.cache);
+        let params = self.params();
+        self.accumulators[0].refresh_with_cache(params, pos, Color::White, &mut self.cache);
+        self.accumulators[0].refresh_with_cache(params, pos, Color::Black, &mut self.cache);
         debug_assert!(
             self.accumulators[0].accurate == [true; 2],
             "NNUE refresh: PST accumulator not accurate after refresh"
         );
         // Full threat compute at root (no parent available)
-        self.threat_acc[0].update_full(pos);
+        self.threat_acc[0].update_full(params, pos);
     }
 
     /// Push a new ply onto the PST accumulator stack.
@@ -269,6 +294,7 @@ impl Network {
             self.accumulators.len()
         );
 
+        let params = self.params();
         for &perspective in &[Color::White, Color::Black] {
             let pov = perspective.index();
             if self.accumulators[self.index].accurate[pov] {
@@ -281,11 +307,12 @@ impl Network {
                         let (left, right) = self.accumulators.split_at_mut(ply);
                         let prev = &left[ply - 1];
                         let current = &mut right[0];
-                        current.update_from(prev, pos, perspective);
+                        current.update_from(params, prev, pos, perspective);
                     }
                 }
                 None => {
                     self.accumulators[self.index].refresh_with_cache(
+                        params,
                         pos,
                         perspective,
                         &mut self.cache,
@@ -321,6 +348,7 @@ impl Network {
     /// siblings that follow. Past `THREAT_CHAIN_MAX` plies the recompute is cheaper.
     fn ensure_threats_updated(&mut self, pos: &Position) {
         let idx = self.index;
+        let params = self.params();
         if self.threat_acc[idx].accurate == [true; 2] {
             return;
         }
@@ -333,7 +361,7 @@ impl Network {
             }
         }
         let Some(source) = source else {
-            self.threat_acc[idx].update_full(pos);
+            self.threat_acc[idx].update_full(params, pos);
             return;
         };
         let len = idx - source;
@@ -380,19 +408,19 @@ impl Network {
             }
             let new = board_at(pos, &rebuilt, slot[k], occ[k]);
             let old = board_at(pos, &rebuilt, slot[k + 1], occ[k + 1]);
-            if !current.update_incremental(&new, &old, parent, delta) {
+            if !current.update_incremental(params, &new, &old, parent, delta) {
                 // A king crossed the centre at this ply: nothing before it carries over.
                 replayed = false;
                 break;
             }
         }
         if !replayed {
-            self.threat_acc[idx].update_full(pos);
+            self.threat_acc[idx].update_full(params, pos);
         }
 
         #[cfg(debug_assertions)]
         {
-            let (full, full_psqt) = threats::compute_full_threats(pos);
+            let (full, full_psqt) = threats::compute_full_threats_with(params, pos);
             let acc = &self.threat_acc[idx];
             for pov in 0..2 {
                 debug_assert!(
@@ -441,7 +469,8 @@ impl Network {
 
         // Use threat accumulator (incrementally updated or full recomputed)
         let threats = &threat_acc.values;
-        let l3_out = unsafe { kernels::dispatch::forward_dense(acc, threats, stm, bucket) };
+        let l3_out =
+            unsafe { kernels::dispatch::forward_dense(self.params(), acc, threats, stm, bucket) };
 
         let stm_i = stm.index();
         let ntm_i = (!stm).index();
@@ -460,6 +489,7 @@ impl Clone for Network {
             accumulators: self.accumulators.clone(),
             cache: self.cache.clone(),
             threat_acc: self.threat_acc.clone(),
+            params: self.params,
         }
     }
 }

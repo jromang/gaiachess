@@ -314,6 +314,10 @@ fn on_deep_stack(f: impl FnOnce() + Send + 'static) {
 }
 
 fn main() {
+    // Before any thread exists, and before anything could pin one: the processors the
+    // engine may use are the ones it was started on.
+    gaiachess::numa::capture_startup_affinity();
+
     // Before the command line is even parsed: a GUI-subsystem program starts out with no
     // console, and `--help` and `--version` are printed by the parser itself.
     #[cfg(all(windows, feature = "gui"))]

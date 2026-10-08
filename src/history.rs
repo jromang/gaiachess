@@ -8,6 +8,7 @@
 use std::sync::atomic::{AtomicI16, Ordering};
 
 use crate::types::{Color, MAX_PLY, Move, Piece, PieceType, Square};
+use crate::largemem::{LargeBox, LargeMem};
 
 /// Maximum history value for gravity formula.
 const MAX_HISTORY: i32 = 16384;
@@ -106,21 +107,14 @@ const PAWN_HIST_SIZE: usize = 1024;
 ///
 /// Size: 1024 * 12 * 64 * 2 bytes = 1.5 MB (heap-allocated via inner Box).
 pub struct PawnHistory {
-    table: Box<[[[i16; Square::NUM]; Piece::NUM]; PAWN_HIST_SIZE]>,
+    table: LargeBox<[[[i16; Square::NUM]; Piece::NUM]; PAWN_HIST_SIZE]>,
 }
 
 impl PawnHistory {
     pub fn new() -> Self {
-        unsafe {
-            let layout =
-                std::alloc::Layout::new::<[[[i16; Square::NUM]; Piece::NUM]; PAWN_HIST_SIZE]>();
-            let ptr = std::alloc::alloc_zeroed(layout);
-            if ptr.is_null() {
-                std::alloc::handle_alloc_error(layout);
-            }
-            PawnHistory {
-                table: Box::from_raw(ptr.cast()),
-            }
+        PawnHistory {
+            // SAFETY: an all-zero integer array is a valid empty table.
+            table: unsafe { LargeBox::new_zeroed() },
         }
     }
 
@@ -265,27 +259,19 @@ pub type PieceToTable = [[i16; Square::NUM]; Piece::NUM];
 /// then piece A to square B is likely good/bad."
 /// Total: 2 * 12 * 64 * 1536 bytes ≈ 2.25 MB (heap-allocated).
 pub struct ContinuationHistory {
-    table: Box<[[[PieceToTable; Square::NUM]; Piece::NUM]; 2]>,
+    table: LargeBox<[[[PieceToTable; Square::NUM]; Piece::NUM]; 2]>,
 }
 
 impl ContinuationHistory {
     pub fn new() -> Self {
-        // Use alloc_zeroed for large heap allocation
-        let table = unsafe {
-            let layout =
-                std::alloc::Layout::new::<[[[PieceToTable; Square::NUM]; Piece::NUM]; 2]>();
-            let ptr = std::alloc::alloc_zeroed(layout);
-            if ptr.is_null() {
-                std::alloc::handle_alloc_error(layout);
-            }
-            Box::from_raw(ptr.cast())
-        };
+        // SAFETY: an all-zero integer array is a valid empty table.
+        let table = unsafe { LargeBox::new_zeroed() };
         ContinuationHistory { table }
     }
 
     pub fn clear(&mut self) {
         unsafe {
-            let ptr = self.table.as_mut() as *mut _ as *mut u8;
+            let ptr = &mut *self.table as *mut _ as *mut u8;
             let size = std::mem::size_of::<[[[PieceToTable; Square::NUM]; Piece::NUM]; 2]>();
             std::ptr::write_bytes(ptr, 0, size);
         }
@@ -430,8 +416,10 @@ const CORR_KINDS: usize = 4;
 /// entries per thread, and with it the collision rate, stays what it was at one
 /// thread. Being a power of two, the key is masked rather than divided.
 pub struct SharedCorrectionHistory {
-    /// `[(key & mask) * 2 + stm] * CORR_KINDS + kind`
-    table: Box<[AtomicI16]>,
+    /// `[(key & mask) * 2 + stm] * CORR_KINDS + kind`, as `AtomicI16`, on large pages.
+    table: LargeMem,
+    /// Entries in `table`.
+    len: usize,
     mask: usize,
 }
 
@@ -442,13 +430,14 @@ impl SharedCorrectionHistory {
         CORRHIST_SIZE * threads.max(1).next_power_of_two()
     }
 
+    /// A zeroed table sized for `threads` threads. Its pages are placed on the memory
+    /// node of whichever thread first writes them.
     pub fn new(threads: usize) -> Self {
         let slots = Self::slots_for(threads);
-        let table = (0..slots * 2 * CORR_KINDS)
-            .map(|_| AtomicI16::new(0))
-            .collect();
+        let len = slots * 2 * CORR_KINDS;
         SharedCorrectionHistory {
-            table,
+            table: LargeMem::zeroed(len * size_of::<AtomicI16>(), false),
+            len,
             mask: slots - 1,
         }
     }
@@ -463,22 +452,36 @@ impl SharedCorrectionHistory {
         }
     }
 
-    /// Zero every entry (`ucinewgame`). Serial: 1 MB at one thread, 32 MB at 24.
+    /// Zero every entry (`ucinewgame`).
     pub fn clear(&mut self) {
-        for entry in self.table.iter_mut() {
-            *entry.get_mut() = 0;
+        self.clear_part(0, 1);
+    }
+
+    /// Zero the `part`-th of `parts` contiguous slices, so that several threads can
+    /// clear the table together. Must not run during a search.
+    pub fn clear_part(&self, part: usize, parts: usize) {
+        debug_assert!(part < parts, "clear_part: part {part} of {parts}");
+        let stride = self.len / parts;
+        let start = stride * part;
+        let end = if part + 1 == parts { self.len } else { start + stride };
+        // SAFETY: the range lies within the table; callers clear disjoint slices
+        // while no search runs, so nothing reads them concurrently.
+        unsafe {
+            std::ptr::write_bytes(
+                self.table.as_ptr().cast::<AtomicI16>().add(start),
+                0,
+                end - start,
+            );
         }
     }
 
     #[inline]
     fn slot(&self, kind: CorrKind, key: u64, stm: Color) -> &AtomicI16 {
         let idx = ((key as usize & self.mask) * 2 + stm.index()) * CORR_KINDS + kind.index();
-        debug_assert!(
-            idx < self.table.len(),
-            "SharedCorrectionHistory: index {} OOB",
-            idx
-        );
-        &self.table[idx]
+        debug_assert!(idx < self.len, "SharedCorrectionHistory: index {} OOB", idx);
+        // SAFETY: `idx` is masked into the table, which holds `len` AtomicI16 values,
+        // zero-initialised and therefore valid.
+        unsafe { &*self.table.as_ptr().cast::<AtomicI16>().add(idx) }
     }
 
     /// Correction value for a key and side to move.
@@ -521,25 +524,19 @@ pub type PieceToCorrTable = [[i16; Square::NUM]; Piece::NUM];
 /// Same pointer-on-stack pattern as `ContinuationHistory`.
 /// Total: 12 * 64 * 1536 bytes ≈ 1.125 MB (heap-allocated).
 pub struct ContCorrectionHistory {
-    table: Box<[[PieceToCorrTable; Square::NUM]; Piece::NUM]>,
+    table: LargeBox<[[PieceToCorrTable; Square::NUM]; Piece::NUM]>,
 }
 
 impl ContCorrectionHistory {
     pub fn new() -> Self {
-        let table = unsafe {
-            let layout = std::alloc::Layout::new::<[[PieceToCorrTable; Square::NUM]; Piece::NUM]>();
-            let ptr = std::alloc::alloc_zeroed(layout);
-            if ptr.is_null() {
-                std::alloc::handle_alloc_error(layout);
-            }
-            Box::from_raw(ptr.cast())
-        };
+        // SAFETY: an all-zero integer array is a valid empty table.
+        let table = unsafe { LargeBox::new_zeroed() };
         ContCorrectionHistory { table }
     }
 
     pub fn clear(&mut self) {
         unsafe {
-            let ptr = self.table.as_mut() as *mut _ as *mut u8;
+            let ptr = &mut *self.table as *mut _ as *mut u8;
             let size = std::mem::size_of::<[[PieceToCorrTable; Square::NUM]; Piece::NUM]>();
             std::ptr::write_bytes(ptr, 0, size);
         }
@@ -620,7 +617,7 @@ mod tests {
             let slots = h.mask + 1;
             assert_eq!(slots, CORRHIST_SIZE * expected, "{threads} threads");
             assert!(slots.is_power_of_two(), "{threads} threads: {slots} slots");
-            assert_eq!(h.table.len(), slots * 2 * CORR_KINDS);
+            assert_eq!(h.len, slots * 2 * CORR_KINDS);
         }
     }
 

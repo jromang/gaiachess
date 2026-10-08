@@ -21,7 +21,7 @@ use crate::types::*;
 
 use super::features;
 use super::kernels::dispatch;
-use super::network::{self, Aligned};
+use super::network::{self, Aligned, NNUEParams};
 use super::{INPUT_BUCKETS, L1_SIZE, OUTPUT_BUCKETS};
 
 // ============================================================
@@ -248,7 +248,13 @@ impl Accumulator {
     /// chain, `pos` is the leaf position (not the intermediate one). This is fine
     /// because `pos` is only used for `king_sq(perspective)`, which is stable as
     /// long as `find_update_source()` verified no king-bucket-crossing occurred.
-    pub fn update_from(&mut self, prev: &Accumulator, pos: &Position, perspective: Color) {
+    pub fn update_from(
+        &mut self,
+        params: &NNUEParams,
+        prev: &Accumulator,
+        pos: &Position,
+        perspective: Color,
+    ) {
         let pov = perspective.index();
         let delta = &self.delta;
         let mv = delta.mv;
@@ -310,7 +316,7 @@ impl Accumulator {
                     king_sq,
                     perspective,
                 );
-                self.apply_add2_sub2(prev, pov, add1, add2, sub1, sub2);
+                self.apply_add2_sub2(params, prev, pov, add1, add2, sub1, sub2);
             }
             MT_EN_PASSANT => {
                 // Pawn moves, captured pawn removed from different square
@@ -331,7 +337,7 @@ impl Accumulator {
                 );
                 let add1 =
                     features::feature_index(piece_color, PieceType::Pawn, to, king_sq, perspective);
-                self.apply_add1_sub2(prev, pov, add1, sub1, sub2);
+                self.apply_add1_sub2(params, prev, pov, add1, sub1, sub2);
             }
             MT_PROMOTION => {
                 let promo_type = mv.promo_type();
@@ -354,10 +360,10 @@ impl Accumulator {
                         king_sq,
                         perspective,
                     );
-                    self.apply_add1_sub2(prev, pov, add1, sub1, sub2);
+                    self.apply_add1_sub2(params, prev, pov, add1, sub1, sub2);
                 } else {
                     // Promotion without capture
-                    self.apply_add1_sub1(prev, pov, add1, sub1);
+                    self.apply_add1_sub1(params, prev, pov, add1, sub1);
                 }
             }
             _ => {
@@ -375,9 +381,9 @@ impl Accumulator {
                         king_sq,
                         perspective,
                     );
-                    self.apply_add1_sub2(prev, pov, add1, sub1, sub2);
+                    self.apply_add1_sub2(params, prev, pov, add1, sub1, sub2);
                 } else {
-                    self.apply_add1_sub1(prev, pov, add1, sub1);
+                    self.apply_add1_sub1(params, prev, pov, add1, sub1);
                 }
             }
         }
@@ -392,8 +398,14 @@ impl Accumulator {
 
     /// Update the PSQT head sums from `prev` for a set of added/removed features.
     #[inline]
-    fn psqt_apply(&mut self, prev: &Accumulator, pov: usize, adds: &[usize], subs: &[usize]) {
-        let params = network::params();
+    fn psqt_apply(
+        &mut self,
+        params: &NNUEParams,
+        prev: &Accumulator,
+        pov: usize,
+        adds: &[usize],
+        subs: &[usize],
+    ) {
         let mut psqt = prev.psqt[pov];
         for &a in adds {
             let w = &params.psqt_pst_weights.0[a];
@@ -412,17 +424,25 @@ impl Accumulator {
 
     /// Normal move: one feature added, one removed.
     #[inline]
-    fn apply_add1_sub1(&mut self, prev: &Accumulator, pov: usize, add1: usize, sub1: usize) {
+    fn apply_add1_sub1(
+        &mut self,
+        params: &NNUEParams,
+        prev: &Accumulator,
+        pov: usize,
+        add1: usize,
+        sub1: usize,
+    ) {
         let vacc = self.values.0[pov].as_mut_ptr();
         let vprev = prev.values.0[pov].as_ptr();
-        unsafe { dispatch::acc_add1_sub1(vprev, vacc, add1, sub1) };
-        self.psqt_apply(prev, pov, &[add1], &[sub1]);
+        unsafe { dispatch::acc_add1_sub1(params, vprev, vacc, add1, sub1) };
+        self.psqt_apply(params, prev, pov, &[add1], &[sub1]);
     }
 
     /// Capture / EP: one feature added, two removed.
     #[inline]
     fn apply_add1_sub2(
         &mut self,
+        params: &NNUEParams,
         prev: &Accumulator,
         pov: usize,
         add1: usize,
@@ -431,14 +451,15 @@ impl Accumulator {
     ) {
         let vacc = self.values.0[pov].as_mut_ptr();
         let vprev = prev.values.0[pov].as_ptr();
-        unsafe { dispatch::acc_add1_sub2(vprev, vacc, add1, sub1, sub2) };
-        self.psqt_apply(prev, pov, &[add1], &[sub1, sub2]);
+        unsafe { dispatch::acc_add1_sub2(params, vprev, vacc, add1, sub1, sub2) };
+        self.psqt_apply(params, prev, pov, &[add1], &[sub1, sub2]);
     }
 
     /// Castling: two features added, two removed.
     #[inline]
     fn apply_add2_sub2(
         &mut self,
+        params: &NNUEParams,
         prev: &Accumulator,
         pov: usize,
         add1: usize,
@@ -448,8 +469,8 @@ impl Accumulator {
     ) {
         let vacc = self.values.0[pov].as_mut_ptr();
         let vprev = prev.values.0[pov].as_ptr();
-        unsafe { dispatch::acc_add2_sub2(vprev, vacc, add1, add2, sub1, sub2) };
-        self.psqt_apply(prev, pov, &[add1, add2], &[sub1, sub2]);
+        unsafe { dispatch::acc_add2_sub2(params, vprev, vacc, add1, add2, sub1, sub2) };
+        self.psqt_apply(params, prev, pov, &[add1, add2], &[sub1, sub2]);
     }
 
     // ============================================================
@@ -464,6 +485,7 @@ impl Accumulator {
     /// full refresh). Subsequent uses with the same bucket are much faster.
     pub fn refresh_with_cache(
         &mut self,
+        params: &NNUEParams,
         pos: &Position,
         perspective: Color,
         cache: &mut FinnyTable,
@@ -524,6 +546,7 @@ impl Accumulator {
         // Apply delta with SIMD register blocking
         unsafe {
             dispatch::finny_apply(
+                params,
                 entry.values.0.as_mut_ptr(),
                 &adds[..n_adds],
                 &subs[..n_subs],
@@ -531,7 +554,6 @@ impl Accumulator {
         };
 
         // PSQT head: same diff, scalar (8 i32 per feature)
-        let params = network::params();
         for &a in &adds[..n_adds] {
             let w = &params.psqt_pst_weights.0[a];
             for b in 0..OUTPUT_BUCKETS {
@@ -676,7 +698,7 @@ mod tests {
 
             // Finny refresh (cold cache)
             let mut acc_finny = Accumulator::new();
-            acc_finny.refresh_with_cache(&pos, perspective, &mut cache);
+            acc_finny.refresh_with_cache(network::params(), &pos, perspective, &mut cache);
 
             for i in 0..L1_SIZE {
                 assert_eq!(
@@ -733,11 +755,11 @@ mod tests {
 
         // Warm the cache with pos1
         let mut acc1 = Accumulator::new();
-        acc1.refresh_with_cache(&pos1, Color::White, &mut cache);
+        acc1.refresh_with_cache(network::params(), &pos1, Color::White, &mut cache);
 
         // Refresh with pos2 (same king square, same bucket, 1 piece diff)
         let mut acc2 = Accumulator::new();
-        acc2.refresh_with_cache(&pos2, Color::White, &mut cache);
+        acc2.refresh_with_cache(network::params(), &pos2, Color::White, &mut cache);
 
         // Compare with full refresh
         let mut acc_ref = Accumulator::new();
@@ -766,7 +788,7 @@ mod tests {
 
         // Refresh with king on e1 (mirrored=1)
         let mut acc_e1 = Accumulator::new();
-        acc_e1.refresh_with_cache(&pos_e1, Color::White, &mut cache);
+        acc_e1.refresh_with_cache(network::params(), &pos_e1, Color::White, &mut cache);
         let mut ref_e1 = Accumulator::new();
         ref_e1.refresh(&pos_e1, Color::White);
 
@@ -779,7 +801,7 @@ mod tests {
 
         // Refresh with king on d1 (mirrored=0, different entry)
         let mut acc_d1 = Accumulator::new();
-        acc_d1.refresh_with_cache(&pos_d1, Color::White, &mut cache);
+        acc_d1.refresh_with_cache(network::params(), &pos_d1, Color::White, &mut cache);
         let mut ref_d1 = Accumulator::new();
         ref_d1.refresh(&pos_d1, Color::White);
 
@@ -810,7 +832,7 @@ mod tests {
                 let pov = perspective.index();
 
                 let mut acc_finny = Accumulator::new();
-                acc_finny.refresh_with_cache(&pos, perspective, &mut cache);
+                acc_finny.refresh_with_cache(network::params(), &pos, perspective, &mut cache);
 
                 let mut acc_ref = Accumulator::new();
                 acc_ref.refresh(&pos, perspective);

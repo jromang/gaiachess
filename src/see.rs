@@ -37,16 +37,40 @@ pub fn see(pos: &Position, m: Move, threshold: i32) -> bool {
         threshold
     );
 
-    // Castling, en passant, and promotions are almost always good — skip SEE
-    if m.move_type() != MT_NORMAL {
+    // Castling and promotions are almost always good — skip SEE.
+    // En passant is not: it is a plain pawn-takes-pawn exchange whose victim sits
+    // behind the target square, so it is resolved below like any capture. Letting it
+    // through unconditionally made it pass any threshold, however far above the one
+    // pawn it can win (a ProbCut threshold of 156 among others).
+    let mt = m.move_type();
+    if mt != MT_NORMAL && mt != MT_EN_PASSANT {
         return true;
     }
 
     let from = m.from_sq();
     let to = m.to_sq();
 
+    // Square of the piece actually taken: the target square, except en passant.
+    let victim_sq = if mt == MT_EN_PASSANT {
+        if pos.side_to_move == Color::White {
+            Square(to.0 - 8)
+        } else {
+            Square(to.0 + 8)
+        }
+    } else {
+        to
+    };
+    debug_assert!(
+        mt != MT_EN_PASSANT
+            || (pos.board[to.index()] == Piece::NONE
+                && pos.board[victim_sq.index()]
+                    == Piece::new(PieceType::Pawn, !pos.side_to_move)),
+        "SEE: en passant {} without an enemy pawn behind an empty target",
+        m.to_uci()
+    );
+
     // Best case: we capture the target piece for free
-    let captured = pos.board[to.index()];
+    let captured = pos.board[victim_sq.index()];
     let captured_val = if captured != Piece::NONE {
         SEE_VALUE[captured.piece_type() as usize]
     } else {
@@ -65,8 +89,9 @@ pub fn see(pos: &Position, m: Move, threshold: i32) -> bool {
         return true;
     }
 
-    // Set up occupancy after the initial capture
-    let mut occ = pos.occupancies[2] ^ from.bb() ^ to.bb();
+    // Set up occupancy after the initial capture. En passant empties the victim's
+    // square, which can open a line onto the target square.
+    let mut occ = pos.occupancies[2] ^ from.bb() ^ victim_sq.bb();
     let mut attackers = attackers_to(to, occ, &pos.pieces);
 
     let diag = pos.pieces[Piece::WHITE_BISHOP.index()]
@@ -282,5 +307,45 @@ mod tests {
             "d5",
             100
         ));
+    }
+
+    fn see_ep(fen: &str, from: &str, to: &str, threshold: i32) -> bool {
+        let pos = Position::from_fen(fen).unwrap();
+        let m = Move::new_with_type(
+            Square::from_string(from).unwrap(),
+            Square::from_string(to).unwrap(),
+            MT_EN_PASSANT,
+        );
+        see(&pos, m, threshold)
+    }
+
+    #[test]
+    fn en_passant_wins_one_pawn_and_no_more() {
+        // After 33.f4 in David's game (issue #29): exf3 e.p. takes the f4 pawn and
+        // nothing can recapture on f3. It wins exactly a pawn, so it must not pass
+        // the ProbCut threshold of 156 that it used to pass unconditionally.
+        let fen = "5rk1/Rb6/3rp3/1P1n1qp1/2BPpP1P/Q3p3/4N2P/2R4K b - f3 0 33";
+        assert!(see_ep(fen, "e4", "f3", 0));
+        assert!(see_ep(fen, "e4", "f3", 100));
+        assert!(!see_ep(fen, "e4", "f3", 101));
+        assert!(!see_ep(fen, "e4", "f3", 156));
+    }
+
+    #[test]
+    fn en_passant_into_a_recapture_is_an_even_trade() {
+        // exd6 e.p., the d6 pawn is then taken by the c7 pawn: pawn for pawn.
+        let fen = "4k3/2p5/8/3pP3/8/8/8/4K3 w - d6 0 1";
+        assert!(see_ep(fen, "e5", "d6", 0));
+        assert!(!see_ep(fen, "e5", "d6", 1));
+    }
+
+    #[test]
+    fn en_passant_opens_the_victims_square() {
+        // ...exd3 e.p. removes the d4 pawn, which was the only thing between the
+        // white rook on d6 and d3: the rook recaptures, pawn for pawn. Leaving d4 in
+        // the occupancy would hide the rook and score the capture a clean +100.
+        let fen = "7k/8/3R4/8/3Pp3/8/8/7K b - d3 0 1";
+        assert!(see_ep(fen, "e4", "d3", 0));
+        assert!(!see_ep(fen, "e4", "d3", 1));
     }
 }
