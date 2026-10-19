@@ -20,15 +20,24 @@ use crate::types::{
 };
 use crate::zobrist::ZOBRIST;
 
-/// Check if a move is quiet (no capture, no promotion, no EP).
-/// Used to validate killer/countermove moves.
-#[inline]
-fn is_quiet(pos: &Position, m: Move) -> bool {
-    let mt = m.move_type();
-    if mt == MT_CASTLING {
-        return true;
+/// Whether a move is quiet: what the quiet stage of generation produces.
+///
+/// One definition for the picker and the search. A promotion to a queen is not quiet,
+/// nor a capture, nor en passant; an under-promotion by a push is, as the generator
+/// has it — the search used to treat those as captures (capture history on the
+/// queen's slot, no history or futility pruning, capture LMR) while the generator and
+/// the quiet stages handled them as quiets. Castling is encoded as king-captures-own-
+/// rook, so the destination is occupied: tested first.
+#[inline(always)]
+pub(crate) fn is_quiet(pos: &Position, m: Move) -> bool {
+    match m.move_type() {
+        MT_CASTLING => true,
+        MT_EN_PASSANT => false,
+        MT_PROMOTION => {
+            m.promo_type() != PieceType::Queen && pos.board[m.to_sq().index()] == Piece::NONE
+        }
+        _ => pos.board[m.to_sq().index()] == Piece::NONE,
     }
-    mt != MT_PROMOTION && mt != MT_EN_PASSANT && pos.board[m.to_sq().index()] == Piece::NONE
 }
 
 /// Compute the Zobrist key of the child position after a move, without performing
@@ -215,6 +224,7 @@ impl MovePicker {
 
     /// Arm quiet skipping: all remaining quiet stages (killers, countermove,
     /// generation, quiets) are bypassed, only bad captures are still yielded.
+    /// Quiet checks are bypassed too: the caller guards only the move it prunes.
     pub fn skip_quiet_moves(&mut self) {
         self.skip_quiets = true;
     }
@@ -627,6 +637,35 @@ mod tests {
     /// position probes nothing, so it must agree with `make_move` on every legal move —
     /// captures, en passant, promotions plain and capturing, and castling, where king
     /// and rook both move and their squares may overlap.
+    /// Quiet is what the quiet stage generates, and only that: every move from
+    /// `generate_quiets` is quiet, every move from `generate_captures` is not.
+    #[test]
+    fn quiet_is_what_the_quiet_stage_generates() {
+        for fen in [
+            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+            // Promotions by push and by capture, both sides.
+            "1n2k2r/P6P/8/8/8/8/6K1/8 w k - 0 1",
+            "8/6k1/8/8/8/8/p6p/1N2K2R b K - 0 1",
+            // En passant.
+            "rnbqkbnr/ppp1p1pp/8/3pPp2/8/8/PPPP1PPP/RNBQKBNR w KQkq f6 0 3",
+        ] {
+            let pos = Position::from_fen(fen).unwrap();
+            let mut buf = ArrayBuf::<ScoredMove, MAX_MOVES>::new();
+            let n = movegen::generate_quiets(&pos, &mut buf);
+            for i in 0..n {
+                let m = buf[i].mv;
+                assert!(is_quiet(&pos, m), "{fen}: quiet stage made {}", m.to_uci());
+            }
+            let mut buf = ArrayBuf::<ScoredMove, MAX_MOVES>::new();
+            let n = movegen::generate_captures(&pos, &mut buf);
+            for i in 0..n {
+                let m = buf[i].mv;
+                assert!(!is_quiet(&pos, m), "{fen}: capture stage made {}", m.to_uci());
+            }
+        }
+    }
+
     #[test]
     fn the_predicted_child_key_is_the_one_make_move_produces() {
         let fens = [

@@ -396,8 +396,10 @@ tunable! {
     // All default to zero, so the search is unchanged until they are tuned; the
     // point is to put the whole reference surface in front of the tuner at once
     // instead of discovering it one branch at a time.
-    /// Reduce more when the TT move is a capture (reference: +593).
-    LMR_TTM_CAPTURE = -110, -1024, 1536, 64;
+    /// Reduce more when the TT move is a capture, at the reference value. The -110 the
+    /// SPSA found earlier was learned on a signal read from the child's board, true for
+    /// nearly every TT move (P28 of TODO_SEARCH_BUGS).
+    LMR_TTM_CAPTURE = 1079, -1024, 1536, 64;
     /// Reduce less for a killer move (reference: -1084 on both killers, never
     /// the countermove — the exclusion is deliberate there).
     LMR_KILLER_SUB = 40, 0, 2048, 64;

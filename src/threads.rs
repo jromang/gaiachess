@@ -270,14 +270,19 @@ impl Drop for CurrLineReporter {
 pub struct RootMove {
     pub mv: Move,
     /// Score of the last completed iteration in which this move was the line's
-    /// best (-SCORE_INFINITE while it never was). Never a bound: only a settled
-    /// aspiration loop writes it, and a stopped iteration writes nothing.
+    /// best (-SCORE_INFINITE while it never was). Exact, written by a settled
+    /// aspiration loop — unless `lower_bound` is set.
     pub score: i32,
     /// The iteration `score` comes from (0 while the move was never scored). The
     /// root moves are kept sorted by depth first, so `root_moves[0]` is always the
     /// deepest completed result — the move played and the line reported when the
     /// search stops in the middle of an iteration.
     pub depth: i32,
+    /// `score` is the lower bound of a fail-high in an iteration that has not
+    /// settled. The move then stands at the last completed depth, ahead of the
+    /// previous best, so that a search stopped before the iteration settles plays
+    /// the move the fail-high has just proved better. The exact score clears it.
+    pub lower_bound: bool,
     /// The score this move had before `score` was last written.
     pub previous_score: i32,
     /// Running average score for aspiration window centering.
@@ -309,6 +314,7 @@ impl RootMove {
             mv,
             score: -SCORE_INFINITE,
             depth: 0,
+            lower_bound: false,
             previous_score: -SCORE_INFINITE,
             avg_score: SCORE_NONE,
             pv,
@@ -356,8 +362,10 @@ pub struct StackEntry {
     /// Follow-PV guard: true if this node is on the previous iteration's PV
     pub follow_pv: bool,
     /// Beta cutoffs seen at this ply since the parent entered its move loop.
-    /// The parent zeroes it once; every child searched from there shares the
-    /// slot, so it counts how often this ply keeps refuting the parent's moves.
+    /// The parent zeroes it on entry and again as its move loop starts, after the
+    /// null move and ProbCut have searched at this ply; every child searched from
+    /// there shares the slot, so it counts how often this ply keeps refuting the
+    /// parent's moves.
     pub failhighs: u8,
 }
 
@@ -561,6 +569,10 @@ pub struct ThreadData {
     pub reported_multi_pv: usize,
     /// Index of the PV line currently being searched (0-based).
     pub pv_index: usize,
+    /// End of the root moves the current line may choose from: the tablebase rank
+    /// group of `root_moves[pv_index]` when the root is in the tables, every root move
+    /// otherwise. Set by the iterative deepening for each line.
+    pub pv_last: usize,
     /// Tablebase hit counter (reported as `tbhits` in UCI info).
     pub tb_hits: u64,
     /// Syzygy TB config for this search.
@@ -580,6 +592,11 @@ pub struct ThreadData {
     pub best_previous_score: i32,
     pub best_previous_avg_score: i32,
     pub previous_time_reduction: f64,
+    /// Whether the evaluation in use is the network's, read once per search. The
+    /// material and SEE conversions the search adds to the eval are measured in the
+    /// network's units; without a network the eval is PeSTO, in centipawns, and they
+    /// must be too (see [`ThreadData::piece_value`]).
+    pub network_eval: bool,
     /// Set by evaluate_pos() when the lazy-eval gate fired (PeSTO used instead of NNUE).
     /// Read immediately afterward to skip correction history application/update.
     pub used_lazy_eval: bool,
@@ -607,6 +624,16 @@ pub struct ThreadData {
     /// `None` during normal play so recording costs nothing.
     #[cfg(feature = "tree")]
     pub tree: Option<Box<crate::tree::TreeRec>>,
+}
+
+/// Whether the main thread, done with its search, stops the helpers.
+///
+/// Always, except when a node budget was split across the pool (see `split_node_limit`)
+/// and nothing else bounds the move: each helper then owns a share and finishes it. A
+/// clock is the main thread's alone — the helpers would otherwise run on to the hard
+/// limit, three to seven times the move's budget, and `bestmove` wait for them.
+fn main_stops_the_pool(per_thread_nodes: bool, has_clock: bool) -> bool {
+    !per_thread_nodes || has_clock
 }
 
 /// Divides a fixed node budget into one share per thread; `None` for every other
@@ -694,6 +721,7 @@ impl ThreadData {
             multi_pv: 1,
             reported_multi_pv: 1,
             pv_index: 0,
+            pv_last: 0,
             tb_hits: 0,
             #[cfg(feature = "syzygy")]
             tb_config: TbConfig::default(),
@@ -703,6 +731,7 @@ impl ThreadData {
             best_previous_avg_score: SCORE_NONE,
             previous_time_reduction: INITIAL_TIME_REDUCTION,
             used_lazy_eval: false,
+            network_eval: true,
             skill: crate::skill::Snapshot::FULL_STRENGTH,
             optimism: [0; 2],
             last_iteration_pv: [Move::NONE; MAX_PLY + 1],
@@ -714,6 +743,33 @@ impl ThreadData {
             stats: Box::new(crate::stats::SearchStats::zeroed()),
             #[cfg(feature = "tree")]
             tree: None,
+        }
+    }
+
+    /// A piece's material value in the units of the evaluation in use: measured on the
+    /// network (`EVAL_PIECE_VALUE`), or the centipawns of PeSTO (`PIECE_VALUE`).
+    ///
+    /// Without a network the October conversions to network units applied to PeSTO's
+    /// centipawns, about four times too large: the PeSTO search of the unit tests
+    /// drifted (issue #23's frontier test fell one ply short), and so would any build
+    /// left without its network.
+    #[inline(always)]
+    pub fn piece_value(&self, pt: usize) -> i32 {
+        debug_assert!(pt < 7, "piece_value: type {pt}");
+        if self.network_eval {
+            EVAL_PIECE_VALUE[pt]
+        } else {
+            PIECE_VALUE[pt]
+        }
+    }
+
+    /// A margin in the units of the evaluation in use, as a SEE threshold (centipawns).
+    #[inline(always)]
+    pub fn eval_to_see(&self, margin: i32) -> i32 {
+        if self.network_eval {
+            eval_to_see(margin)
+        } else {
+            margin
         }
     }
 
@@ -901,7 +957,8 @@ impl ThreadData {
         self.stats.clear();
 
         // Refresh NNUE accumulator for root position
-        if nnue::network::has_network() {
+        self.network_eval = nnue::network::has_network();
+        if self.network_eval {
             self.nnue.refresh(&self.pos);
         }
         self.root_depth = 0;
@@ -922,6 +979,7 @@ impl ThreadData {
         // by the *previous* search — a different position, possibly a different game.
         self.optimism = [0; 2];
         self.pv_index = 0;
+        self.pv_last = 0;
         self.tb_hits = 0;
         self.curr_line.clear();
         #[cfg(feature = "syzygy")]
@@ -993,6 +1051,10 @@ impl ThreadData {
             entry.double_extensions = 0;
             entry.reduction = 0;
             entry.follow_pv = false;
+            // The root's count has no parent to clear it: without this it ran over the
+            // life of the process, and the root's LMR context depended on every search
+            // before — a dump on a fresh thread did not reduce as the engine in a game.
+            entry.failhighs = 0;
         }
     }
 
@@ -1186,6 +1248,8 @@ impl ThreadPool {
             .collect();
 
         self.threads = build_threads(&numa, &thread_node, bound);
+        // The thread elected last time may not exist any more.
+        self.last_best_idx = 0;
         for (i, td) in self.threads.iter_mut().enumerate() {
             td.id = i;
             td.thread_count = n;
@@ -1312,15 +1376,40 @@ impl ThreadPool {
         search_moves: &[Move],
     ) -> (Move, Option<Move>) {
         STOP.store(false, Ordering::Relaxed);
+        self.start_search_armed(pos, limits, search_moves)
+    }
+
+    /// Like [`start_search_filtered`], for a caller that has set STOP itself.
+    ///
+    /// The UCI session does: a `stop` can be read off stdin before the session has
+    /// reached the `go` it follows, and lowering STOP here would erase it — the search
+    /// would then run until a second `stop` that never comes.
+    pub fn start_search_armed(
+        &mut self,
+        pos: &Position,
+        limits: SearchLimits,
+        search_moves: &[Move],
+    ) -> (Move, Option<Move>) {
         SEARCHING.store(true, Ordering::Relaxed);
         let _searching = SearchingGuard;
         self.shared.tt.new_search();
         LAST_INFO_MS.store(0, Ordering::Relaxed);
 
-        // Prepare all threads. A pinned thread evaluates with its node's copy of the
-        // network, chosen here, before the root refresh, so that a network loaded since
-        // the last search is the one used.
-        for td in &mut self.threads {
+        // A handicapped engine searches on one thread whatever the machine has, so a
+        // given skill level plays the same everywhere. Extra cores would otherwise
+        // quietly make a "weak" opponent stronger. Decided before the threads are
+        // prepared: the lone thread must divide nothing by the pool's size — its node
+        // budget, its instability — or the level would depend on `Threads`.
+        let lone = (self.threads.len() == 1 && !self.bound)
+            || crate::skill::level() < crate::skill::FULL_STRENGTH;
+        let searching = if lone { 1 } else { self.threads.len() };
+
+        // Prepare the threads that search. A pinned thread evaluates with its node's
+        // copy of the network, chosen here, before the root refresh, so that a network
+        // loaded since the last search is the one used.
+        let pool_size = self.threads.len();
+        for td in &mut self.threads[..searching] {
+            td.thread_count = searching;
             td.multi_pv = self.multi_pv;
             let replica = if self.bound {
                 nnue::replica(self.numa.system_node_of(td.numa_node))
@@ -1346,22 +1435,34 @@ impl ThreadPool {
             || !search_moves.is_empty()
             || crate::uci::analyse_mode();
         if let Some(mv) = crate::book::choice(pos, analysing) {
+            // The last `info` line and the tablebase prefetch read the front root move
+            // of the elected thread: make it the book move, on the thread they read.
+            // Left alone, they showed the first legal move generated, and an index
+            // kept from a larger pool could point past the end of this one.
+            self.last_best_idx = 0;
+            let td = &mut self.threads[0];
+            td.thread_count = pool_size;
+            if let Some(i) = td.root_moves.iter().position(|rm| rm.mv == mv) {
+                td.root_moves[..=i].rotate_right(1);
+            }
+            td.best_move = mv;
+            debug_assert!(
+                td.root_moves.first().is_some_and(|rm| rm.mv == mv),
+                "book move {} is not a root move",
+                mv.to_uci()
+            );
             return (mv, None);
         }
 
         self.shared.cpu_load.reset();
 
         #[cfg(not(target_arch = "wasm32"))]
-        let _curr_line_reporter = CurrLineReporter::start(&self.threads);
+        let _curr_line_reporter = CurrLineReporter::start(&self.threads[..searching]);
 
-        // A handicapped engine searches on one thread whatever the machine has, so a
-        // given skill level plays the same everywhere. Extra cores would otherwise
-        // quietly make a "weak" opponent stronger.
-        if (self.threads.len() == 1 && !self.bound)
-            || crate::skill::level() < crate::skill::FULL_STRENGTH
-        {
+        if lone {
             // Single-thread fast path: no spawning overhead
             search::search(&mut self.threads[0], &self.shared);
+            self.threads[0].thread_count = pool_size;
             self.last_best_idx = 0;
             let best = self.threads[0].best_move;
             let ponder = self.extract_ponder_move(0);
@@ -1399,7 +1500,7 @@ impl ThreadPool {
             // a fixed-node lane at several threads exists to avoid.
             let mut main_job = move || {
                 search::search(main_td, shared);
-                if !main_td.per_thread_nodes {
+                if main_stops_the_pool(main_td.per_thread_nodes, main_td.tm.has_clock()) {
                     STOP.store(true, Ordering::Relaxed);
                 }
             };
@@ -1425,10 +1526,31 @@ impl ThreadPool {
         // Select best thread via weighted vote aggregation
         let best_idx = self.select_best_thread();
         self.last_best_idx = best_idx;
+        self.inherit_time_state(best_idx);
 
         let best = self.threads[best_idx].best_move;
         let ponder = self.extract_ponder_move(best_idx);
         (best, ponder)
+    }
+
+    /// Hands the main thread the score the next move's time management compares
+    /// against: the one of the move actually played, which is the elected thread's.
+    ///
+    /// Every thread ends its search on its own score and running average, but only the
+    /// main thread reads them back, to measure how far the evaluation has fallen. The
+    /// time reduction stays the main thread's own, as in the reference engines.
+    fn inherit_time_state(&mut self, best_idx: usize) {
+        if best_idx == 0 || best_idx >= self.threads.len() {
+            return;
+        }
+        let elected = &self.threads[best_idx];
+        if elected.root_moves.first().is_none_or(|rm| rm.depth == 0) {
+            return;
+        }
+        let (score, avg) = (elected.best_previous_score, elected.best_previous_avg_score);
+        let main = &mut self.threads[0];
+        main.best_previous_score = score;
+        main.best_previous_avg_score = avg;
     }
 
     /// Emit the final UCI snapshot immediately before `bestmove`.
@@ -1437,7 +1559,10 @@ impl ThreadPool {
     /// iteration. Repeating the last completed PV here gives the GUI final statistics
     /// and also makes a helper selected by Lazy SMP agree with the move being played.
     pub fn print_final_uci_info(&self) {
-        let td = &self.threads[self.last_best_idx];
+        let Some(td) = self.threads.get(self.last_best_idx) else {
+            debug_assert!(false, "elected thread {} out of the pool", self.last_best_idx);
+            return;
+        };
         if td.silent || td.root_moves.is_empty() {
             return;
         }
@@ -1445,8 +1570,9 @@ impl ThreadPool {
         if td.root_moves[0].depth > 0 {
             let multi_pv = td.reported_multi_pv.min(td.root_moves.len()).max(1);
             // Every root move carries the depth its score comes from, and the
-            // deepest completed line is at the front: the snapshot is exact, never
-            // a bound, never shallower than what was finished.
+            // deepest completed line is at the front: the snapshot is never
+            // shallower than what was finished, and exact unless a fail-high of the
+            // unfinished iteration stands there, reported as a lower bound.
             search::print_multi_pv_info(td, &self.shared, multi_pv);
         } else if td.best_move.is_ok() {
             let elapsed = td.tm.total_elapsed_ms().max(1);
@@ -1573,15 +1699,32 @@ impl ThreadPool {
         agg
     }
 
-    /// Extract the ponder move (PV[1]) from the given thread's best root move.
+    /// Extract the ponder move from the given thread's best root move: PV[1], or, when
+    /// the line stops after the move itself, the move the table holds for the position
+    /// it leads to.
+    ///
+    /// A one-move line is common: a tablebase hit at ply 1, a draw, the line of a
+    /// fail-high promoted when the search stopped. The table entry of the child is
+    /// what the search expected there (the form of the reference engines); it comes
+    /// from a shared, lock-free table, so it is checked for legality before use.
     fn extract_ponder_move(&self, thread_idx: usize) -> Option<Move> {
         let td = &self.threads[thread_idx];
-        if !td.root_moves.is_empty() && td.root_moves[0].pv_len >= 2 {
-            let m = td.root_moves[0].pv[1];
-            if m.is_ok() { Some(m) } else { None }
-        } else {
-            None
+        let rm = td.root_moves.first()?;
+        if rm.pv_len >= 2 {
+            let m = rm.pv[1];
+            return m.is_ok().then_some(m);
         }
+        let mv = rm.pv[0];
+        if !mv.is_ok() {
+            return None;
+        }
+        let mut pos = td.pos.clone();
+        pos.make_move(mv);
+        if pos.is_draw(1) {
+            return None;
+        }
+        let reply = self.shared.tt.probe(pos.key, 0, pos.halfmove_clock)?.mv;
+        movegen::is_playable_table_move(&pos, reply).then_some(reply)
     }
 }
 
@@ -1669,10 +1812,10 @@ mod tests {
 
         let share = BUDGET / THREADS as u64;
         for td in &pool.threads {
-            // The limit is checked every 512 nodes, so a thread can overshoot by that
-            // much plus the tail of the node it was in.
+            // The limit is checked every 512 nodes, and every count is seen once, so a
+            // thread overshoots by less than that.
             assert!(
-                td.nodes >= share && td.nodes < share + 2048,
+                td.nodes >= share && td.nodes <= share + 512,
                 "thread {} searched {} nodes, expected about {}",
                 td.id,
                 td.nodes,
@@ -1738,7 +1881,7 @@ mod tests {
             "a lone thread must not think it owns a share"
         );
         assert!(
-            td.nodes >= 40_000 && td.nodes < 42_048,
+            td.nodes >= 40_000 && td.nodes <= 40_512,
             "lone thread searched {} nodes for a budget of 40000",
             td.nodes
         );
@@ -1760,6 +1903,8 @@ mod tests {
 
     #[test]
     fn searchmoves_confines_the_actual_root_search() {
+        // Searches: a weakened level or a STOP raised by another test must not reach it.
+        let _guard = crate::skill::lock_level();
         let pos = Position::from_fen_ex("r3k2r/8/8/8/8/8/8/R3K2R w AHah - 0 1", true).unwrap();
         let only = crate::uci::parse_uci_move(&pos, "e1h1").expect("legal Chess960 castle");
         let mut pool = ThreadPool::new(1, 4);
@@ -1774,6 +1919,8 @@ mod tests {
 
     #[test]
     fn multipv_finishes_in_descending_score_order() {
+        // Searches: a weakened level or a STOP raised by another test must not reach it.
+        let _guard = crate::skill::lock_level();
         let pos = Position::from_fen(STARTPOS).unwrap();
         let mut pool = ThreadPool::new(1, 4);
         pool.multi_pv = 3;
@@ -1848,6 +1995,9 @@ mod tests {
     /// elected thread, and that thread stands at the deepest completed iteration.
     #[test]
     fn the_elected_thread_stands_at_the_deepest_completed_iteration() {
+        // A weakened level set by a test running beside this one would search on one
+        // thread and leave the helpers unprepared.
+        let _guard = crate::skill::lock_level();
         let pos = Position::from_fen(
             "r1bq1rk1/pp2bppp/2n1pn2/2pp4/3P4/2PBPN2/PP1N1PPP/R1BQ1RK1 w - - 0 8",
         )
@@ -1871,5 +2021,197 @@ mod tests {
             "elected thread at depth {} while another completed {deepest}",
             elected.root_moves[0].depth
         );
+    }
+    /// Shrinking the pool forgets which thread was elected: the index could otherwise
+    /// point past the end of the new pool, and the next `info` line panic.
+    #[test]
+    fn a_rebuilt_pool_forgets_the_thread_it_elected() {
+        let mut pool = ThreadPool::new(4, 1);
+        pool.last_best_idx = 3;
+        pool.resize_threads(2);
+        assert_eq!(pool.last_best_idx, 0);
+        assert!(pool.threads.get(pool.last_best_idx).is_some());
+    }
+
+    /// A move out of the book is the move the final `info` line and the prefetch
+    /// read: the front root move of the elected thread. They used to read the first
+    /// legal move generated (`pv a2a3` before `bestmove e2e4`).
+    #[test]
+    fn a_book_move_is_the_move_the_last_line_shows() {
+        let _guard = crate::skill::lock_level();
+        let pos = Position::from_fen(STARTPOS).unwrap();
+        let mut pool = ThreadPool::new(2, 1);
+        for td in &mut pool.threads {
+            td.silent = true;
+        }
+        pool.last_best_idx = 1;
+        crate::skill::set(10, 0);
+        STOP.store(false, Ordering::Relaxed);
+        let (best, ponder) = pool.start_search(&pos, SearchLimits::depth(2));
+        crate::skill::set(crate::skill::FULL_STRENGTH, 0);
+        assert!(best.is_ok());
+        assert_eq!(ponder, None, "the book plays without a search");
+        assert_eq!(pool.last_best_idx, 0);
+        let td = &pool.threads[0];
+        assert_eq!(td.best_move, best);
+        assert_eq!(td.root_moves[0].mv, best, "the front move is the book move");
+        assert_eq!(td.root_moves[0].depth, 0, "and it carries no search");
+    }
+
+    /// A line of one move still gives a ponder move when the table knows the reply,
+    /// and only a legal one: none for a forged entry, none after a drawing move.
+    #[test]
+    fn a_one_move_line_ponders_on_the_table_reply() {
+        use crate::tt::Bound;
+        let _guard = crate::skill::lock_level();
+        let pos = Position::from_fen(STARTPOS).unwrap();
+        let mut pool = ThreadPool::new(1, 1);
+        pool.threads[0].silent = true;
+        STOP.store(false, Ordering::Relaxed);
+        pool.start_search(&pos, SearchLimits::depth(4));
+        let first = pool.threads[0].root_moves[0].mv;
+        pool.threads[0].root_moves[0].pv_len = 1;
+
+        let mut child = pos.clone();
+        child.make_move(first);
+        let mut buf: ArrayBuf<Move, MAX_MOVES> = ArrayBuf::new();
+        movegen::generate_legal_moves(&child, &mut buf);
+        let reply = buf[0];
+        pool.shared
+            .tt
+            .store(child.key, 3, 0, 0, Bound::Exact, reply, 0, true);
+        assert_eq!(pool.extract_ponder_move(0), Some(reply), "the table's reply");
+
+        // An entry whose move cannot be played in the child (white's own e2e4).
+        let forged = Move::new(Square::E2, Square::E4);
+        assert!(!movegen::is_pseudo_legal(&child, forged));
+        pool.shared
+            .tt
+            .store(child.key, 3, 0, 0, Bound::Exact, forged, 0, true);
+        assert_eq!(pool.extract_ponder_move(0), None, "a forged entry is refused");
+    }
+
+    /// Stopped while a later multi-PV line is searched, the engine plays the move of
+    /// the first line it has just published, and ponders on that move's reply: it used
+    /// to play the previous iteration's move with the new move's reply as ponder.
+    #[test]
+    fn a_multi_pv_search_stopped_on_a_later_line_plays_its_first_line() {
+        let _guard = crate::skill::lock_level();
+        let pos = Position::from_fen(
+            "r1bq1rk1/pp2bppp/2n1pn2/2pp4/3P4/2PBPN2/PP1N1PPP/R1BQ1RK1 w - - 0 8",
+        )
+        .unwrap();
+        for threads in [1, 4] {
+            for nodes in (5_000..=300_000).step_by(29_500) {
+                let mut pool = ThreadPool::new(threads, 4);
+                pool.multi_pv = 3;
+                for td in &mut pool.threads {
+                    td.silent = true;
+                }
+                STOP.store(false, Ordering::Relaxed);
+                let (best, ponder) = pool.start_search(&pos, SearchLimits::nodes(nodes));
+                let front = &pool.threads[pool.last_best_idx].root_moves[0];
+                assert_eq!(best, front.mv, "{threads} thread(s), {nodes} nodes");
+                if front.pv_len >= 2 {
+                    assert_eq!(ponder, Some(front.pv[1]), "{threads} thread(s), {nodes} nodes");
+                }
+            }
+        }
+    }
+
+    /// A weakened level is the same opponent whatever `Threads` says: one thread
+    /// searches, with the whole node budget — it used to get a quarter of it at four.
+    #[test]
+    fn a_weakened_level_searches_alike_on_any_pool() {
+        let _guard = crate::skill::lock_level();
+        // Out of the book, so the level has to search.
+        let pos = Position::from_fen(
+            "r1bq1rk1/pp2bppp/2n1pn2/2pp4/3P4/2PBPN2/PP1N1PPP/R1BQ1RK1 w - - 0 8",
+        )
+        .unwrap();
+        let mut results = Vec::new();
+        for threads in [1, 4] {
+            let mut pool = ThreadPool::new(threads, 4);
+            for td in &mut pool.threads {
+                td.silent = true;
+            }
+            crate::skill::set(19, 7);
+            STOP.store(false, Ordering::Relaxed);
+            let (best, _) = pool.start_search(&pos, SearchLimits::nodes(3_000));
+            crate::skill::set(crate::skill::FULL_STRENGTH, 0);
+            assert_eq!(pool.threads[0].thread_count, threads, "pool size restored");
+            results.push((best, pool.threads[0].nodes));
+        }
+        assert_eq!(results[0], results[1], "same move, same nodes at 1 and 4 threads");
+    }
+
+    /// The main thread stops the helpers when it is done, unless each spends a node
+    /// share of its own and no clock bounds the move.
+    #[test]
+    fn a_clock_lets_the_main_thread_stop_the_pool() {
+        assert!(main_stops_the_pool(false, false));
+        assert!(main_stops_the_pool(false, true));
+        assert!(!main_stops_the_pool(true, false), "node shares are finished");
+        assert!(main_stops_the_pool(true, true), "clock and nodes: the clock decides");
+    }
+
+    /// The next move measures its falling score against the move actually played,
+    /// which is the elected thread's — not the main thread's own.
+    #[test]
+    fn the_elected_thread_hands_its_score_to_the_next_move() {
+        let mut pool = ThreadPool::new(2, 1);
+        for (i, td) in pool.threads.iter_mut().enumerate() {
+            td.root_moves = vec![RootMove::new(Move::new(Square::E2, Square::E4))];
+            td.root_moves[0].depth = 10;
+            td.best_previous_score = 100 * (i as i32 + 1);
+            td.best_previous_avg_score = 90 * (i as i32 + 1);
+        }
+        pool.inherit_time_state(0);
+        assert_eq!(pool.threads[0].best_previous_score, 100, "main elected: unchanged");
+        pool.inherit_time_state(1);
+        assert_eq!(pool.threads[0].best_previous_score, 200);
+        assert_eq!(pool.threads[0].best_previous_avg_score, 180);
+    }
+
+    /// `go mate N` also ends on a mate suffered within N moves: Black, in check, has
+    /// only Kh8, and Qg7# follows. It used to search on to depth 127.
+    #[test]
+    fn a_mate_search_ends_on_a_mate_suffered_too() {
+        let _guard = crate::skill::lock_level();
+        let pos = Position::from_fen("6k1/5Q2/6K1/8/8/8/8/8 b - - 0 1").unwrap();
+        let mut pool = ThreadPool::new(1, 4);
+        pool.threads[0].silent = true;
+        STOP.store(false, Ordering::Relaxed);
+        let limits = SearchLimits {
+            mate: Some(1),
+            ..SearchLimits::default()
+        };
+        let (best, _) = pool.start_search(&pos, limits);
+        let td = &pool.threads[0];
+        assert_eq!(best.to_uci(), "g8h8", "the only move");
+        assert_eq!(td.root_moves[0].score, mated_in(2), "mated in one move");
+        assert!(td.completed_depth < 10, "searched on to depth {}", td.completed_depth);
+    }
+
+    /// `go mate N` on several threads: the search ends as soon as a thread proves the
+    /// mate, with that mate.
+    #[test]
+    fn a_proved_mate_ends_a_mate_search_on_several_threads() {
+        let _guard = crate::skill::lock_level();
+        // A back-rank mate in one.
+        let pos = Position::from_fen("6k1/5ppp/8/8/8/8/5PPP/3R2K1 w - - 0 1").unwrap();
+        let mut pool = ThreadPool::new(4, 4);
+        for td in &mut pool.threads {
+            td.silent = true;
+        }
+        STOP.store(false, Ordering::Relaxed);
+        let limits = SearchLimits {
+            mate: Some(1),
+            ..SearchLimits::default()
+        };
+        let (best, _) = pool.start_search(&pos, limits);
+        assert_eq!(best.to_uci(), "d1d8", "the back-rank mate");
+        let elected = &pool.threads[pool.last_best_idx];
+        assert_eq!(elected.root_moves[0].score, mate_in(1));
     }
 }

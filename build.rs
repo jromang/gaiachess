@@ -83,9 +83,16 @@ fn main() {
     // Pyrrhic (Syzygy tablebase probing)
     // tbprobe.c uses <stdatomic.h> (C11 atomics) which MSVC 14.50 doesn't expose
     // cleanly. Use clang — handles C11 atomics natively on all platforms.
+    //
+    // No inherited rustflags: cc would turn the PGO build's -Cprofile-generate into
+    // -fprofile-generate, and the system clang rarely shares rustc's LLVM. Its raw
+    // profile records then differ in layout from what rustc's profiler runtime reads,
+    // and the instrumented binary crashes at exit while writing its profile (seen on
+    // the CI runners, clang 23 against LLVM 22 locally). Probing is not worth a profile.
     #[cfg(feature = "syzygy")]
     {
         cc::Build::new()
+            .inherit_rustflags(false)
             .compiler("clang")
             .file("src/pyrrhic/tbprobe.c")
             .include("src/pyrrhic")

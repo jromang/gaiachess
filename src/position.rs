@@ -238,9 +238,17 @@ pub struct Position {
     /// Incremental PeSTO: game phase (sum of PHASE_INC for all pieces).
     pub game_phase: i32,
 
-    history: [StateHistory; 1024],
+    history: [StateHistory; HISTORY_LEN],
     pub ply: usize,
 }
+
+/// Saved states a position can hold: a game, plus the deepest search on top of it.
+const HISTORY_LEN: usize = 1024;
+
+/// Past this many saved states [`Position::rebase_history`] trims the game history.
+/// Far enough below [`HISTORY_LEN`] for a full-depth search on top of it, and high
+/// enough that an ordinary game never pays for the copy.
+const REBASE_PLY: usize = HISTORY_LEN / 2;
 
 impl Position {
     // ============================================================
@@ -830,7 +838,7 @@ impl Position {
             game_phase: 0,
             plies_from_null: 0,
             repetition: 0,
-            history: [StateHistory::default(); 1024],
+            history: [StateHistory::default(); HISTORY_LEN],
             ply: 0,
         };
 
@@ -1184,7 +1192,7 @@ impl Position {
             m.to_sq().0
         );
         debug_assert!(
-            self.ply < 1023,
+            self.ply < HISTORY_LEN - 1,
             "make_move: ply {} overflow (BUG 4)",
             self.ply
         );
@@ -1426,6 +1434,34 @@ impl Position {
         self.check_validity();
     }
 
+    /// Keeps a game of any length within the fixed history.
+    ///
+    /// For a position reached by playing a game's moves one by one (`position ...
+    /// moves`, the interface's game): once the history is half full, the states no rule
+    /// can reach any more are dropped. What reads the history goes back at most
+    /// `min(halfmove clock, plies since the null move)` plies — repetition, the cuckoo
+    /// scan — and one ply for the prior move's threats and capture: those are kept, the
+    /// rest is gone. A game of more than ~450 moves used to overflow the 1024 states
+    /// and abort the engine. Never called inside a search, which unmakes back to its
+    /// root.
+    pub fn rebase_history(&mut self) {
+        if self.ply >= REBASE_PLY {
+            self.trim_history();
+        }
+    }
+
+    /// [`Self::rebase_history`] at any length.
+    pub(crate) fn trim_history(&mut self) {
+        let reach = (self.halfmove_clock as usize).min(self.plies_from_null as usize);
+        let keep = (reach + 1).min(self.ply);
+        if keep == self.ply {
+            return;
+        }
+        self.history.copy_within(self.ply - keep..self.ply, 0);
+        self.ply = keep;
+        debug_assert!(self.ply < REBASE_PLY, "trimmed history still holds {} states", self.ply);
+    }
+
     // ============================================================
     // unmake_move
     // ============================================================
@@ -1517,7 +1553,11 @@ impl Position {
     /// Apply a [null move](https://www.chessprogramming.org/Null_Move): switch side
     /// without moving any piece. Used during search for null-move pruning.
     pub fn make_null_move(&mut self) {
-        debug_assert!(self.ply < 1023, "make_null: ply {} overflow", self.ply);
+        debug_assert!(
+            self.ply < HISTORY_LEN - 1,
+            "make_null: ply {} overflow",
+            self.ply
+        );
         debug_assert!(self.checkers == 0, "make_null: in check (illegal)");
         self.history[self.ply] = StateHistory {
             castling_rights: self.castling_rights,
@@ -1688,6 +1728,18 @@ impl Position {
     #[inline(always)]
     pub fn draw_by_repetition(&self, search_ply: i32) -> bool {
         self.repetition != 0 && self.repetition < search_ply
+    }
+
+    /// Whether any position since the last irreversible move (or null move) has
+    /// occurred before. Tells the tablebase root ranking that the game is going round
+    /// in circles, so that it ranks wins by distance instead of all alike.
+    pub fn has_repeated(&self) -> bool {
+        let end = (self.halfmove_clock as usize).min(self.plies_from_null as usize);
+        if end < 4 {
+            return false;
+        }
+        self.repetition != 0
+            || (1..=(end - 4).min(self.ply)).any(|k| self.history[self.ply - k].repetition != 0)
     }
 
     /// Returns true if the position has at least one legal move.
@@ -2133,8 +2185,8 @@ impl Position {
 
         // 12. Ply bound (catches BUG 4: history overflow)
         debug_assert!(
-            self.ply < 1024,
-            "check_validity: ply {} >= 1024 (history overflow)",
+            self.ply < HISTORY_LEN,
+            "check_validity: ply {} >= {HISTORY_LEN} (history overflow)",
             self.ply
         );
 
@@ -2189,7 +2241,7 @@ impl Position {
 // ============================================================
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     const STARTPOS: &str = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
 
@@ -2513,6 +2565,22 @@ mod tests {
         assert_eq!(pos.ep_square, Square::NONE);
     }
 
+    /// A repetition since the last irreversible move is remembered until a pawn
+    /// move or a capture wipes the slate.
+    #[test]
+    fn has_repeated_lasts_until_the_next_irreversible_move() {
+        let mut pos = Position::from_fen(STARTPOS).unwrap();
+        assert!(!pos.has_repeated());
+        for uci in ["g1f3", "g8f6", "f3g1", "f6g8"] {
+            make_uci(&mut pos, uci);
+        }
+        assert!(pos.has_repeated(), "the start position came back");
+        make_uci(&mut pos, "b1c3");
+        assert!(pos.has_repeated(), "still within the reversible stretch");
+        make_uci(&mut pos, "e7e5");
+        assert!(!pos.has_repeated(), "a pawn move clears it");
+    }
+
     #[test]
     fn test_fen_epd_opcodes_are_not_clocks() {
         // Non-numeric tokens after the EP square are EPD opcodes, not parse errors.
@@ -2545,6 +2613,52 @@ mod tests {
     /// the lower of its two squares in some of those positions and on the higher one
     /// in the others; the path check between the squares must not take the king
     /// itself for an obstacle.
+    /// A long game in UCI notation: queen's knights shuffling `cycles` times, then a pawn
+    /// move for each side, `pairs` times (at most 14: two steps on each file but c, whose
+    /// third square the knights use). With `cycles` up to 24 the halfmove clock never
+    /// reaches 100.
+    pub(crate) fn long_game(pairs: usize, cycles: usize) -> Vec<String> {
+        assert!(pairs <= 14 && cycles <= 24);
+        let files = ["a", "b", "d", "e", "f", "g", "h"];
+        let mut moves = Vec::new();
+        for k in 0..pairs {
+            for _ in 0..cycles {
+                moves.extend(["b1c3", "b8c6", "c3b1", "c6b8"].map(String::from));
+            }
+            let (f, step) = (files[k % files.len()], k / files.len());
+            moves.push(format!("{f}{}{f}{}", 2 + step, 3 + step));
+            moves.push(format!("{f}{}{f}{}", 7 - step, 6 - step));
+        }
+        moves
+    }
+
+    /// Trimming the game history changes nothing any rule can see: repetitions,
+    /// upcoming repetitions and draws come out the same, ply after ply, as on the
+    /// untrimmed position.
+    #[test]
+    fn a_trimmed_history_sees_the_same_repetitions() {
+        let game = long_game(6, 10);
+        let mut full = Position::from_fen(STARTPOS).unwrap();
+        for (i, uci) in game.iter().enumerate() {
+            let mut trimmed = full.clone();
+            trimmed.trim_history();
+            assert!(trimmed.ply <= full.ply);
+            // The next stretch of the game, on both.
+            let mut a = full.clone();
+            for next in game.iter().skip(i).take(12) {
+                make_uci(&mut a, next);
+                make_uci(&mut trimmed, next);
+                assert_eq!(a.key, trimmed.key);
+                assert_eq!(a.repetition, trimmed.repetition, "ply {i} then {next}");
+                for sp in 0..4 {
+                    assert_eq!(a.upcoming_repetition(sp), trimmed.upcoming_repetition(sp));
+                    assert_eq!(a.is_draw(sp as i32), trimmed.is_draw(sp as i32));
+                }
+            }
+            make_uci(&mut full, uci);
+        }
+    }
+
     #[test]
     fn an_upcoming_repetition_is_seen_whichever_end_the_piece_stands_on() {
         let mut pos = Position::from_fen("4k3/8/8/8/8/8/8/4K3 w - - 0 1").unwrap();

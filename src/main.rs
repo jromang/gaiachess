@@ -590,6 +590,8 @@ fn real_main(cmd: Cmd, stdin: ProbedStdin) {
                 );
                 println!("Shared net:  {}", gaiachess::shm::describe());
             }
+            #[cfg(feature = "gaiatb")]
+            println!("Shared TB:   {}", gaiachess::dtm::describe_sharing());
             // On x86-64 the SIMD paths are resolved from CPUID at startup; the
             // report shows what this machine actually runs, not what the build
             // could. Other architectures have a single compile-time backend.

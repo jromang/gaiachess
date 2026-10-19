@@ -55,6 +55,7 @@ impl GameState {
             m.to_uci()
         );
         self.pos.make_move(m);
+        self.pos.rebase_history();
         self.moves.push(m);
         self.refresh();
     }
@@ -82,6 +83,7 @@ impl GameState {
         self.pos = Position::from_fen(STARTPOS).expect("start position must parse");
         for &m in &self.moves {
             self.pos.make_move(m);
+            self.pos.rebase_history();
         }
         self.refresh();
     }

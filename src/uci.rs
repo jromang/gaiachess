@@ -59,6 +59,47 @@ static SHOW_WDL: AtomicBool = AtomicBool::new(false);
 /// `UCI_ShowCurrLine`: publish lock-free snapshots of the lines being searched.
 static SHOW_CURR_LINE: AtomicBool = AtomicBool::new(false);
 
+/// Every `go` the stdin reader has passed on, counted in the order it read them.
+///
+/// The reader acts on `stop` and `ponderhit` the moment it reads them, but the session
+/// only reaches the `go` they follow once it has dealt with everything queued before
+/// it. Arming a search then means lowering STOP and raising PONDER — and doing that
+/// blindly would wipe out an event the reader has already seen for this very search.
+/// The counts say which search an event was meant for (see [`arm_search_flags`]).
+static GO_READ: AtomicU64 = AtomicU64::new(0);
+/// The `go` (by [`GO_READ`]) that the last `stop` or `quit` was read after.
+static STOP_READ: AtomicU64 = AtomicU64::new(0);
+/// The `go` (by [`GO_READ`]) that the last `ponderhit` was read after.
+static HIT_READ: AtomicU64 = AtomicU64::new(0);
+
+/// Sets STOP and PONDER for the search of the `go`-th `go`, keeping any `stop` or
+/// `ponderhit` the reader has already read after it.
+///
+/// Lowered first and checked after: the reader records which `go` an event follows
+/// before acting on it, so an event landing between the two steps is seen by the
+/// check, and one landing before the first step is restored by it. An event read
+/// after an earlier `go` belongs to that search and is left behind. Sequentially
+/// consistent throughout, as the argument needs a store then a load to be ordered on
+/// both threads. Without a reader (tests, the browser build) nothing is ever recorded
+/// and the search starts clean, as it always did.
+fn arm_search_flags(go: u64, ponder: bool) {
+    arm_flags(go, ponder, &STOP, &PONDER);
+}
+
+/// [`arm_search_flags`] on flags of the caller's choosing, so a test can watch it work
+/// without raising the process-wide STOP under every other test's search.
+fn arm_flags(go: u64, ponder: bool, stop: &AtomicBool, pondering: &AtomicBool) {
+    debug_assert!(go > 0, "a search is armed for a go that was counted");
+    stop.store(false, Ordering::SeqCst);
+    pondering.store(ponder, Ordering::SeqCst);
+    if STOP_READ.load(Ordering::SeqCst) >= go {
+        stop.store(true, Ordering::SeqCst);
+    }
+    if HIT_READ.load(Ordering::SeqCst) >= go {
+        pondering.store(false, Ordering::SeqCst);
+    }
+}
+
 /// `UCI_ShowRefutations`: publish the replies found for non-best root moves.
 static SHOW_REFUTATIONS: AtomicBool = AtomicBool::new(false);
 
@@ -130,7 +171,9 @@ fn skill_seed() -> u64 {
 /// only one to read it, or the bytes one reader has buffered are lost to the other.
 ///
 /// `stop` and `quit` set the global STOP flag here, in the reader, so a search stops
-/// even though the main thread is blocked in start_search().
+/// even though the main thread is blocked in start_search(). Each `go`, `stop` and
+/// `ponderhit` is counted as well, so the session can tell which search an event was
+/// meant for when it gets round to the `go` (see [`arm_search_flags`]).
 pub fn spawn_stdin_reader() -> mpsc::Receiver<String> {
     let (tx, rx) = mpsc::channel::<String>();
     std::thread::spawn(move || {
@@ -141,11 +184,16 @@ pub fn spawn_stdin_reader() -> mpsc::Receiver<String> {
                     let tokens: Vec<&str> = l.split_whitespace().collect();
                     let rest = skip_unknown_prefix(&tokens);
                     match rest {
+                        ["go", ..] => {
+                            GO_READ.fetch_add(1, Ordering::SeqCst);
+                        }
                         ["stop", ..] | ["quit", ..] => {
-                            STOP.store(true, Ordering::Relaxed);
+                            STOP_READ.store(GO_READ.load(Ordering::SeqCst), Ordering::SeqCst);
+                            STOP.store(true, Ordering::SeqCst);
                         }
                         ["ponderhit", ..] => {
-                            PONDER.store(false, Ordering::Relaxed);
+                            HIT_READ.store(GO_READ.load(Ordering::SeqCst), Ordering::SeqCst);
+                            PONDER.store(false, Ordering::SeqCst);
                         }
                         ["debug", "on", ..] => {
                             DEBUG.store(true, Ordering::Relaxed);
@@ -188,6 +236,11 @@ pub struct UciSession {
     pool: ThreadPool,
     ponder_enabled: bool,
     chess960: bool,
+    /// `go` commands handled so far: the same count the stdin reader keeps in
+    /// [`GO_READ`], since every line reaches both in the same order.
+    go_count: u64,
+    /// The skill level the last search ran at (see [`UciSession::forget_other_levels`]).
+    searched_level: i32,
 }
 
 impl UciSession {
@@ -197,10 +250,28 @@ impl UciSession {
             pool: ThreadPool::new(1, 16),
             ponder_enabled: true,
             chess960: false,
+            go_count: 0,
+            searched_level: crate::skill::FULL_STRENGTH,
         }
     }
 
-    /// Heavy init the spec wants after `uciok`: GaiaTB decompresses ~147 MB.
+    /// Clears the tables and histories when the level has changed since the last search.
+    ///
+    /// A weakened level stores its own evaluations — material or piece squares mixed
+    /// into the network, then noised — and scores from a tree it searched half blind.
+    /// Full strength would read them back as its own, cut on them, and train its
+    /// correction on them; a weak level would play above its rung on what full strength
+    /// left. Checked at the search, which every way of changing the level goes through.
+    fn forget_other_levels(&mut self) {
+        let level = crate::skill::level();
+        if level != self.searched_level {
+            self.pool.clear();
+            self.searched_level = level;
+        }
+    }
+
+    /// Heavy init the spec wants after `uciok`: GaiaTB decompresses ~147 MB, unless
+    /// another engine process on the machine already did and shares its image.
     fn ensure_ready(&self) {
         #[cfg(all(feature = "gaiatb", gaiatb_embedded))]
         {
@@ -251,19 +322,23 @@ impl UciSession {
 
             ["go", rest @ ..] => {
                 self.ensure_ready();
+                self.forget_other_levels();
                 let ponder_requested = rest.contains(&"ponder");
-                if ponder_requested {
-                    PONDER.store(true, Ordering::Relaxed);
-                }
+                self.go_count += 1;
+                arm_search_flags(self.go_count, ponder_requested);
                 #[cfg(feature = "online-tb")]
                 if crate::online_tb::is_enabled() {
                     crate::online_tb::ensure_worker_running();
                 }
                 let (limits, search_moves) = parse_go(rest, &self.pos);
+                let infinite = limits.infinite;
+                // Armed: STOP already says whether this search was stopped before it
+                // began, and must not be lowered again.
                 let (best, ponder_move) =
                     self.pool
-                        .start_search_filtered(&self.pos, limits, &search_moves);
-                wait_for_ponder_release(ponder_requested);
+                        .start_search_armed(&self.pos, limits, &search_moves);
+                // No legal move: there is nothing to wait for, the answer is final.
+                wait_for_release(ponder_requested, infinite && best.is_ok());
                 self.pool.print_final_uci_info();
                 if !best.is_ok() {
                     // No legal move (mate or stalemate). The protocol's nullmove is 0000.
@@ -288,14 +363,14 @@ impl UciSession {
                 // Prefetch online TB: PV positions first, then opponent replies
                 #[cfg(feature = "online-tb")]
                 if crate::online_tb::is_enabled() {
-                    let idx = self.pool.last_best_idx;
-                    let (pv, pv_len) = if !self.pool.threads[idx].root_moves.is_empty() {
-                        (
-                            &self.pool.threads[idx].root_moves[0].pv[..],
-                            self.pool.threads[idx].root_moves[0].pv_len,
-                        )
-                    } else {
-                        (&[][..], 0)
+                    let front = self
+                        .pool
+                        .threads
+                        .get(self.pool.last_best_idx)
+                        .and_then(|td| td.root_moves.first());
+                    let (pv, pv_len) = match front {
+                        Some(rm) => (&rm.pv[..], rm.pv_len),
+                        None => (&[][..], 0),
                     };
                     crate::online_tb::start_prefetch(
                         self.pos.clone(),
@@ -398,21 +473,37 @@ impl UciSession {
     }
 }
 
-/// A ponder search must not hand a move to the GUI before `ponderhit` or `stop`,
-/// even when an independent depth limit or a terminal position ended its work.
-fn wait_for_ponder_release(ponder_requested: bool) {
-    if !ponder_requested {
+/// Holds the `bestmove` back until the interface may have it.
+///
+/// A ponder search must not hand a move to the GUI before `ponderhit` or `stop`, and an
+/// infinite one not before `stop` ("Do not exit the search without being told so in
+/// this mode!"), even when a depth limit, a level's depth ceiling or a short mate ended
+/// the search on its own.
+fn wait_for_release(ponder_requested: bool, infinite: bool) {
+    if !must_hold_bestmove(ponder_requested, infinite, true, false) {
         return;
     }
 
     #[cfg(not(target_arch = "wasm32"))]
     {
         crate::threads::SEARCHING.store(true, Ordering::Relaxed);
-        while PONDER.load(Ordering::Relaxed) && !STOP.load(Ordering::Relaxed) {
+        while must_hold_bestmove(
+            ponder_requested,
+            infinite,
+            PONDER.load(Ordering::Relaxed),
+            STOP.load(Ordering::Relaxed),
+        ) {
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
         crate::threads::SEARCHING.store(false, Ordering::Relaxed);
     }
+}
+
+/// Whether a finished search must keep its move to itself: a `stop` always releases
+/// it; otherwise a ponder search waits for its `ponderhit`, and an infinite one for
+/// its `stop`.
+fn must_hold_bestmove(ponder_requested: bool, infinite: bool, pondering: bool, stop: bool) -> bool {
+    !stop && ((ponder_requested && pondering) || infinite)
 }
 
 impl Default for UciSession {
@@ -463,7 +554,10 @@ fn parse_position(tokens: &[&str], pos: &mut Position, chess960: bool) {
     if let ["moves", rest @ ..] = tokens {
         for move_str in rest {
             match parse_uci_move(pos, move_str) {
-                Some(m) => pos.make_move(m),
+                Some(m) => {
+                    pos.make_move(m);
+                    pos.rebase_history();
+                }
                 None => {
                     out!("info string Illegal move: {move_str}");
                     break;
@@ -988,10 +1082,25 @@ mod tests {
     /// swallows another's output, or clears the log out from under it.
     static TRANSCRIPT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    fn lock_transcript() -> std::sync::MutexGuard<'static, ()> {
-        TRANSCRIPT_LOCK
+    /// Held for a whole session: the transcript lock, and the skill level's.
+    ///
+    /// The level's lock is the one every multi-thread test takes, and those raise the
+    /// process-wide STOP as they finish — enough to cut a session's search short and
+    /// change its score. It also keeps a weakened level set by another test away from
+    /// the session's searches.
+    struct TranscriptGuard {
+        _transcript: std::sync::MutexGuard<'static, ()>,
+        _level: std::sync::MutexGuard<'static, ()>,
+    }
+
+    fn lock_transcript() -> TranscriptGuard {
+        let transcript = TRANSCRIPT_LOCK
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        TranscriptGuard {
+            _transcript: transcript,
+            _level: crate::skill::lock_level(),
+        }
     }
 
     /// Drive a whole session and hand back everything it printed, by way of the debug
@@ -1021,6 +1130,130 @@ mod tests {
             .filter_map(|value| value.parse().ok())
             .last()
             .unwrap_or_else(|| panic!("no score cp line in: {text}"))
+    }
+
+    /// A `stop` or `ponderhit` the reader saw before the session reached its `go`
+    /// survives the arming of that search, and one meant for an earlier search does not
+    /// leak into the next. Used to be erased: `go infinite` then `stop` sent together
+    /// left the engine searching for ever.
+    #[test]
+    fn events_read_ahead_of_their_go_survive_the_arming() {
+        // The counters are read by every session's `go`: keep the transcript tests out.
+        let _guard = lock_transcript();
+        let (stop, ponder) = (AtomicBool::new(false), AtomicBool::new(false));
+        let read = |go: u64, stop: u64, hit: u64| {
+            GO_READ.store(go, Ordering::SeqCst);
+            STOP_READ.store(stop, Ordering::SeqCst);
+            HIT_READ.store(hit, Ordering::SeqCst);
+        };
+
+        // go, stop: both read before the session handles the go.
+        read(1, 1, 0);
+        arm_flags(1, false, &stop, &ponder);
+        assert!(stop.load(Ordering::SeqCst), "the stop was meant for this search");
+
+        // That stop belonged to search 1; search 2 starts clean.
+        read(2, 1, 0);
+        arm_flags(2, false, &stop, &ponder);
+        assert!(!stop.load(Ordering::SeqCst), "an earlier search's stop leaked");
+
+        // go ponder, ponderhit: the search starts on the clock.
+        read(3, 1, 3);
+        arm_flags(3, true, &stop, &ponder);
+        assert!(!ponder.load(Ordering::SeqCst), "the ponderhit was lost");
+        assert!(!stop.load(Ordering::SeqCst));
+
+        // go ponder with no hit yet: pondering.
+        read(4, 1, 3);
+        arm_flags(4, true, &stop, &ponder);
+        assert!(ponder.load(Ordering::SeqCst));
+
+        // Back to what a session without a reader sees.
+        read(0, 0, 0);
+    }
+
+    /// `go infinite` keeps its move until `stop`, whatever ended the search; a ponder
+    /// search until `ponderhit` or `stop`. Used to answer as soon as the 128 iterations
+    /// of a short mate, or a level's few plies, were done.
+    #[test]
+    fn a_bestmove_is_held_until_the_interface_may_have_it() {
+        // (ponder requested, infinite, PONDER, STOP) -> held
+        assert!(must_hold_bestmove(false, true, false, false), "infinite waits for stop");
+        assert!(!must_hold_bestmove(false, true, false, true), "stop releases infinite");
+        assert!(must_hold_bestmove(true, false, true, false), "ponder waits for its hit");
+        assert!(!must_hold_bestmove(true, false, false, false), "ponderhit releases it");
+        assert!(!must_hold_bestmove(true, false, true, true), "stop releases a ponder");
+        assert!(must_hold_bestmove(true, true, false, false), "a hit does not end infinite");
+        assert!(!must_hold_bestmove(false, false, false, false), "a bounded go never waits");
+        assert!(!must_hold_bestmove(false, false, true, false), "PONDER alone means nothing");
+    }
+
+    /// A game longer than the 1024 saved states — 1372 plies here — is parsed and
+    /// searched: `position ... moves` used to overflow the history and abort.
+    #[test]
+    fn a_game_of_more_than_a_thousand_plies_is_parsed_and_searched() {
+        let game = crate::position::tests::long_game(14, 24);
+        assert!(game.len() > 1100);
+        let mut tokens = vec!["startpos", "moves"];
+        tokens.extend(game.iter().map(String::as_str));
+        let mut pos = Position::from_fen(STARTPOS).unwrap();
+        parse_position(&tokens, &mut pos, false);
+        assert_eq!(pos.fullmove_number as usize, 1 + game.len() / 2, "every move was played");
+        assert!(pos.ply < 512, "history still {} states deep", pos.ply);
+
+        let _guard = crate::skill::lock_level();
+        let mut pool = crate::threads::ThreadPool::new(1, 1);
+        pool.threads[0].silent = true;
+        STOP.store(false, Ordering::Relaxed);
+        let (best, _) = pool.start_search(&pos, SearchLimits::depth(6));
+        assert!(best.is_ok());
+    }
+
+    /// Full strength after a weakened level searches as a fresh engine would: nothing
+    /// the weak level stored in the tables or the histories is read back.
+    #[test]
+    fn a_change_of_level_leaves_nothing_behind() {
+        let _guard = lock_transcript();
+        let position =
+            "position fen r1bq1rk1/pp2bppp/2n1pn2/2pp4/3P4/2PBPN2/PP1N1PPP/R1BQ1RK1 w - - 0 8";
+        // The deterministic part of the last depth-9 line: score, nodes and PV.
+        let last_line = |text: &str| -> String {
+            let line = text
+                .lines()
+                .filter(|l| l.contains("info depth 9 ") && l.contains(" pv "))
+                .last()
+                .unwrap_or_else(|| panic!("no depth 9 line in: {text}"));
+            let words: Vec<&str> = line.split_whitespace().collect();
+            let field = |name: &str, len: usize| {
+                let i = words.iter().position(|w| *w == name).expect(name);
+                words[i + 1..i + 1 + len].join(" ")
+            };
+            let pv = line.split(" pv ").nth(1).unwrap_or_default();
+            format!("{} {} {pv}", field("score", 2), field("nodes", 1))
+        };
+        let after_weak = transcript(
+            "level-weak",
+            &[
+                "setoption name NormalizeScore value false",
+                "setoption name Skill Level value 5",
+                position,
+                "go depth 4",
+                "setoption name Skill Level value 20",
+                position,
+                "go depth 9",
+            ],
+        );
+        let fresh = transcript(
+            "level-fresh",
+            &[
+                "setoption name NormalizeScore value false",
+                "setoption name Skill Level value 20",
+                position,
+                "go depth 9",
+            ],
+        );
+        crate::skill::set(crate::skill::FULL_STRENGTH, 0);
+        assert_eq!(last_line(&after_weak), last_line(&fresh));
     }
 
     #[test]
@@ -1194,6 +1427,8 @@ mod tests {
 
     #[test]
     fn four_field_fen_search_plays_a_black_move() {
+        // Searches: a weakened level or a STOP raised by another test must not reach it.
+        let _guard = crate::skill::lock_level();
         // The Fritz symptom: a 4-field FEN used to be rejected, the engine
         // stayed on startpos, and the PV (e2e4…) was illegal on the GUI board.
         let mut pos = Position::from_fen(STARTPOS).unwrap();

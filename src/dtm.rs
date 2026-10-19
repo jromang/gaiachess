@@ -3,14 +3,20 @@
 //! This module wraps `gaiatb/src/probe.rs` (copied verbatim below) and adds
 //! a GaiaChess-specific `probe_position()` entry point.
 //!
-//! **50-move rule**: like Nalimov and Gaviota, these tables ignore the 50-move
-//! rule. This is acceptable because 3+4 piece DTMs are small (≤83 half-moves).
+//! **50-move rule**: like Nalimov and Gaviota, these tables ignore the 50-move rule,
+//! so [`probe_position`] declines a mate further away than the clock still allows —
+//! a 3+4 piece DTM runs up to 83 half-moves, more than a clock past 17 leaves (#24).
+//!
+//! **One copy per machine**: the decompressed tables are shared between engine
+//! processes like the network weights (see [`load`] and `shm.rs`).
 //!
 //! Gated behind `--features gaiatb`.
 
+use std::borrow::Cow;
 use std::sync::OnceLock;
 
 use crate::position::Position;
+use crate::shm::{Backing, Origin};
 use crate::types::{Color, PieceType, dtm_score};
 
 // ── Blob source ──────────────────────────────────────────────────────────────
@@ -30,7 +36,7 @@ static PROBER: OnceLock<Option<Prober>> = OnceLock::new();
 /// Returns true if the tables loaded successfully.
 #[cfg(gaiatb_embedded)]
 pub fn init() -> bool {
-    PROBER.get_or_init(|| Prober::from_blob(BLOB)).is_some()
+    PROBER.get_or_init(|| load(BLOB)).is_some()
 }
 
 /// Where a host-delivered blob accumulates before [`publish_received`] reads it.
@@ -54,9 +60,154 @@ pub fn reserve(len: usize) -> *mut u8 {
 pub fn publish_received() -> bool {
     let blob = std::mem::take(&mut *INCOMING.lock().unwrap());
     if PROBER.get().is_none() {
-        PROBER.set(Prober::from_blob(&blob)).ok();
+        PROBER.set(load(&blob)).ok();
     }
     available()
+}
+
+// ── One copy per machine ─────────────────────────────────────────────────────
+//
+// The decompressed tables are ~155 MB per process and never written once built. A
+// test lane running 64 engines held 64 identical copies of them, ~10 GB. They are
+// shared like the network weights (`shm.rs`): one sealed image per executable and
+// blob, built by the first process that asks, mapped read-only by the others, freed
+// with the last of them. Any failure falls back to a private copy, which is what
+// every process held before: sharing saves memory, it is never a condition for
+// probing the tables.
+
+/// Turns the sharing of the tables off (`GAIA_SHARED_TB=0`), independently of the
+/// network's `GAIA_SHARED_NET`, so each can be measured on its own.
+const SHARED_TB_VAR: &str = "GAIA_SHARED_TB";
+
+/// Version of the image layout. The image name carries it, so a change to the
+/// header or to how the store is laid out must bump it: two layouts must never
+/// meet under one name (on Windows, where images are not keyed by executable).
+const IMAGE_FORMAT: u32 = 1;
+
+const IMAGE_MAGIC: [u8; 4] = *b"GTBI";
+
+/// Fixed part of the image header. One (WTM, BTM) offset pair per table follows.
+const IMAGE_FIXED: usize = 32;
+
+/// Header status of an image whose store holds every table.
+const IMAGE_COMPLETE: u32 = 1;
+
+/// One line for `gaiachess info`. Loads nothing.
+pub fn describe_sharing() -> String {
+    crate::shm::describe_policy(crate::shm::wanted(SHARED_TB_VAR), SHARED_TB_VAR)
+}
+
+/// The tables, from the machine's shared image when possible, else private.
+fn load(blob: &[u8]) -> Option<Prober> {
+    let dir = read_directory(blob)?;
+    if !crate::shm::supported() {
+        return Prober::private(blob, &dir);
+    }
+    let mut reason = format!("sharing turned off by {SHARED_TB_VAR}");
+    if crate::shm::wanted(SHARED_TB_VAR) {
+        let name = image_name(blob);
+        match Prober::shared(blob, &dir, &name) {
+            Ok((prober, origin)) => {
+                let backing = Backing::Shared {
+                    origin,
+                    peers: crate::shm::peers_of(&name),
+                };
+                crate::outerr!("info string GaiaTB tables: {backing}");
+                return Some(prober);
+            }
+            Err(e) => reason = e,
+        }
+    }
+    let prober = Prober::private(blob, &dir)?;
+    crate::outerr!("info string GaiaTB tables: {}", Backing::Private { reason });
+    Some(prober)
+}
+
+/// The image's name: which blob, in which layout. The sharing layer adds the user
+/// and the executable.
+fn image_name(blob: &[u8]) -> String {
+    format!(
+        "gaiatb-{:016x}-i{IMAGE_FORMAT}",
+        crate::nnue::integrity::fnv1a64(blob)
+    )
+}
+
+/// The image is a header, then the store exactly as a private load lays it out:
+///
+/// ```text
+/// 0   magic "GTBI"            4   IMAGE_FORMAT
+/// 8   table count             12  status (IMAGE_COMPLETE, or 0: the store overflowed)
+/// 16  bytes of store used     24  reserved
+/// 32  per table, u64 each: where its WTM and BTM sections start in the store
+/// ```
+///
+/// The offsets are written down because nothing else knows them: the frames do not
+/// record their decoded size, and a process that receives the image must not have
+/// to decompress anything to read it.
+fn image_header_len(tables: usize) -> usize {
+    (IMAGE_FIXED + 16 * tables).next_multiple_of(64)
+}
+
+fn write_header(head: &mut [u8], tables: usize, layout: Option<&Layout>) {
+    debug_assert_eq!(head.len(), image_header_len(tables));
+    head.fill(0);
+    head[0..4].copy_from_slice(&IMAGE_MAGIC);
+    head[4..8].copy_from_slice(&IMAGE_FORMAT.to_le_bytes());
+    head[8..12].copy_from_slice(&(tables as u32).to_le_bytes());
+    // An image whose build failed is still published, status zero, so that every
+    // process reads the same refusal instead of waiting for a builder that gave up.
+    let Some(layout) = layout else {
+        return;
+    };
+    debug_assert_eq!(layout.offsets.len(), tables);
+    head[12..16].copy_from_slice(&IMAGE_COMPLETE.to_le_bytes());
+    head[16..24].copy_from_slice(&(layout.used as u64).to_le_bytes());
+    for (i, &(wtm, btm)) in layout.offsets.iter().enumerate() {
+        let at = IMAGE_FIXED + 16 * i;
+        head[at..at + 8].copy_from_slice(&(wtm as u64).to_le_bytes());
+        head[at + 8..at + 16].copy_from_slice(&(btm as u64).to_le_bytes());
+    }
+}
+
+fn read_header(head: &[u8], tables: usize, capacity: usize) -> Result<Layout, String> {
+    if head.len() != image_header_len(tables) {
+        return Err(format!("header is {} bytes", head.len()));
+    }
+    let u32_at =
+        |at: usize| u32::from_le_bytes([head[at], head[at + 1], head[at + 2], head[at + 3]]);
+    let u64_at = |at: usize| {
+        let mut b = [0u8; 8];
+        b.copy_from_slice(&head[at..at + 8]);
+        u64::from_le_bytes(b)
+    };
+    if head[0..4] != IMAGE_MAGIC || u32_at(4) != IMAGE_FORMAT {
+        return Err(String::from("not a GaiaTB image of this format"));
+    }
+    if u32_at(8) as usize != tables {
+        return Err(format!("image holds {} tables, blob {tables}", u32_at(8)));
+    }
+    if u32_at(12) != IMAGE_COMPLETE {
+        return Err(String::from(
+            "the tables did not fit the store their directory predicts",
+        ));
+    }
+    let used = u64_at(16);
+    if used > capacity as u64 {
+        return Err(format!("store holds {used} bytes, room for {capacity}"));
+    }
+    let used = used as usize;
+    let mut offsets = Vec::with_capacity(tables);
+    for i in 0..tables {
+        let (wtm, btm) = (
+            u64_at(IMAGE_FIXED + 16 * i),
+            u64_at(IMAGE_FIXED + 16 * i + 8),
+        );
+        if wtm > btm || btm > used as u64 {
+            return Err(format!("table {i} lies outside the store"));
+        }
+        offsets.push((wtm as usize, btm as usize));
+    }
+    Ok(Layout { offsets, used })
 }
 
 /// Returns true if the DTM tables are loaded and ready.
@@ -75,8 +226,11 @@ pub fn available() -> bool {
 /// `probe_dtm()` returns an STM-relative DTM (dtm>0 = STM wins) because each
 /// table section (WTM/BTM) stores DTMs from that section's mover's perspective.
 pub fn probe_position(pos: &Position, ply: i32) -> Option<i32> {
-    let prober = PROBER.get()?.as_ref()?;
+    probe_with(PROBER.get()?.as_ref()?, pos, ply)
+}
 
+/// [`probe_position`] through a given set of tables.
+fn probe_with(prober: &Prober, pos: &Position, ply: i32) -> Option<i32> {
     // Quick piece-count guard (should already be checked by caller, but be safe)
     if pos.occupied().count_ones() > 4 {
         return None;
@@ -86,7 +240,17 @@ pub fn probe_position(pos: &Position, ply: i32) -> Option<i32> {
     let stm_white = pos.side_to_move == Color::White;
 
     let dtm = prober.probe_dtm(&white, &black, wk, bk, &pieces[..np], stm_white)?;
-    Some(stored_dtm_to_score(dtm as i32, ply))
+    let dtm = dtm as i32;
+    // A mate the 50-move rule may forbid is not proved by a distance-to-mate table: it
+    // can still be won through a capture or a pawn move the DTM line does not make,
+    // but only a search can say so. Declined, as Nalimov declines it, rather than
+    // turning a cursed win into a mate. A stored value is the distance plus one.
+    let distance = if dtm == 0 { 0 } else { dtm.abs() - 1 };
+    let moves_left = 100 - pos.halfmove_clock as i32;
+    if distance > moves_left {
+        return None;
+    }
+    Some(stored_dtm_to_score(dtm, ply))
 }
 
 /// Map a stored DTM to a negamax score at `ply`.
@@ -181,33 +345,47 @@ fn extract_for_probe(pos: &Position) -> ([u8; 5], [u8; 5], u8, u8, [u8; 8], usiz
 // ╔══════════════════════════════════════════════════════════════════════════╗
 // ║  GaiaTB probe.rs — copied from gaiatb/src/probe.rs                       ║
 // ║  Self-contained: no gaiatb crate dependency.                             ║
-// ║  Two local adaptations: decompression goes through `decode_zstd` (the C  ║
-// ║  zstd cannot be linked into a wasm module), and `packed_data` is sized   ║
-// ║  up front (letting ~155 MB double its way up would hold peak memory far  ║
-// ║  above that — a browser never hands linear memory back).                 ║
+// ║  Local adaptations: decompression goes through `decode_frame` (the C     ║
+// ║  zstd cannot be linked into a wasm module), and loading is split so the  ║
+// ║  store can be a buffer of our choosing — this process's own, sized up    ║
+// ║  front (letting ~155 MB double its way up would hold peak memory far     ║
+// ║  above that — a browser never hands linear memory back), or an image     ║
+// ║  shared with the other engine processes.                                 ║
 // ╚══════════════════════════════════════════════════════════════════════════╝
 
 // ── Decompression ────────────────────────────────────────────────────────────
 
-/// One zstd frame, fully decoded. Native builds use the C zstd; the wasm build
-/// decodes with ruzstd, pure Rust, same as the embedded network does.
+/// Decodes one zstd frame into the front of `dst` and returns its length; `None`
+/// if the frame is corrupt or does not fit. Native builds use the C zstd, which
+/// writes in place: the frames do not record their decoded size, but the
+/// single-pass decoder only needs room enough.
 #[cfg(not(target_arch = "wasm32"))]
-fn decode_zstd(data: &[u8]) -> Option<Vec<u8>> {
-    zstd::decode_all(data).ok()
+fn decode_frame(frame: &[u8], dst: &mut [u8]) -> Option<usize> {
+    zstd::bulk::decompress_to_buffer(frame, dst).ok()
 }
 
+/// The wasm build decodes with ruzstd, pure Rust, same as the embedded network does.
 #[cfg(target_arch = "wasm32")]
-fn decode_zstd(data: &[u8]) -> Option<Vec<u8>> {
+fn decode_frame(frame: &[u8], dst: &mut [u8]) -> Option<usize> {
     use std::io::Read;
     // The frames declare a 128 MB window, over ruzstd's 100 MB default ceiling —
     // the same raise the embedded network needs (see nnue/network.rs). The window
     // is a claim in the frame header, not an allocation: no section comes close.
     const WINDOW: u64 = 128 * 1024 * 1024;
     let mut decoder =
-        ruzstd::decoding::StreamingDecoder::new_with_max_window_size(data, WINDOW).ok()?;
-    let mut out = Vec::new();
-    decoder.read_to_end(&mut out).ok()?;
-    Some(out)
+        ruzstd::decoding::StreamingDecoder::new_with_max_window_size(frame, WINDOW).ok()?;
+    // Read straight into the store: a temporary as large as the section would only
+    // raise the high-water mark of a linear memory the browser never hands back.
+    let mut len = 0;
+    while len < dst.len() {
+        match decoder.read(&mut dst[len..]).ok()? {
+            0 => return Some(len),
+            n => len += n,
+        }
+    }
+    // The store is full: the frame must have ended exactly there.
+    let mut more = [0u8; 1];
+    (decoder.read(&mut more).ok()? == 0).then_some(len)
 }
 
 // ── Blob constants ───────────────────────────────────────────────────
@@ -708,111 +886,216 @@ struct ProberTable {
 
 struct Prober {
     tables: Vec<ProberTable>,
-    packed_data: Vec<u8>,
+    /// Every table's packed entries, end to end: this process's own copy, or an
+    /// image shared with the other engine processes on the machine.
+    packed_data: Cow<'static, [u8]>,
 }
 
-impl Prober {
-    fn from_blob(blob: &[u8]) -> Option<Self> {
-        if blob.len() < HEADER_SIZE || blob[0..4] != BLOB_MAGIC || blob[4] != BLOB_VERSION {
-            return None;
-        }
-        let table_count = blob[5] as usize;
-        let data_start = HEADER_SIZE + table_count * ENTRY_SIZE;
-        if blob.len() < data_start {
-            return None;
-        }
+/// One line of the blob's directory: a table's shape, and where its frames are.
+struct Entry {
+    sig: [u8; SIG_LEN],
+    flags: u8,
+    bits: u8,
+    max_dtm: u16,
+    per_stm: u32,
+    total_positions: u32,
+    /// The table's compressed bytes within the blob; empty when it has none to
+    /// decode (a single-value table).
+    frames: std::ops::Range<usize>,
+}
 
-        // Size the decompressed store from the entries before filling it, so the
-        // ~155 MB is allocated once instead of grown. The entry table understates
-        // slightly — pawnful tables carry en-passant sub-ranges beyond `per_stm` —
-        // hence the margin below: what matters is that the store never reallocates,
-        // since at this size letting it double its way up would hold peak memory far
-        // above the result, and a browser never hands linear memory back.
-        let mut total_packed = 0usize;
-        for i in 0..table_count {
-            let off = HEADER_SIZE + i * ENTRY_SIZE;
-            let buf = &blob[off..off + ENTRY_SIZE];
-            let flags = buf[8];
-            let bits = buf[9] as usize;
-            let per_stm = u32::from_le_bytes(buf[12..16].try_into().ok()?) as usize;
-            if flags & FLAG_SINGLE_VALUE != 0 {
-                continue;
-            }
-            total_packed += if flags & FLAG_SPLIT_STM != 0 {
-                2 * (per_stm * bits).div_ceil(8)
-            } else {
-                (2 * per_stm * bits).div_ceil(8)
-            };
-        }
+/// Where the tables landed in the decompressed store.
+#[derive(Clone, PartialEq, Eq, Debug)]
+struct Layout {
+    /// Per table, in directory order: where its WTM and BTM sections start. They
+    /// are equal unless the table is split by side to move.
+    offsets: Vec<(usize, usize)>,
+    /// Bytes of the store the tables fill.
+    used: usize,
+}
 
-        let capacity = total_packed + total_packed / 64 + (64 << 10);
-        let mut tables = Vec::with_capacity(table_count);
-        let mut packed_data: Vec<u8> = Vec::with_capacity(capacity);
+/// Reads the blob's header and directory. `None` if the blob is not one of ours
+/// or a table's frames run past its end.
+fn read_directory(blob: &[u8]) -> Option<Vec<Entry>> {
+    if blob.len() < HEADER_SIZE || blob[0..4] != BLOB_MAGIC || blob[4] != BLOB_VERSION {
+        return None;
+    }
+    let table_count = blob[5] as usize;
+    let data_start = HEADER_SIZE + table_count * ENTRY_SIZE;
+    if blob.len() < data_start {
+        return None;
+    }
 
-        for i in 0..table_count {
+    (0..table_count)
+        .map(|i| {
             let off = HEADER_SIZE + i * ENTRY_SIZE;
             let buf = &blob[off..off + ENTRY_SIZE];
 
             let mut sig = [0u8; SIG_LEN];
             sig.copy_from_slice(&buf[0..8]);
             let flags = buf[8];
-            let bits = buf[9];
-            let max_dtm = u16::from_le_bytes([buf[10], buf[11]]);
-            let per_stm = u32::from_le_bytes(buf[12..16].try_into().ok()?);
-            let total_pos = u32::from_le_bytes(buf[16..20].try_into().ok()?);
             let comp_off = u64::from_le_bytes(buf[20..28].try_into().ok()?) as usize;
             let comp_sz = u32::from_le_bytes(buf[28..32].try_into().ok()?) as usize;
 
-            let packed_offset = packed_data.len();
-            let mut btm_packed_offset = packed_offset;
-
-            if flags & FLAG_SINGLE_VALUE == 0 && comp_sz > 0 {
-                let cs = data_start + comp_off;
-                let ce = cs + comp_sz;
-                if ce > blob.len() {
+            let frames = if flags & FLAG_SINGLE_VALUE == 0 && comp_sz > 0 {
+                let start = data_start.checked_add(comp_off)?;
+                let end = start.checked_add(comp_sz)?;
+                if end > blob.len() {
                     return None;
                 }
-                let compressed = &blob[cs..ce];
+                start..end
+            } else {
+                0..0
+            };
 
-                if flags & FLAG_SPLIT_STM != 0 {
-                    let wtm_sz = u32::from_le_bytes(compressed[0..4].try_into().ok()?) as usize;
-                    let wtm = decode_zstd(&compressed[4..4 + wtm_sz])?;
-                    let btm = decode_zstd(&compressed[4 + wtm_sz..])?;
-                    packed_data.extend_from_slice(&wtm);
-                    btm_packed_offset = packed_data.len();
-                    packed_data.extend_from_slice(&btm);
-                } else {
-                    let decompressed = decode_zstd(compressed)?;
-                    packed_data.extend_from_slice(&decompressed);
-                }
-            }
-
-            let (has_pawns, wp, bp, groups) = parse_sig_to_indexer(&sig);
-
-            tables.push(ProberTable {
+            Some(Entry {
                 sig,
                 flags,
-                bits_per_entry: bits,
-                max_dtm,
-                per_stm_size: per_stm,
-                total_positions: total_pos,
-                packed_offset,
-                btm_packed_offset,
-                has_pawns,
-                num_white_pawns: wp,
-                num_black_pawns: bp,
-                non_pawn_groups: groups,
-            });
-        }
+                bits: buf[9],
+                max_dtm: u16::from_le_bytes([buf[10], buf[11]]),
+                per_stm: u32::from_le_bytes(buf[12..16].try_into().ok()?),
+                total_positions: u32::from_le_bytes(buf[16..20].try_into().ok()?),
+                frames,
+            })
+        })
+        .collect()
+}
 
-        debug_assert!(
-            packed_data.capacity() == capacity,
-            "the packed store outgrew its estimate and reallocated",
-        );
-        Some(Prober {
+/// How large a store to give the tables, from the directory alone.
+///
+/// Sized once up front, never grown. On the embedded blob the directory predicts the
+/// decoded size to the byte (154 560 410); the margin is there for a table whose
+/// sections run past `per_stm` — pawnful tables may carry en-passant sub-ranges —
+/// so that such a blob still loads rather than overflowing its store.
+fn store_capacity(dir: &[Entry]) -> usize {
+    let mut total = 0usize;
+    for e in dir {
+        if e.flags & FLAG_SINGLE_VALUE != 0 {
+            continue;
+        }
+        let (per_stm, bits) = (e.per_stm as usize, e.bits as usize);
+        total += if e.flags & FLAG_SPLIT_STM != 0 {
+            2 * (per_stm * bits).div_ceil(8)
+        } else {
+            (2 * per_stm * bits).div_ceil(8)
+        };
+    }
+    total + total / 64 + (64 << 10)
+}
+
+/// Decompresses every table into `store`, in directory order, and says where each
+/// one landed. `None` if a frame is corrupt or the store is too small for them all.
+fn fill_store(blob: &[u8], dir: &[Entry], store: &mut [u8]) -> Option<Layout> {
+    let mut used = 0usize;
+    let mut offsets = Vec::with_capacity(dir.len());
+    for e in dir {
+        let wtm = used;
+        let mut btm = used;
+        if !e.frames.is_empty() {
+            let compressed = &blob[e.frames.clone()];
+            if e.flags & FLAG_SPLIT_STM != 0 {
+                // Two frames, decoded and byte-aligned separately: see `probe_dtm`.
+                let wtm_len = u32::from_le_bytes(compressed.get(..4)?.try_into().ok()?) as usize;
+                let split = wtm_len.checked_add(4)?;
+                used += decode_frame(compressed.get(4..split)?, &mut store[used..])?;
+                btm = used;
+                used += decode_frame(compressed.get(split..)?, &mut store[used..])?;
+            } else {
+                used += decode_frame(compressed, &mut store[used..])?;
+            }
+        }
+        debug_assert!(wtm <= btm && btm <= used && used <= store.len());
+        offsets.push((wtm, btm));
+    }
+    Some(Layout { offsets, used })
+}
+
+/// The whole store, decompressed into memory of this process's own.
+fn private_store(blob: &[u8], dir: &[Entry]) -> Option<(Vec<u8>, Layout)> {
+    // Zeroed rather than reserved, so the decoder can write in place; on a native
+    // build the allocator hands back fresh zero pages, and the margin it never
+    // writes is never faulted in.
+    let mut store = vec![0u8; store_capacity(dir)];
+    let layout = fill_store(blob, dir, &mut store)?;
+    store.truncate(layout.used);
+    Some((store, layout))
+}
+
+impl Prober {
+    /// The tables in a private copy, which is what every process held before they
+    /// were shared.
+    fn private(blob: &[u8], dir: &[Entry]) -> Option<Self> {
+        let (store, layout) = private_store(blob, dir)?;
+        Some(Self::assemble(dir, &layout.offsets, Cow::Owned(store)))
+    }
+
+    /// The tables in the image called `name`, built here if no other process holds
+    /// it yet. The error says why, in a form fit for `info string`.
+    fn shared(blob: &[u8], dir: &[Entry], name: &str) -> Result<(Self, Origin), String> {
+        let header = image_header_len(dir.len());
+        let capacity = store_capacity(dir);
+        let mapped = crate::shm::acquire(name, header + capacity, &mut |dst| {
+            let (head, store) = dst.split_at_mut(header);
+            let layout = fill_store(blob, dir, store);
+            write_header(head, dir.len(), layout.as_ref());
+        })?;
+        let bytes = mapped.bytes();
+        let layout = read_header(&bytes[..header], dir.len(), capacity)?;
+        let store = &bytes[header..header + layout.used];
+
+        // The name pins the blob and the image format, not what this build writes
+        // into that format. Checking mode rebuilds and compares, so a change that
+        // forgot to bump IMAGE_FORMAT is caught here instead of probing wrong
+        // distances.
+        if crate::shm::verify_requested() {
+            let (mine, mine_layout) =
+                private_store(blob, dir).ok_or("the tables do not decompress")?;
+            if mine_layout != layout || mine[..] != *store {
+                return Err(String::from(
+                    "shared image disagrees with this build (bump IMAGE_FORMAT)",
+                ));
+            }
+        }
+        Ok((
+            Self::assemble(dir, &layout.offsets, Cow::Borrowed(store)),
+            mapped.origin,
+        ))
+    }
+
+    /// The prober over a store already filled, wherever it lives.
+    fn assemble(
+        dir: &[Entry],
+        offsets: &[(usize, usize)],
+        packed_data: Cow<'static, [u8]>,
+    ) -> Self {
+        debug_assert_eq!(dir.len(), offsets.len());
+        let tables = dir
+            .iter()
+            .zip(offsets)
+            .map(|(e, &(packed_offset, btm_packed_offset))| {
+                debug_assert!(packed_offset <= btm_packed_offset);
+                debug_assert!(btm_packed_offset <= packed_data.len());
+                let (has_pawns, wp, bp, groups) = parse_sig_to_indexer(&e.sig);
+                ProberTable {
+                    sig: e.sig,
+                    flags: e.flags,
+                    bits_per_entry: e.bits,
+                    max_dtm: e.max_dtm,
+                    per_stm_size: e.per_stm,
+                    total_positions: e.total_positions,
+                    packed_offset,
+                    btm_packed_offset,
+                    has_pawns,
+                    num_white_pawns: wp,
+                    num_black_pawns: bp,
+                    non_pawn_groups: groups,
+                }
+            })
+            .collect();
+        Prober {
             tables,
             packed_data,
-        })
+        }
     }
 
     /// Probe DTM. Returns `Some(dtm)` where dtm>0 means STM wins, dtm<0 STM loses, 0=draw.
@@ -973,5 +1256,133 @@ mod tests {
         assert_eq!(probe_position(&pos, 0), Some(mate_in(1)));
         let mated = Position::from_fen("R6k/8/6K1/8/8/8/8/8 b - - 1 1").unwrap();
         assert_eq!(probe_position(&mated, 1), Some(mated_in(1)));
+    }
+
+    /// A mate is proved only within what the 50-move rule leaves: at the clock where it
+    /// lands exactly on the deadline it stands, one half-move later it is declined (the
+    /// probe used to ignore the clock, issue #24 for Nalimov). A mate on the board
+    /// stands at any clock.
+    #[cfg(gaiatb_embedded)]
+    #[test]
+    fn a_table_mate_beyond_the_fifty_move_deadline_is_declined() {
+        assert!(init(), "embedded tables must load");
+        let fen = |hmc: i32| format!("8/8/8/4k3/8/8/8/KR6 w - - {hmc} 80");
+        let fresh =
+            probe_position(&Position::from_fen(&fen(0)).unwrap(), 0).expect("KRK is in the tables");
+        let distance = crate::types::SCORE_MATE - fresh;
+        assert!(
+            distance > 1 && distance < 100,
+            "a long rook mate, got {distance}"
+        );
+
+        let at = |hmc: i32| probe_position(&Position::from_fen(&fen(hmc)).unwrap(), 0);
+        assert_eq!(
+            at(100 - distance),
+            Some(fresh),
+            "the mate lands on the deadline"
+        );
+        assert_eq!(at(101 - distance), None, "one half-move too late");
+        assert_eq!(at(99), None);
+
+        let mated = Position::from_fen("R6k/8/6K1/8/8/8/8/8 b - - 99 120").unwrap();
+        assert_eq!(
+            probe_position(&mated, 1),
+            Some(mated_in(1)),
+            "mated is mated"
+        );
+    }
+
+    /// The store is sized from the directory before anything is decoded, and a blob
+    /// that outgrew it would not load at all, shared or not.
+    #[cfg(gaiatb_embedded)]
+    #[test]
+    fn the_embedded_tables_fit_the_store_their_directory_predicts() {
+        let dir = read_directory(BLOB).expect("embedded blob");
+        let (store, layout) = private_store(BLOB, &dir).expect("the tables decompress");
+        assert_eq!(store.len(), layout.used);
+        assert!(layout.used <= store_capacity(&dir));
+        assert!(
+            layout.used > 100 << 20,
+            "~155 MB of tables, got {}",
+            layout.used
+        );
+    }
+
+    #[cfg(gaiatb_embedded)]
+    #[test]
+    fn a_store_too_small_is_refused_not_overrun() {
+        let dir = read_directory(BLOB).unwrap();
+        let mut store = vec![0u8; store_capacity(&dir) / 2];
+        assert!(fill_store(BLOB, &dir, &mut store).is_none());
+    }
+
+    #[test]
+    fn the_image_header_round_trips_and_refuses_a_failed_build() {
+        let layout = Layout {
+            offsets: vec![(0, 0), (0, 10), (10, 25)],
+            used: 40,
+        };
+        let mut head = vec![0xffu8; image_header_len(3)];
+        write_header(&mut head, 3, Some(&layout));
+        assert_eq!(read_header(&head, 3, 100), Ok(layout.clone()));
+        assert!(
+            read_header(&head, 3, 39).is_err(),
+            "more used than the store holds"
+        );
+
+        let stray = Layout {
+            offsets: vec![(0, 0), (0, 10), (10, 41)],
+            used: 40,
+        };
+        write_header(&mut head, 3, Some(&stray));
+        assert!(read_header(&head, 3, 100).is_err(), "a table past the end");
+
+        write_header(&mut head, 3, None);
+        let err = read_header(&head, 3, 100).unwrap_err();
+        assert!(err.contains("did not fit"), "{err}");
+
+        write_header(&mut head, 3, Some(&layout));
+        head[0] ^= 1;
+        assert!(read_header(&head, 3, 100).is_err(), "not our magic");
+    }
+
+    /// A first asker builds the image, a second receives it, and both read what a
+    /// private load holds — byte for byte, and probe for probe.
+    #[cfg(all(gaiatb_embedded, target_os = "linux"))]
+    #[test]
+    fn a_shared_image_probes_like_a_private_copy() {
+        let dir = read_directory(BLOB).unwrap();
+        // Not the engine's name: the abstract namespace is machine-wide.
+        let name = format!("gaiatb-test-{}", std::process::id());
+        let (built, origin) = Prober::shared(BLOB, &dir, &name).expect("build");
+        assert_eq!(origin, Origin::Built);
+        let (received, origin) = Prober::shared(BLOB, &dir, &name).expect("receive");
+        assert_eq!(origin, Origin::Received);
+
+        let private = Prober::private(BLOB, &dir).unwrap();
+        for shared in [&built, &received] {
+            assert!(matches!(shared.packed_data, Cow::Borrowed(_)));
+            assert!(shared.packed_data[..] == private.packed_data[..]);
+            for (a, b) in shared.tables.iter().zip(&private.tables) {
+                assert_eq!(
+                    (a.packed_offset, a.btm_packed_offset),
+                    (b.packed_offset, b.btm_packed_offset)
+                );
+            }
+        }
+
+        let fens = [
+            "7k/8/6K1/8/8/8/8/R7 w - - 0 1",
+            "8/8/8/4k3/8/8/4P3/4K3 w - - 0 1",
+            "8/8/8/3k4/8/1K6/2Q5/7r b - - 0 1",
+            "8/8/4k3/8/8/2N5/8/R3K3 b - - 0 1",
+            "8/5p2/8/4k3/8/8/2P5/4K3 w - - 0 1",
+        ];
+        for fen in fens {
+            let pos = Position::from_fen(fen).unwrap();
+            let want = probe_with(&private, &pos, 3);
+            assert!(want.is_some(), "{fen} is in the tables");
+            assert_eq!(probe_with(&received, &pos, 3), want, "{fen}");
+        }
     }
 }

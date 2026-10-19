@@ -797,6 +797,15 @@ pub fn is_legal(pos: &Position, m: Move) -> bool {
     true
 }
 
+/// Whether a move read from the transposition table can be played here.
+///
+/// The table is shared, lock-free and keyed on 16 bits: its move may belong to another
+/// position. [`is_legal`] assumes a pseudo-legal move and answers `true` by default, so
+/// the two tests are needed together, in this order.
+pub fn is_playable_table_move(pos: &Position, m: Move) -> bool {
+    is_pseudo_legal(pos, m) && is_legal(pos, m)
+}
+
 /// Check that a move is pseudo-legal for the current position.
 ///
 /// Used to validate TT moves which may come from hash collisions. Verifies
@@ -955,4 +964,26 @@ pub fn is_pseudo_legal(pos: &Position, m: Move) -> bool {
         _ => unreachable!(),
     };
     (attacks & to.bb()) != 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A move the table may hold for another position is refused before [`is_legal`]
+    /// sees it: that test assumes a pseudo-legal move and would pass this one (the
+    /// refutation line once published it as is).
+    #[test]
+    fn a_table_move_from_another_position_is_not_playable() {
+        // Black to move: e2e4 is White's pawn push, and Black is in check besides.
+        let pos =
+            Position::from_fen("rnbqkbnr/ppppp1pp/8/5p1Q/4P3/8/PPPP1PPP/RNB1KBNR b KQkq - 1 2")
+                .unwrap();
+        assert!(!is_playable_table_move(&pos, Move::new(Square::E2, Square::E4)));
+        assert!(!is_playable_table_move(&pos, Move::NONE));
+        // A quiet move that ignores the check is pseudo-legal for no one here.
+        assert!(!is_playable_table_move(&pos, Move::new(Square::A7, Square::A6)));
+        // The one move that is legal.
+        assert!(is_playable_table_move(&pos, Move::new(Square::G7, Square::G6)));
+    }
 }

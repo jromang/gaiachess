@@ -47,6 +47,67 @@ pub enum TbCategory {
     Win,
     Draw,
     Loss,
+    /// An answer the server is not sure of (`syzygy-*`, `maybe-*`, `unknown`). Kept in
+    /// the cache so the position is not asked about again, never used by the search.
+    Unknown,
+}
+
+/// The server's category for a position queried at halfmove clock 0.
+///
+/// A cursed win and a blessed loss are draws under the 50-move rule; what the server
+/// is unsure of is not a draw — reading it as one fixed real wins at 0.
+fn category_of(name: &str) -> TbCategory {
+    match name {
+        "win" => TbCategory::Win,
+        "loss" => TbCategory::Loss,
+        "draw" | "cursed-win" | "blessed-loss" => TbCategory::Draw,
+        _ => TbCategory::Unknown,
+    }
+}
+
+/// The position as the server is asked about it: with the halfmove clock at 0.
+///
+/// The cache is keyed on the Zobrist key, which does not hold the clock, while the
+/// server's answer depends on it — a win at clock 10 can be a cursed win at clock 80.
+/// Asked at 0, every answer means the same thing, and [`OnlineTbEntry::score`] weighs
+/// it against the clock of the position the search is at.
+fn query_fen(pos: &Position) -> String {
+    let fen = pos.to_fen();
+    let mut fields: Vec<&str> = fen.split_whitespace().collect();
+    debug_assert!(fields.len() >= 6, "FEN without counters: {fen}");
+    if fields.len() >= 5 {
+        fields[4] = "0";
+    }
+    fields.join(" ")
+}
+
+impl OnlineTbEntry {
+    /// The entry as a negamax score at `ply`, for a position at `halfmove_clock`, or
+    /// `None` when the clock leaves it unproved.
+    ///
+    /// A draw at clock 0 is a draw at any clock. A mate is proved when its distance
+    /// fits in the half-moves the 50-move rule leaves (a distance-to-mate ignores the
+    /// rule, issue #24). A win or a loss without such a mate is the server's verdict at
+    /// clock 0, which is only this position's at clock 0.
+    pub fn score(&self, ply: i32, halfmove_clock: u8) -> Option<i32> {
+        let moves_left = 100 - halfmove_clock as i32;
+        match self.category {
+            TbCategory::Draw => Some(0),
+            TbCategory::Unknown => None,
+            TbCategory::Win => match self.dtm.map(i32::abs) {
+                // A win is never zero half-moves away: zero would read as mated now.
+                Some(d) if d != 0 && d <= moves_left => Some(dtm_score(ply, d)),
+                _ if halfmove_clock == 0 => Some(tb_win_in(ply)),
+                _ => None,
+            },
+            TbCategory::Loss => match self.dtm.map(i32::abs) {
+                // Zero half-moves to be mated is the mate on the board.
+                Some(d) if d <= moves_left => Some(dtm_score(ply, -d)),
+                _ if halfmove_clock == 0 => Some(tb_loss_in(ply)),
+                _ => None,
+            },
+        }
+    }
 }
 
 // ── Probe request ────────────────────────────────────────────────────────────
@@ -164,7 +225,7 @@ pub fn submit_pv_positions(pos: &Position, pv: &[Move], pv_len: usize) {
         if pieces <= 7 {
             // Priority 1: direct PV position, TB-eligible
             if !is_known(scratch.key) {
-                submit_priority(scratch.key, scratch.to_fen());
+                submit_priority(scratch.key, query_fen(&scratch));
             }
         } else if pieces == 8 {
             // Priority 2: PV-adjacent captures (8 → ≤7 pieces)
@@ -181,7 +242,7 @@ pub fn submit_pv_positions(pos: &Position, pv: &[Move], pv_len: usize) {
                 let mut after = scratch.clone();
                 after.make_move(cap);
                 if after.occupied().count_ones() <= 7 && !is_known(after.key) {
-                    submit(after.key, after.to_fen());
+                    submit(after.key, query_fen(&after));
                 }
             }
         }
@@ -269,7 +330,7 @@ pub fn start_prefetch(
         if next.occupied().count_ones() > 7 {
             continue;
         }
-        submit(next.key, next.to_fen());
+        submit(next.key, query_fen(&next));
     }
 
     // Spawn the background worker
@@ -369,11 +430,7 @@ fn probe_lichess(fen: &str) -> Result<OnlineTbEntry, String> {
 
     let resp: LichessResponse = serde_json::from_str(&body).map_err(|e| e.to_string())?;
 
-    let category = match resp.category.as_str() {
-        "win" => TbCategory::Win,
-        "loss" => TbCategory::Loss,
-        _ => TbCategory::Draw,
-    };
+    let category = category_of(resp.category.as_str());
 
     Ok(OnlineTbEntry {
         dtm: if category == TbCategory::Draw {
@@ -383,4 +440,53 @@ fn probe_lichess(fen: &str) -> Result<OnlineTbEntry, String> {
         },
         category,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// What the server is unsure of is not a draw; a cursed win and a blessed loss are.
+    #[test]
+    fn only_certain_categories_are_results() {
+        assert_eq!(category_of("win"), TbCategory::Win);
+        assert_eq!(category_of("loss"), TbCategory::Loss);
+        for draw in ["draw", "cursed-win", "blessed-loss"] {
+            assert_eq!(category_of(draw), TbCategory::Draw, "{draw}");
+        }
+        for unsure in ["syzygy-win", "syzygy-loss", "maybe-win", "maybe-loss", "unknown"] {
+            assert_eq!(category_of(unsure), TbCategory::Unknown, "{unsure}");
+        }
+    }
+
+    /// The server is asked about the position at clock 0, whatever its clock.
+    #[test]
+    fn the_query_resets_the_halfmove_clock() {
+        let pos = Position::from_fen("8/8/8/4k3/8/8/8/KR6 w - - 73 120").unwrap();
+        assert_eq!(query_fen(&pos), "8/8/8/4k3/8/8/8/KR6 w - - 0 120");
+    }
+
+    /// A mate stands only while it fits before the 50-move deadline; a win without a
+    /// provable mate is the server's verdict at clock 0 alone.
+    #[test]
+    fn an_entry_is_weighed_against_the_clock() {
+        let win = |dtm| OnlineTbEntry { dtm, category: TbCategory::Win };
+        let loss = |dtm| OnlineTbEntry { dtm, category: TbCategory::Loss };
+        let draw = OnlineTbEntry { dtm: Some(0), category: TbCategory::Draw };
+
+        assert_eq!(win(Some(31)).score(2, 0), Some(dtm_score(2, 31)));
+        assert_eq!(win(Some(31)).score(2, 69), Some(dtm_score(2, 31)), "lands on the deadline");
+        assert_eq!(win(Some(31)).score(2, 70), None, "one half-move too late");
+        assert_eq!(win(Some(140)).score(2, 0), Some(tb_win_in(2)), "won, mate unproved");
+        assert_eq!(win(None).score(2, 0), Some(tb_win_in(2)));
+        assert_eq!(win(None).score(2, 1), None);
+
+        assert_eq!(loss(Some(0)).score(3, 99), Some(dtm_score(3, 0)), "mated now");
+        assert_eq!(loss(Some(20)).score(3, 85), None);
+        assert_eq!(loss(None).score(3, 0), Some(tb_loss_in(3)));
+
+        assert_eq!(draw.score(5, 90), Some(0), "a draw at clock 0 stays one");
+        let unsure = OnlineTbEntry { dtm: None, category: TbCategory::Unknown };
+        assert_eq!(unsure.score(5, 0), None);
+    }
 }

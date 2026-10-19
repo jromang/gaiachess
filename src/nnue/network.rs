@@ -375,24 +375,7 @@ fn build_private(data: &[u8]) -> Box<NNUEParams> {
 }
 
 /// What the weights the engine is reading are actually backed by.
-#[derive(Clone, Debug)]
-pub enum NetBacking {
-    /// Memory shared with every other engine process on this machine.
-    Shared { origin: &'static str, peers: usize },
-    /// This process's own copy, and why.
-    Private { reason: String },
-}
-
-impl std::fmt::Display for NetBacking {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            NetBacking::Shared { origin, peers } => {
-                write!(f, "shared ({origin}, {peers} peer(s) serving)")
-            }
-            NetBacking::Private { reason } => write!(f, "private ({reason})"),
-        }
-    }
-}
+pub use crate::shm::Backing as NetBacking;
 
 /// Where the current weights came from, so the sharing policy can be changed
 /// after the fact without the caller having to hand them over again.
@@ -469,8 +452,8 @@ fn materialise(data: &[u8], content_hash: u64) -> &'static NNUEParams {
                 }
 
                 let backing = NetBacking::Shared {
-                    origin: mapped.origin.as_str(),
-                    peers: crate::shm::peers(),
+                    origin: mapped.origin,
+                    peers: crate::shm::peers_of(&name),
                 };
                 crate::outerr!("info string NNUE network: {backing}");
                 *BACKING.lock().unwrap_or_else(|e| e.into_inner()) = Some(backing);

@@ -275,6 +275,9 @@ impl GameScene {
             // Whatever is being turned over was worked out at the strength the player
             // has just changed, and playing it would be the old opponent's move.
             self.engine.stop_pondering();
+            // Nor may the new opponent read what the old one stored: two strengths
+            // evaluate on two scales and search two different trees.
+            self.engine.forget();
         }
         self.level = level;
     }

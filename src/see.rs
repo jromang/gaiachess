@@ -1,9 +1,34 @@
 //! [Static Exchange Evaluation](https://www.chessprogramming.org/Static_Exchange_Evaluation)
 //! using the swap algorithm.
 
-use crate::bitboard::{attackers_to, bishop_attacks, rook_attacks};
+use crate::bitboard::{attackers_to, between_bb, bishop_attacks, more_than_one, pop_lsb, rook_attacks};
 use crate::position::Position;
 use crate::types::*;
+
+/// The pieces of `us` pinned to their king, and the enemy sliders pinning them.
+///
+/// Only the pieces of the king's own side: a pinned enemy piece blocking a check is not
+/// a recapture question.
+fn king_blockers(pos: &Position, us: Color) -> (u64, u64) {
+    let ksq = pos.king_sq(us);
+    let them = !us;
+    let occ = pos.occupancies[2];
+    let queens = pos.pieces[Piece::new(PieceType::Queen, them).index()];
+    let mut snipers = (bishop_attacks(ksq, 0)
+        & (pos.pieces[Piece::new(PieceType::Bishop, them).index()] | queens))
+        | (rook_attacks(ksq, 0)
+            & (pos.pieces[Piece::new(PieceType::Rook, them).index()] | queens));
+    let (mut blockers, mut pinners) = (0u64, 0u64);
+    while snipers != 0 {
+        let sniper = pop_lsb(&mut snipers);
+        let between = between_bb(ksq, sniper) & occ & !sniper.bb();
+        if between != 0 && !more_than_one(between) && between & pos.occupancies[us as usize] != 0 {
+            blockers |= between;
+            pinners |= sniper.bb();
+        }
+    }
+    (blockers, pinners)
+}
 
 /// SEE piece values (indexed by `PieceType`: Pawn=0..King=5, None=6).
 const SEE_VALUE: [i32; 7] = [100, 320, 330, 500, 900, 20000, 0];
@@ -106,11 +131,19 @@ pub fn see(pos: &Position, m: Move, threshold: i32) -> bool {
     let mut stm = pos.side_to_move;
     let mut result = 1i32;
 
+    // A piece pinned to its king cannot recapture while its pinner stands. Computed
+    // here, once the exchange is known to matter: [white king, black king].
+    let pins = [king_blockers(pos, Color::White), king_blockers(pos, Color::Black)];
+
     loop {
         stm = !stm;
         attackers &= occ;
 
-        let mine = attackers & pos.occupancies[stm as usize];
+        let mut mine = attackers & pos.occupancies[stm as usize];
+        let (blockers, pinners) = pins[stm as usize];
+        if pinners & occ != 0 {
+            mine &= !blockers;
+        }
         if mine == 0 {
             break;
         }
@@ -188,6 +221,32 @@ mod tests {
         let t = Square::from_string(to).unwrap();
         let m = Move::new(f, t);
         see(&pos, m, threshold)
+    }
+
+    /// A defender pinned to its king does not recapture: Nxe5 wins the pawn, d6 being
+    /// pinned by Rd1. Used to count the pin as a recapture and see a knight lost.
+    #[test]
+    fn a_pinned_defender_does_not_recapture() {
+        let fen = "3k4/8/3p4/4p3/8/5N2/8/3R3K w - - 0 1";
+        assert!(see_test(fen, "f3", "e5", 0));
+        assert!(see_test(fen, "f3", "e5", 100), "a clean pawn");
+        assert!(!see_test(fen, "f3", "e5", 101));
+    }
+
+    /// The same, colours reversed: the pin binds whichever side recaptures.
+    #[test]
+    fn a_pinned_defender_does_not_recapture_for_white_either() {
+        let fen = "3r3k/8/5n2/8/4P3/3P4/8/3K4 b - - 0 1";
+        assert!(see_test(fen, "f6", "e4", 100));
+        assert!(!see_test(fen, "f6", "e4", 101));
+    }
+
+    /// A pin lasts only as long as its pinner: once the pinning bishop has left its
+    /// square by capturing, the bishop it pinned takes it back.
+    #[test]
+    fn a_pin_ends_with_its_pinner() {
+        let fen = "4k3/3b4/2p5/1B6/8/8/8/4K3 w - - 0 1";
+        assert!(!see_test(fen, "b5", "c6", 0), "Bxc6 Bxc6 loses the bishop for a pawn");
     }
 
     #[test]

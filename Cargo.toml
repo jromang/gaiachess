@@ -7,7 +7,7 @@ default-members = ["."]
 
 [package]
 name = "gaiachess"
-version = "4.3.3"
+version = "4.4.1"
 edition = "2024"
 rust-version = "1.98"
 authors = ["Jean-François Romang", "David Rabel"]

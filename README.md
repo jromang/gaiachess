@@ -102,7 +102,7 @@ on a laptop as on a server.
 
 ### Evaluation
 
-- **NNUE**: GaiaNet threat-feature architecture (12 king buckets × 768 PST + filtered threat features, ~41K inputs → 640 → CReLU+pairwise → 16 → 32 → 1), 8 output buckets, trained with [Bullet](https://github.com/jw1912/bullet) on self-play data
+- **NNUE**: GaiaNet-T2b (12 king buckets × 768 PST inputs, plus 4,560 pawn pairs and 59,808 filtered piece-interaction threat features → 1024 → paired SCReLU → 16 → 32 → 1), 8 material-based output buckets and a PSQT head, 87 MB, trained with an in-house trainer built on [Bullet](https://github.com/jw1912/bullet)
 - **SIMD**: runtime dispatch AVX-512+VNNI / AVX-512 / AVX2 / scalar — one binary, resolved from CPUID at startup (NEON on ARM)
 - **Movegen**: per-piece PEXT (BMI2) / AVX2 BLSMSK / magic on x86, Hyperbola Quintessence (`rbit`) on ARM64; setwise AVX-512 Kogge-Stone / scalar — runtime-elected too, with PEXT skipped on the AMD generations that microcode it
 
@@ -201,9 +201,10 @@ no interface in it at all (below) has no such dependency and links against nothi
 libc. Windows and macOS need nothing extra.
 
 ```bash
-# Download the network (see https://huggingface.co/jromanghf/gaiachess-networks)
+# Download the default network, the one named by DEFAULT_NET in defaults.conf
+# (all networks: https://huggingface.co/jromanghf/gaiachess-networks)
 curl -L -o nets/gaianet.bin \
-  "https://huggingface.co/jromanghf/gaiachess-networks/resolve/main/<network-name>.bin"
+  "https://huggingface.co/jromanghf/gaiachess-networks/resolve/main/gaianet-t2b-t5.bin"
 
 # Build with the network embedded
 MODEL=nets/gaianet.bin RUSTFLAGS="-C target-cpu=native" cargo build --release --features nnue
@@ -228,8 +229,6 @@ MODEL=nets/gaianet.bin RUSTFLAGS="-C target-cpu=x86-64-v3 --cfg gaia_dist" \
 ```
 
 Run `cargo test` for the test suite and `cargo run --release -- bench` for the search benchmark.
-
-The NNUE trainer lives in `trainer/` (see its `--help` for usage).
 
 ## License
 

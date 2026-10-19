@@ -30,7 +30,7 @@
 //! Which rung is which rating, how the numbers below were measured, and the harness that
 //! measures them (`tools/skill/`) are written up in `vault/recherche/Niveaux de jeu.md`.
 
-use crate::types::{MAX_PLY, Move, SCORE_TB_WIN_IN_MAX};
+use crate::types::{MAX_PLY, Move, SCORE_EVAL_MAX, SCORE_TB_WIN_IN_MAX};
 use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 
 /// Weakest setting: a first opponent for someone who has just learned the moves.
@@ -71,9 +71,10 @@ pub struct Rung {
     /// itself, so it costs nothing in reproducibility, and it is closer to how people
     /// play than a fixed depth is: nobody thinks exactly as hard about every move.
     pub deeper_permille: i32,
-    /// Half-width, in centipawns, of the error made on every position.
+    /// Half-width of the error made on every position, in the units of the evaluation
+    /// the level is given (see the scale note on [`LADDER`]).
     pub small_window: i32,
-    /// Half-width, in centipawns, of the error made on the occasional position.
+    /// Half-width of the error made on the occasional position, in the same units.
     pub blunder_window: i32,
     /// How often, per thousand positions, the wide error is made instead.
     pub blunder_permille: i32,
@@ -91,7 +92,8 @@ pub struct Rung {
     /// of them do, measured. Below them, misjudging and overlooking already produce more
     /// variety than any person would show.
     pub variety_moves: i32,
-    /// How much worse than the best a move may be and still get played, in centipawns.
+    /// How much worse than the best a move may be and still get played, in the units of
+    /// the root scores (see the scale note on [`LADDER`]).
     pub variety_margin: i32,
 }
 
@@ -141,6 +143,14 @@ const fn rung(
 ///
 /// The numbers were set by playing the rungs against each other; `tools/skill/` holds the
 /// harness, and the measurements are written up in the note named at the top of the file.
+///
+/// **Scale.** The windows and margins are not centipawns. They apply to the level's own
+/// evaluation, which blends material or piece-square values (centipawns) with the
+/// network's output (the search's internal units, where a pawn is worth several times
+/// more): how many pawns a window is worth depends on the rung's fidelity and on the
+/// network. The table was measured with the network of its time, so a new default
+/// network moves the rungs — re-measure them at every change of champion
+/// (`tools/skill/ladder.py` for the spacing, `tools/skill/anchor.py` for the scale).
 #[rustfmt::skip]
 const LADDER: [Rung; FULL_STRENGTH as usize] = [
     //   depth deeper  small  blund  b/1000  vision  fidelity          book  var  marg
@@ -349,7 +359,7 @@ pub fn noise(score: i32, key: u64, snap: &Snapshot) -> i32 {
     if (hash >> 32) as u32 % 1000 < rung.blunder_permille as u32 {
         error += draw(mix(hash), rung.blunder_window);
     }
-    (score + error).clamp(-SCORE_TB_WIN_IN_MAX + 1, SCORE_TB_WIN_IN_MAX - 1)
+    (score + error).clamp(-SCORE_EVAL_MAX, SCORE_EVAL_MAX)
 }
 
 /// A number in `[-window, window]`, taken from the low bits of a mixed hash.
@@ -384,7 +394,7 @@ pub fn sees_move(snap: &Snapshot, key: u64, mv: Move, ply: usize, easy: bool) ->
 
 /// Which of the moves worth playing this level actually plays.
 ///
-/// `scores` holds the root moves the search resolved, in centipawns and in no particular
+/// `scores` holds the root moves the search resolved, in search units and in no particular
 /// order. Anything within the rung's margin of the best is a move a player of that
 /// strength could reasonably choose; this picks between them and returns its index.
 ///

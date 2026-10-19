@@ -719,6 +719,11 @@ pub const fn is_decisive(score: i32) -> bool {
 /// best score that proves nothing. See [`is_beyond_eval`].
 pub const SCORE_UNPROVEN_WIN: i32 = SCORE_TB_WIN_IN_MAX - 1;
 
+/// The largest evaluation there can be: one below the unproven-win sentinel, so that
+/// no evaluation is ever read as a proof by [`is_beyond_eval`] and the guards built on
+/// it. The network's output has no bound of its own.
+pub const SCORE_EVAL_MAX: i32 = SCORE_UNPROVEN_WIN - 1;
+
 /// Returns true if `score` is a proven win or the unproven-win sentinel.
 #[inline(always)]
 pub const fn is_win_or_unproven(score: i32) -> bool {
@@ -748,12 +753,42 @@ pub const fn is_beyond_eval(score: i32) -> bool {
 /// MVV-LVA piece values indexed by `PieceType` (Pawn=0..King=5, None=6).
 pub const PIECE_VALUE: [i32; 7] = [100, 320, 330, 500, 900, 20000, 0];
 
+/// Material in search units (network output x NETWORK_SCALE), indexed like
+/// `PIECE_VALUE`: the median rise of the evaluation of the side to move when one
+/// piece of the other side is removed, over positions within 300 of equality
+/// (`tools/scripts/eval_piece_values.py` on `tests/scale_probe.epd`, network
+/// e044). The network saturates, so this is not `PIECE_VALUE` scaled: a queen is
+/// worth about 1.2 rooks here. The king entry mirrors `PIECE_VALUE` (never taken).
+pub const EVAL_PIECE_VALUE: [i32; 7] = [325, 1315, 1385, 1555, 1850, 20000, 0];
+
+/// Search units per 100 SEE centipawns, from the knight and bishop entries of the
+/// same measurement (1317 + 1384 against 320 + 330).
+pub const EVAL_PER_SEE_PAWN: i32 = 416;
+
+/// A margin in search units, expressed as a SEE threshold (centipawns).
+#[inline(always)]
+pub const fn eval_to_see(margin: i32) -> i32 {
+    margin * 100 / EVAL_PER_SEE_PAWN
+}
+
 // ============================================================
 // Tests
 // ============================================================
 
 #[cfg(test)]
 mod tests {
+
+    /// The largest evaluation is still an evaluation, and the next value up is not:
+    /// no static eval can pass for a proof, whatever the network returns.
+    #[test]
+    fn the_largest_evaluation_is_not_a_proof() {
+        assert!(!is_beyond_eval(SCORE_EVAL_MAX));
+        assert!(!is_beyond_eval(-SCORE_EVAL_MAX));
+        assert!(is_beyond_eval(SCORE_EVAL_MAX + 1));
+        assert!(is_beyond_eval(-SCORE_EVAL_MAX - 1));
+        assert!(SCORE_EVAL_MAX <= i16::MAX as i32, "a table entry holds it");
+    }
+
     use super::*;
 
     #[test]

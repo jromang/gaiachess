@@ -5,7 +5,8 @@
 //! rows on every accumulator update, so what the cache sees is not one working
 //! set but as many as there are processes, all of them cold. The weights are
 //! identical and never written, so there is no reason for more than one copy
-//! of them to exist on a machine.
+//! of them to exist on a machine. The same holds for the decompressed GaiaTB
+//! tables (`dtm.rs`), about twice the size of the weights.
 //!
 //! What is shared is a *memfd*: anonymous kernel memory with a file descriptor
 //! but no name anywhere in the filesystem. Processes find each other through
@@ -52,6 +53,26 @@ impl Origin {
     }
 }
 
+/// How a blob the engine reads is backed, for the line it prints about it.
+#[derive(Clone, Debug)]
+pub enum Backing {
+    /// Memory shared with every other engine process on this machine.
+    Shared { origin: Origin, peers: usize },
+    /// This process's own copy, and why.
+    Private { reason: String },
+}
+
+impl std::fmt::Display for Backing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Backing::Shared { origin, peers } => {
+                write!(f, "shared ({}, {peers} peer(s) serving)", origin.as_str())
+            }
+            Backing::Private { reason } => write!(f, "private ({reason})"),
+        }
+    }
+}
+
 /// A blob mapped read-only, shared with every other process that asked for the
 /// same name. Never unmapped: the engine hands out `&'static` references into
 /// it and has no protocol for taking one back.
@@ -82,22 +103,24 @@ pub fn supported() -> bool {
     imp::SUPPORTED
 }
 
-/// Whether sharing is available *and* wanted. `GAIA_SHARED_NET=0` (or `false`,
-/// or `off`) turns it off before anything is materialised, which is the only
-/// hook a benchmark has: the network is built during startup, before the first
-/// UCI option can arrive.
-pub fn enabled() -> bool {
-    use std::sync::OnceLock;
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        if !supported() {
-            return false;
-        }
-        match std::env::var("GAIA_SHARED_NET") {
+/// Whether sharing is available and not turned off by the environment variable
+/// `var` (`0`, `false`, `off` or `no`). Each blob has its own variable, so a
+/// measurement can share one and not the other.
+pub fn wanted(var: &str) -> bool {
+    supported()
+        && match std::env::var(var) {
             Ok(v) => !matches!(v.trim(), "0" | "false" | "off" | "no"),
             Err(_) => true,
         }
-    })
+}
+
+/// Whether the network may be shared. `GAIA_SHARED_NET=0` turns it off before
+/// anything is materialised, which is the only hook a benchmark has: the
+/// network is built during startup, before the first UCI option can arrive.
+pub fn enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| wanted("GAIA_SHARED_NET"))
 }
 
 /// Whether to re-derive the blob and compare it against the mapping.
@@ -106,7 +129,8 @@ pub fn enabled() -> bool {
 /// which *transform* produced the bytes, and a transform can change with the
 /// layout untouched. A stale name is then indistinguishable from a good one,
 /// and the process would evaluate through its neighbour's weights in silence.
-/// Debug builds always check; release builds check on request.
+/// Debug builds always check; release builds check on request
+/// (`GAIA_SHARED_NET_VERIFY=1`, which covers every shared blob despite its name).
 pub fn verify_requested() -> bool {
     cfg!(debug_assertions)
         || std::env::var("GAIA_SHARED_NET_VERIFY").is_ok_and(|v| !matches!(v.trim(), "0" | ""))
@@ -127,13 +151,25 @@ pub fn peers() -> usize {
     imp::peers()
 }
 
-/// One line for `gaiachess info`. Materialises nothing.
+/// How many processes are currently serving the blob called `name`. A process
+/// serves one socket per blob it holds, so this is the count to quote about one
+/// blob: [`peers`] would count the same process once per blob.
+pub fn peers_of(name: &str) -> usize {
+    imp::peers_of(name)
+}
+
+/// One line for `gaiachess info` about the network. Materialises nothing.
 pub fn describe() -> String {
+    describe_policy(enabled(), "GAIA_SHARED_NET")
+}
+
+/// One line for `gaiachess info` about a blob whose sharing `var` controls.
+pub fn describe_policy(enabled: bool, var: &str) -> String {
     if !supported() {
         return String::from("unsupported on this platform");
     }
-    if !enabled() {
-        return String::from("disabled (GAIA_SHARED_NET)");
+    if !enabled {
+        return format!("disabled ({var})");
     }
     let n = peers();
     let verify = if verify_requested() {
@@ -340,8 +376,21 @@ mod imp {
         out
     }
 
+    /// Distinct processes serving anything: one serves a socket per blob it
+    /// holds, named after its pid, and the builders' `init` sockets serve nothing.
     pub fn peers() -> usize {
-        scan_peers(&format!("gaiachess/{}/", euid())).len()
+        let names = scan_peers(&format!("gaiachess/{}/", euid()));
+        let mut pids: Vec<&str> = names
+            .iter()
+            .filter_map(|n| n.rsplit_once("/serve/").map(|(_, pid)| pid))
+            .collect();
+        pids.sort_unstable();
+        pids.dedup();
+        pids.len()
+    }
+
+    pub fn peers_of(name: &str) -> usize {
+        scan_peers(&serve_prefix(name)).len()
     }
 
     fn abstract_addr(name: &str) -> Result<SocketAddr, String> {
@@ -563,8 +612,13 @@ mod imp {
         build: &mut dyn FnMut(&mut [u8]),
     ) -> Result<OwnedFd, String> {
         let size = image_size(len);
+        // The label is what `/proc/<pid>/smaps` shows for the mapping
+        // (`/memfd:gaiachess-<name>`), so each blob's share can be told apart
+        // when measuring. The name has no NUL: `abstract_addr` already refused it.
+        let label = std::ffi::CString::new(format!("gaiachess-{name}"))
+            .map_err(|_| String::from("image name holds a NUL"))?;
         let fd = memfd_create(
-            c"gaiachess-net",
+            label.as_c_str(),
             MFdFlags::MFD_CLOEXEC | MFdFlags::MFD_ALLOW_SEALING,
         )
         .map_err(|e| format!("memfd_create: {e}"))?;
@@ -818,6 +872,10 @@ mod imp {
         0
     }
 
+    pub fn peers_of(_name: &str) -> usize {
+        0
+    }
+
     fn create(name: &std::ffi::CStr, size: usize) -> Handle {
         let large = crate::largemem::with_large_page_privilege(|page| {
             let total = size.div_ceil(page) * page;
@@ -926,6 +984,10 @@ mod imp {
     pub const SUPPORTED: bool = false;
 
     pub fn peers() -> usize {
+        0
+    }
+
+    pub fn peers_of(_name: &str) -> usize {
         0
     }
 

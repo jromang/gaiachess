@@ -30,31 +30,12 @@ jobs:
           # full text, so the loss happened past the shell. --notes-file round-trips
           # byte for byte.
           cat > "$RUNNER_TEMP/release-notes.md" <<'NOTES'
-          ## What's new in 4.3.3
+          ## What's new in 4.4.1
 
-          **Search parameters retuned.** All 214 tunable search parameters, tuned together
-          over 432 000 games.
-
-          **Fixes**
-          - En passant captures passed every SEE threshold, which could prune a winning
-            quiet move at every depth.
-          - A Syzygy draw at the root is shown as `0.00` instead of the search evaluation.
-
-          **Large machines**
-          - New option `NumaPolicy` (default `auto`). On machines with several memory nodes,
-            threads are pinned to groups of processors sharing a cache, each node gets its
-            own copy of the network, and the hash table is spread over the nodes. Measured
-            on a dual-socket, 192-thread machine: +16 % (opening) to +92 % (endgame) nodes
-            per second.
-          - `Threads` goes up to 1024.
-          - The hash and history tables use large pages where available. On Windows this
-            needs the "Lock pages in memory" right; without it the engine falls back to
-            ordinary pages.
-          - `SharedNetwork` now works on Windows too: engine processes share one copy of
-            the network weights.
-          - The hash table is cleared in parallel.
-
-          Thanks to David Rabel for the games and analyses behind both fixes.
+          - **New network** `gaianet-t2b-t5`, trained with a new recipe.
+          - **About forty search fixes** (UCI `stop`/`ponderhit`/`go mate`, MultiPV, SEE,
+            quiescence, tablebases).
+          - **GaiaTB tables shared between processes** on Linux, like the network.
 
           ## Download
 

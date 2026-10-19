@@ -17,8 +17,12 @@ use crate::largemem::LargeMem;
 #[cfg(test)]
 use crate::types::is_mate_score;
 use crate::types::{
-    Move, SCORE_MATE, SCORE_MATE_IN_MAX, SCORE_NONE, SCORE_TB_WIN, SCORE_TB_WIN_IN_MAX,
+    Move, SCORE_MATE, SCORE_MATE_IN_MAX, SCORE_NONE, SCORE_TB_WIN, SCORE_TB_WIN_IN_MAX, is_decisive,
 };
+
+/// Depth of an entry that holds an evaluation alone, below any searched depth (the
+/// quiescence writes depth 0): such an entry is the first replaced in its cluster.
+pub const DEPTH_EVAL_ONLY: i32 = -2;
 
 /// TT entry bound type.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -112,6 +116,9 @@ const _: () = assert!(
 
 const AGE_CYCLE: u8 = 32;
 const AGE_MASK: u8 = 31;
+/// Plies of depth one generation of age costs an entry in the choice of a victim:
+/// an entry of the previous search loses to one of this search six plies shallower.
+const AGE_WEIGHT: i32 = 6;
 
 /// Default TT size in megabytes.
 const DEFAULT_SIZE_MB: usize = 16;
@@ -263,9 +270,16 @@ impl TT {
 
         for entry in &cluster.entries {
             if entry.key == verify && !entry.is_empty() {
+                // An eval-only entry has no score: SCORE_NONE must come back as it went
+                // in, not through the mate adjustment that would make it a won score.
+                let score = if entry.bound() == Bound::None {
+                    SCORE_NONE
+                } else {
+                    score_from_tt(entry.score as i32, ply, halfmove_clock)
+                };
                 return Some(TTHit {
                     mv: Move(entry.mv),
-                    score: score_from_tt(entry.score as i32, ply, halfmove_clock),
+                    score,
                     eval: entry.eval as i32,
                     depth: entry.depth as i32,
                     bound: entry.bound(),
@@ -278,6 +292,9 @@ impl TT {
 
     /// Store a search result in the TT.
     /// Thread-safe: uses interior mutability for lockless concurrent writes.
+    ///
+    /// `Bound::None` stores an evaluation alone: `score` is then `SCORE_NONE`, read back
+    /// as such, and the entry can neither cut nor bound anything.
     #[allow(clippy::too_many_arguments)]
     pub fn store(
         &self,
@@ -292,11 +309,21 @@ impl TT {
     ) {
         debug_assert!((0..256).contains(&ply), "TT store: ply {} OOB", ply);
         debug_assert!(
-            score.abs() <= SCORE_MATE_IN_MAX + 512,
+            (bound == Bound::None) == (score == SCORE_NONE),
+            "TT store: bound {:?} with score {}",
+            bound,
+            score
+        );
+        debug_assert!(
+            score == SCORE_NONE || score.abs() <= SCORE_MATE_IN_MAX + 512,
             "TT store: score {} too large",
             score
         );
-        debug_assert!((-5..=256).contains(&depth), "TT store: depth {} OOB", depth);
+        debug_assert!(
+            (-5..=i8::MAX as i32).contains(&depth),
+            "TT store: depth {} OOB",
+            depth
+        );
         debug_assert!(
             mv == Move::NONE || (mv.from_sq().0 < 64 && mv.to_sq().0 < 64),
             "TT store: move squares OOB from={} to={}",
@@ -322,7 +349,7 @@ impl TT {
 
             // Otherwise pick the lowest-quality entry
             let relative_age = ((AGE_CYCLE + tt_age - entry.age()) & AGE_MASK) as i32;
-            let quality = entry.depth as i32 - 4 * relative_age;
+            let quality = entry.depth as i32 - AGE_WEIGHT * relative_age;
             if quality < lowest_quality {
                 lowest_quality = quality;
                 replace_idx = i;
@@ -330,6 +357,12 @@ impl TT {
         }
 
         let entry = &mut cluster.entries[replace_idx];
+
+        // An evaluation alone adds nothing to an entry of the same position, which
+        // already holds one beside its score.
+        if bound == Bound::None && entry.key == verify && !entry.is_empty() {
+            return;
+        }
 
         // Preserve existing move if we don't have a new one and key matches
         if mv != Move::NONE || entry.key != verify {
@@ -344,10 +377,26 @@ impl TT {
             || entry.age() != tt_age
         {
             entry.key = verify;
-            entry.score = score_to_tt(score, ply) as i16;
-            entry.eval = eval as i16;
-            entry.depth = depth as i8;
+            entry.score = if score == SCORE_NONE {
+                SCORE_NONE as i16
+            } else {
+                score_to_tt(score, ply) as i16
+            };
+            // Saturated: an evaluation, or SCORE_NONE, always fits; nothing wraps.
+            entry.eval = eval.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+            // Saturated, never wrapped: 128 read back as -128 would be the
+            // shallowest entry in the table instead of the deepest.
+            entry.depth = depth.clamp(i8::MIN as i32, i8::MAX as i32) as i8;
             entry.flags = (bound as u8) | ((pv as u8) << 2) | (tt_age << 3);
+        } else if entry.depth >= 5
+            && entry.bound() != Bound::Exact
+            && is_decisive(entry.score as i32)
+        {
+            // Secondary aging: a deep bound on a mate or tablebase score that keeps
+            // turning shallower writes away loses a ply each time, so that a proof
+            // found nearer the root, or a shorter mate, can take its place instead
+            // of being refused for ever by the depth of a stale bound.
+            entry.depth -= 1;
         }
     }
 
@@ -485,6 +534,17 @@ mod tests {
         assert_eq!(hit.bound, Bound::Exact);
     }
 
+    /// The deepest depth a search can reach is the deepest an entry can hold: it must
+    /// come back as itself, not wrapped round to the shallowest entry in the table.
+    #[test]
+    fn the_deepest_search_depth_is_stored_as_itself() {
+        let tt = TT::new(1);
+        let key: u64 = 0x0123_4567_89AB_CDEF;
+        let deepest = crate::types::MAX_PLY as i32 - 1;
+        tt.store(key, deepest, 0, 0, Bound::Lower, Move::NONE, 0, false);
+        assert_eq!(tt.probe(key, 0, 0).expect("stored").depth, deepest);
+    }
+
     #[test]
     fn test_tt_miss() {
         let tt = TT::new(1);
@@ -600,5 +660,92 @@ mod tests {
             hit.score
         );
         assert_eq!(hit.score, -(SCORE_TB_WIN_IN_MAX - 1));
+    }
+
+    /// An eval-only entry gives its evaluation back and no score, whatever the
+    /// halfmove clock: SCORE_NONE taken through the mate adjustment would read as won.
+    #[test]
+    fn an_eval_only_entry_has_no_score() {
+        let tt = TT::new(1);
+        let key: u64 = 0xDEAD_0005;
+        tt.store(
+            key,
+            DEPTH_EVAL_ONLY,
+            123,
+            SCORE_NONE,
+            Bound::None,
+            Move::NONE,
+            7,
+            true,
+        );
+        for hmc in [0, 60, 98] {
+            let hit = tt.probe(key, 3, hmc).expect("stored");
+            assert_eq!(hit.score, SCORE_NONE);
+            assert_eq!(hit.bound, Bound::None);
+            assert_eq!(hit.eval, 123);
+            assert_eq!(hit.depth, DEPTH_EVAL_ONLY);
+            assert_eq!(hit.mv, Move::NONE);
+            assert!(hit.pv);
+        }
+    }
+
+    /// An eval-only write never replaces a searched entry of the same key.
+    #[test]
+    fn an_eval_only_write_keeps_a_searched_entry() {
+        let tt = TT::new(1);
+        let key: u64 = 0xDEAD_0006;
+        let mv = Move::new(Square::E2, Square::E4);
+        tt.store(key, 1, 40, 75, Bound::Lower, mv, 0, false);
+        tt.store(
+            key,
+            DEPTH_EVAL_ONLY,
+            40,
+            SCORE_NONE,
+            Bound::None,
+            Move::NONE,
+            0,
+            true,
+        );
+        let hit = tt.probe(key, 0, 0).expect("stored");
+        assert_eq!(
+            (hit.score, hit.bound, hit.depth, hit.mv),
+            (75, Bound::Lower, 1, mv)
+        );
+    }
+
+    /// A deep mate bound that refuses a shallower write of its position loses a
+    /// ply each time; an evaluation bound, or an exact mate, keeps its depth.
+    #[test]
+    fn a_refused_write_ages_a_deep_mate_bound() {
+        let tt = TT::new(1);
+        let (mate, plain, exact) = (0xDEAD_0007u64, 0xDEAD_0008u64, 0xDEAD_0009u64);
+        tt.store(
+            mate,
+            10,
+            0,
+            SCORE_MATE - 7,
+            Bound::Lower,
+            Move::NONE,
+            0,
+            false,
+        );
+        tt.store(plain, 10, 0, 120, Bound::Lower, Move::NONE, 0, false);
+        tt.store(
+            exact,
+            10,
+            0,
+            SCORE_MATE - 7,
+            Bound::Exact,
+            Move::NONE,
+            0,
+            false,
+        );
+        for key in [mate, plain, exact] {
+            tt.store(key, 3, 0, 50, Bound::Upper, Move::NONE, 0, false);
+            tt.store(key, 3, 0, 50, Bound::Upper, Move::NONE, 0, false);
+        }
+        assert_eq!(tt.probe(mate, 0, 0).expect("kept").depth, 8);
+        assert_eq!(tt.probe(plain, 0, 0).expect("kept").depth, 10);
+        assert_eq!(tt.probe(exact, 0, 0).expect("kept").depth, 10);
     }
 }

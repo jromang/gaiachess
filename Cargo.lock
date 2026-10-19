@@ -405,7 +405,7 @@ dependencies = [
 
 [[package]]
 name = "gaiachess"
-version = "4.3.3"
+version = "4.4.1"
 dependencies = [
  "bpaf",
  "cc",

@@ -348,7 +348,9 @@ fn probe_root_dtz(pos: &Position) -> Option<Vec<(Move, i32, i32)>> {
             pos.halfmove_clock as u32,
             a.ep,
             a.turn,
-            false,
+            // After a repetition every winning move no longer ranks alike: the
+            // shortest DTZ comes first, so the engine makes progress.
+            pos.has_repeated(),
             results.as_mut_ptr(),
         )
     };
@@ -406,16 +408,39 @@ pub fn rank_root_moves(pos: &Position) -> Option<RootRanking> {
     }
 
     // Try DTZ first (precise ranking, accounts for 50-move rule)
-    if let Some(ranked) = probe_root_dtz(pos) {
+    if let Some(mut ranked) = probe_root_dtz(pos) {
+        normalize_draws(pos, &mut ranked);
         return Some((ranked, true));
     }
 
     // Fallback to WDL (less precise, no DTZ info)
-    if let Some(ranked) = probe_root_wdl(pos) {
+    if let Some(mut ranked) = probe_root_wdl(pos) {
+        normalize_draws(pos, &mut ranked);
         return Some((ranked, false));
     }
 
     None
+}
+
+/// Ranks as a draw every root move that draws in the game itself: one that completes a
+/// threefold repetition, or reaches the 50-move limit. The tables know nothing of the
+/// game's history, and would rank such a move as the win it would be on a fresh board.
+#[cfg(feature = "syzygy")]
+fn normalize_draws(pos: &Position, ranked: &mut [(Move, i32, i32)]) {
+    let mut child = pos.clone();
+    let mut changed = false;
+    for (mv, rank, score) in ranked.iter_mut() {
+        child.make_move(*mv);
+        if child.is_draw(1) && *rank != 0 {
+            *rank = 0;
+            *score = 0;
+            changed = true;
+        }
+        child.unmake_move(*mv);
+    }
+    if changed {
+        ranked.sort_by(|a, b| b.1.cmp(&a.1));
+    }
 }
 
 #[cfg(all(test, feature = "syzygy"))]

@@ -187,6 +187,14 @@ mod desktop {
             let _ = self.tx.send(Command::NewGame);
         }
 
+        /// Clears what the engine has learned without touching what it is doing: a
+        /// search under way finishes, and the next one starts from empty tables. For a
+        /// change of level, where what one strength stored — handicapped evaluations,
+        /// scores from a blind tree — must not be read back by another.
+        pub fn forget(&mut self) {
+            let _ = self.tx.send(Command::NewGame);
+        }
+
         /// Asks for a move. Any search already running is abandoned.
         ///
         /// The move list is not read here: the position carries its own history, which is
@@ -395,8 +403,7 @@ mod desktop {
                     // yields to what is being learned now. A search entered through the
                     // pool gets this for free; this one has to ask.
                     shared.tt.new_search();
-                    // Installs the real budget and folds the level's depth ceiling in.
-                    td.prepare_search(&pos, &limits);
+                    prepare_turn(&mut td, &pos, &limits);
                     // Below full strength the book answers before the search does, which
                     // is what keeps a level from opening the same way every game. At full
                     // strength it never answers, pondering or not.
@@ -418,6 +425,18 @@ mod desktop {
                 }
             }
         }
+    }
+
+    /// Readies the worker's thread for one turn: the real budget, the level's depth
+    /// ceiling, and the lines asked for.
+    ///
+    /// One line: the interface never asks for more. `prepare_search` raises the count
+    /// for a level that picks between moves, in place, and the worker keeps its thread
+    /// from one turn to the next — so a game at level 14-19 left four lines behind it
+    /// for every turn after, whatever the level became.
+    pub(super) fn prepare_turn(td: &mut ThreadData, pos: &Position, limits: &SearchLimits) {
+        td.multi_pv = 1;
+        td.prepare_search(pos, limits);
     }
 
     /// The reply the search expects, the second move of its own principal variation.
@@ -497,6 +516,12 @@ mod web {
 
         pub fn new_game(&mut self) {
             self.abort();
+            send("ucinewgame");
+        }
+
+        /// Clears what the engine has learned without touching what it is doing (see
+        /// the desktop engine).
+        pub fn forget(&mut self) {
             send("ucinewgame");
         }
 
@@ -720,6 +745,21 @@ mod ponder_tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         panic!("the engine never answered");
+    }
+
+    /// The lines a varied level asks for are its own: the next turn at another level
+    /// searches the one line the interface wants.
+    #[test]
+    fn a_varied_level_leaves_no_extra_lines_behind() {
+        let _guard = skill::lock_level();
+        let pos = startpos();
+        let mut td = crate::threads::ThreadData::new(0);
+        skill::set(15, 0);
+        super::desktop::prepare_turn(&mut td, &pos, &SearchLimits::depth(2));
+        assert!(td.multi_pv > 1, "level 15 picks between several lines");
+        skill::set(skill::FULL_STRENGTH, 0);
+        super::desktop::prepare_turn(&mut td, &pos, &SearchLimits::depth(2));
+        assert_eq!(td.multi_pv, 1, "and full strength gets one again");
     }
 
     #[test]
