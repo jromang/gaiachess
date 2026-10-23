@@ -164,6 +164,16 @@ The first version of Gaia was born in June 2003, in a student apartment in Stras
 
 We released six versions in three years, entered a few French computer chess championships, and then... life happened. Studies, jobs, moving, family. Gaia 3.5 came out in June 2006, and then silence. For almost twenty years.
 
+<p align="center">
+  <img src="docs/logos/gaia1.jpg" width="100" height="50" alt="Gaia logo by David Rabel">
+  <img src="docs/logos/gaia2.jpg" width="100" height="50" alt="Gaia logo by David Rabel">
+  <img src="docs/logos/gaia3.jpg" width="100" height="50" alt="Gaia logo by G. Rabel">
+  <img src="docs/logos/gaia4.jpg" width="100" height="50" alt="Gaia logo by G. Rabel">
+  <img src="docs/logos/gaia5.jpg" width="100" height="50" alt="Gaia logo by Jean-François Romang">
+  <br>
+  <sub>The logos of the first Gaia, from the old website: two by David Rabel, two by G. Rabel, the last one by me.</sub>
+</p>
+
 In the meantime, the chess programming world has changed beyond recognition. Neural networks went from science fiction to standard equipment. NNUE happened. Open-source engines reached superhuman strength and spawned an entire ecosystem. The [Chess Programming Wiki](https://www.chessprogramming.org/) turned into an incredible knowledge base. Rust appeared and made systems programming actually enjoyable. Tools like SPRT testing brought real statistical rigor to engine development. The community grew, shared, documented everything.
 
 Coming back to chess programming after all this time felt like waking up in the future. Everything I struggled with in 2003 now has a name, a wiki page, and a dozen open-source implementations to learn from. It's humbling and exhilarating at the same time.
