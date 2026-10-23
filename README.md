@@ -171,7 +171,7 @@ We released six versions in three years, entered a few French computer chess cha
   <img src="docs/logos/gaia4.jpg" width="100" height="50" alt="Gaia logo by G. Rabel">
   <img src="docs/logos/gaia5.jpg" width="100" height="50" alt="Gaia logo by Jean-François Romang">
   <br>
-  <sub>The logos of the first Gaia, from the old website: two by David Rabel, two by G. Rabel, the last one by me.</sub>
+  <sub>The logos of the first Gaia, from the old website: two by David Rabel, two by G. Rabel, the last one by J.F. Romang.</sub>
 </p>
 
 In the meantime, the chess programming world has changed beyond recognition. Neural networks went from science fiction to standard equipment. NNUE happened. Open-source engines reached superhuman strength and spawned an entire ecosystem. The [Chess Programming Wiki](https://www.chessprogramming.org/) turned into an incredible knowledge base. Rust appeared and made systems programming actually enjoyable. Tools like SPRT testing brought real statistical rigor to engine development. The community grew, shared, documented everything.
