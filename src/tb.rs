@@ -132,6 +132,7 @@ mod ffi {
             ep: u32,
             turn: bool,
             has_repeated: bool,
+            rank_dtz: bool,
             results: *mut TbRootMoves,
         ) -> i32;
         pub fn tb_probe_root_wdl(
@@ -149,7 +150,9 @@ mod ffi {
             use_rule50: bool,
             results: *mut TbRootMoves,
         ) -> i32;
-        pub static TB_LARGEST: i32;
+        // Written by `tb_init` (and `tb_free`) long after the program starts: an
+        // immutable extern static would promise the compiler it never changes.
+        pub static mut TB_LARGEST: i32;
     }
 }
 
@@ -166,12 +169,31 @@ pub enum Wdl {
     Loss,
 }
 
-/// Initialize Syzygy tablebases from the given path.
-/// Returns true on success. Can be called with multiple paths separated by `;` (Windows) or `:` (Unix).
+/// Initialize Syzygy tablebases from the given path. Can be called with multiple paths
+/// separated by `;` (Windows) or `:` (Unix).
+///
+/// Returns whether any table was found. Pyrrhic's own answer is true however empty the
+/// directory, so on its own it could not tell a wrong path from a right one: what was
+/// loaded is read from [`max_pieces`] instead (see [`file_counts`] for the detail).
 #[cfg(feature = "syzygy")]
 pub fn init(path: &str) -> bool {
     let cstr = std::ffi::CString::new(path).expect("invalid syzygy path");
-    unsafe { ffi::tb_init(cstr.as_ptr()) }
+    let ok = unsafe { ffi::tb_init(cstr.as_ptr()) };
+    ok && max_pieces() > 0
+}
+
+/// How many WDL and DTZ files the last [`init`] found.
+#[cfg(feature = "syzygy")]
+pub fn file_counts() -> (u32, u32) {
+    // Written by `tb_init` long after start-up, hence `mut`; read by value only.
+    unsafe extern "C" {
+        static mut TB_NUM_WDL: i32;
+        static mut TB_NUM_DTZ: i32;
+    }
+    // SAFETY: plain integers, read after `init` by the thread that called it.
+    let (wdl, dtz) = unsafe { (TB_NUM_WDL, TB_NUM_DTZ) };
+    debug_assert!(wdl >= 0 && dtz >= 0);
+    (wdl.max(0) as u32, dtz.max(0) as u32)
 }
 
 /// Free tablebase resources.
@@ -185,7 +207,10 @@ pub fn free() {
 /// Returns 0 if no tablebases are loaded.
 #[cfg(feature = "syzygy")]
 pub fn max_pieces() -> u32 {
-    unsafe { ffi::TB_LARGEST as u32 }
+    // Read by value: no reference to the mutable static is ever formed.
+    let largest = unsafe { ffi::TB_LARGEST };
+    debug_assert!((0..=7).contains(&largest), "TB_LARGEST out of range: {largest}");
+    largest as u32
 }
 
 /// Extract the 10 Pyrrhic arguments from a Position.
@@ -290,25 +315,34 @@ pub fn probe_wdl(pos: &Position) -> Option<Wdl> {
 const MAX_DTZ: i32 = 0x40000; // 262144
 
 /// Compute a tbScore from a Pyrrhic tbRank.
-/// Certain wins → SCORE_TB_WIN. Cursed wins → small cp. Draw → 0. Losses → mirror.
+/// Certain wins → SCORE_TB_WIN. Cursed wins → a fraction of a pawn, in the
+/// engine's internal units (the network pawn). Draw → 0. Losses → mirror.
 ///
 /// This Pyrrhic bridge ranks a cursed win as `MAX_DTZ - (dtz + rule50)`,
 /// unlike the newer half-range convention used by the reference scorer. The
 /// first cursed rank is therefore `MAX_DTZ - 101`, not `MAX_DTZ / 2 - 101`.
 #[cfg(feature = "syzygy")]
 fn compute_tb_score(tb_rank: i32) -> i32 {
+    // One pawn in the units the search (and the score display) works in.
+    const TB_PAWN: i32 = EVAL_PIECE_VALUE[PieceType::Pawn as usize];
     let win_bound = MAX_DTZ - 100;
     if tb_rank >= win_bound {
         SCORE_TB_WIN // Certain win before 50-move rule
     } else if tb_rank > 0 {
-        // Gradual: scale from ~1 to ~49 cp as DTZ approaches the rule-50 limit.
+        // Gradual: from ~1/2 pawn down to ~1/80 pawn (internal units, about 51 to
+        // 1 displayed cp) as DTZ approaches the rule-50 limit. Never 0, so a
+        // cursed win never prints as a draw.
         let r = tb_rank - (MAX_DTZ - 200);
-        (r.max(3) * 100) / 200
+        let score = (r.max(3) * TB_PAWN) / 200;
+        debug_assert!(score > 0 && score < TB_PAWN);
+        score
     } else if tb_rank == 0 {
         0
     } else if tb_rank > -win_bound {
         let r = tb_rank + (MAX_DTZ - 200);
-        (r.min(-3) * 100) / 200
+        let score = (r.min(-3) * TB_PAWN) / 200;
+        debug_assert!(score < 0 && score > -TB_PAWN);
+        score
     } else {
         -SCORE_TB_WIN // Certain loss
     }
@@ -331,10 +365,15 @@ fn extract_root_moves(results: &ffi::TbRootMoves) -> Vec<(Move, i32, i32)> {
 }
 
 /// Probe root DTZ (precise, 50-move aware). Returns None if tables unavailable.
+///
+/// `rank_dtz` ranks the certain wins and losses by DTZ too, shortest win and longest
+/// loss first; without it they all rank alike, until a repetition has been seen.
 #[cfg(feature = "syzygy")]
-fn probe_root_dtz(pos: &Position) -> Option<Vec<(Move, i32, i32)>> {
+fn probe_root_dtz(pos: &Position, rank_dtz: bool) -> Option<Vec<(Move, i32, i32)>> {
     let a = PyrrhicArgs::from_pos(pos);
-    let mut results = std::mem::MaybeUninit::<ffi::TbRootMoves>::uninit();
+    // Zeroed, not uninit: Pyrrhic writes only `size` and `moves[..size]`, and
+    // `assume_init` on a partly uninitialised buffer is undefined behaviour.
+    let mut results = std::mem::MaybeUninit::<ffi::TbRootMoves>::zeroed();
     let success = unsafe {
         ffi::tb_probe_root_dtz(
             a.white,
@@ -351,6 +390,7 @@ fn probe_root_dtz(pos: &Position) -> Option<Vec<(Move, i32, i32)>> {
             // After a repetition every winning move no longer ranks alike: the
             // shortest DTZ comes first, so the engine makes progress.
             pos.has_repeated(),
+            rank_dtz,
             results.as_mut_ptr(),
         )
     };
@@ -358,6 +398,7 @@ fn probe_root_dtz(pos: &Position) -> Option<Vec<(Move, i32, i32)>> {
         return None;
     }
     let results = unsafe { results.assume_init() };
+    debug_assert!(results.size as usize <= ffi::TB_MAX_MOVES);
     Some(extract_root_moves(&results))
 }
 
@@ -365,7 +406,9 @@ fn probe_root_dtz(pos: &Position) -> Option<Vec<(Move, i32, i32)>> {
 #[cfg(feature = "syzygy")]
 fn probe_root_wdl(pos: &Position) -> Option<Vec<(Move, i32, i32)>> {
     let a = PyrrhicArgs::from_pos(pos);
-    let mut results = std::mem::MaybeUninit::<ffi::TbRootMoves>::uninit();
+    // Zeroed, not uninit: Pyrrhic writes only `size` and `moves[..size]`, and
+    // `assume_init` on a partly uninitialised buffer is undefined behaviour.
+    let mut results = std::mem::MaybeUninit::<ffi::TbRootMoves>::zeroed();
     let success = unsafe {
         ffi::tb_probe_root_wdl(
             a.white,
@@ -387,6 +430,7 @@ fn probe_root_wdl(pos: &Position) -> Option<Vec<(Move, i32, i32)>> {
         return None;
     }
     let results = unsafe { results.assume_init() };
+    debug_assert!(results.size as usize <= ffi::TB_MAX_MOVES);
     Some(extract_root_moves(&results))
 }
 
@@ -403,12 +447,26 @@ pub type RootRanking = (Vec<(Move, i32, i32)>, bool);
 
 #[cfg(feature = "syzygy")]
 pub fn rank_root_moves(pos: &Position) -> Option<RootRanking> {
+    rank_root_moves_with(pos, false)
+}
+
+/// Like [`rank_root_moves`], with every certain win and loss ranked by DTZ as well:
+/// the move that leads to mate along the shortest zeroing path comes first, and on
+/// the losing side the longest. For walking a line to mate, not for the root search,
+/// which wants every certain win in one group.
+#[cfg(feature = "syzygy")]
+pub fn rank_root_moves_by_dtz(pos: &Position) -> Option<RootRanking> {
+    rank_root_moves_with(pos, true)
+}
+
+#[cfg(feature = "syzygy")]
+fn rank_root_moves_with(pos: &Position, rank_dtz: bool) -> Option<RootRanking> {
     if pos.occupied().count_ones() > max_pieces() || pos.castling_rights != 0 {
         return None;
     }
 
     // Try DTZ first (precise ranking, accounts for 50-move rule)
-    if let Some(mut ranked) = probe_root_dtz(pos) {
+    if let Some(mut ranked) = probe_root_dtz(pos, rank_dtz) {
         normalize_draws(pos, &mut ranked);
         return Some((ranked, true));
     }
@@ -451,12 +509,33 @@ mod tests {
     fn root_score_separates_cursed_results_from_certain_results() {
         assert_eq!(compute_tb_score(MAX_DTZ), SCORE_TB_WIN);
         assert_eq!(compute_tb_score(MAX_DTZ - 100), SCORE_TB_WIN);
-        assert_eq!(compute_tb_score(MAX_DTZ - 101), 49);
-        assert_eq!(compute_tb_score(MAX_DTZ - 200), 1);
+        assert_eq!(compute_tb_score(MAX_DTZ - 101), 160);
+        assert_eq!(compute_tb_score(MAX_DTZ - 200), 4);
         assert_eq!(compute_tb_score(0), 0);
-        assert_eq!(compute_tb_score(-MAX_DTZ + 200), -1);
-        assert_eq!(compute_tb_score(-MAX_DTZ + 101), -49);
+        assert_eq!(compute_tb_score(-MAX_DTZ + 200), -4);
+        assert_eq!(compute_tb_score(-MAX_DTZ + 101), -160);
         assert_eq!(compute_tb_score(-MAX_DTZ + 100), -SCORE_TB_WIN);
         assert_eq!(compute_tb_score(-MAX_DTZ), -SCORE_TB_WIN);
+    }
+
+    #[test]
+    fn a_cursed_result_never_displays_as_a_draw() {
+        // Even the smallest cursed win must not round to `cp 0` on the displayed
+        // scale, from a bare-rook ending to the heaviest seven-man material.
+        let fens = [
+            "8/8/4k3/8/8/4K3/8/R7 w - - 0 1",
+            "3qk3/8/8/8/8/8/8/2RQK3 w - - 0 1",
+            "2rqk3/8/8/8/8/8/8/1RRQK3 w - - 0 1",
+        ];
+        for fen in fens {
+            let pos = Position::from_fen(fen).expect("valid fen");
+            for rank in [MAX_DTZ - 200, MAX_DTZ - 199, MAX_DTZ - 150, MAX_DTZ - 101] {
+                let win = compute_tb_score(rank);
+                let loss = compute_tb_score(-rank);
+                assert!(crate::wdl::to_cp(win, &pos) > 0, "{fen}: rank {rank}");
+                assert!(crate::wdl::to_cp(loss, &pos) < 0, "{fen}: rank {rank}");
+                assert!(crate::wdl::to_cp(win, &pos) <= 60, "{fen}: rank {rank}");
+            }
+        }
     }
 }

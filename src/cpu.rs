@@ -13,6 +13,9 @@
 //! - `GAIA_SIMD=scalar|avx2|avx512|vnni512` caps the tier. It never raises it
 //!   above what the CPU supports — forcing upward would be an
 //!   illegal-instruction crash, so an impossible request is clamped down.
+//! - `GAIA_THREATS=bitboards|avx2|vbmi2` caps the move-threat path alone, the
+//!   rest of the tier untouched: every path records the same entries, so the
+//!   search is the same and only the speed can differ.
 //!
 //! On a build whose target already pins the top tier (`kernels::STATIC_TOP`,
 //! e.g. `target-cpu=native` on a Zen 4/5 box), the hot call sites bypass the
@@ -22,10 +25,12 @@
 use std::sync::OnceLock;
 
 use crate::nnue::L1_SIZE;
-use crate::nnue::accumulator::Accumulator;
+use crate::nnue::accumulator::{AccDelta, Accumulator};
 use crate::nnue::forward::{self, NNZ_SIZE};
 use crate::nnue::kernels::{self, k_avx2, k_avx512, k_scalar, k_vnni512, threat512};
+use crate::nnue::move_threats::{self, MoveThreats};
 use crate::nnue::network::{Aligned, NNUEParams, PermKind};
+use crate::position::Position;
 use crate::types::Color;
 
 // ============================================================
@@ -93,6 +98,27 @@ impl NnzKind {
     }
 }
 
+/// How a played move records its threat changes — one more axis: the one-register ray
+/// view needs VBMI (byte permutation) and VBMI2 (byte compression), which the AVX-512
+/// tiers do not imply (Skylake-X and Cascade Lake have neither). All three record the
+/// same entries; only the speed differs.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub enum MoveThreatsKind {
+    Bitboards,
+    Avx2View,
+    Vbmi2View,
+}
+
+impl MoveThreatsKind {
+    pub fn name(self) -> &'static str {
+        match self {
+            MoveThreatsKind::Bitboards => "bitboards",
+            MoveThreatsKind::Avx2View => "avx2 view",
+            MoveThreatsKind::Vbmi2View => "vbmi2 view",
+        }
+    }
+}
+
 // ============================================================
 // The dispatch table
 // ============================================================
@@ -108,8 +134,10 @@ pub struct CpuDispatch {
     pub acc_add2_sub2: unsafe fn(&NNUEParams, *const i16, *mut i16, usize, usize, usize, usize),
     pub finny_apply: unsafe fn(&NNUEParams, *mut i16, &[usize], &[usize]),
     pub threat_batch: unsafe fn(*const i16, *mut i16, *const [i8; L1_SIZE], &[u32], &[u32]),
+    pub(crate) move_threats: unsafe fn(&Position, &AccDelta, &mut MoveThreats),
     pub tier: SimdTier,
     pub nnz: NnzKind,
+    pub threats: MoveThreatsKind,
     pub perm: PermKind,
     pub attacks: AttackKind,
     /// AVX-512 Kogge-Stone setwise slider fill available.
@@ -118,6 +146,8 @@ pub struct CpuDispatch {
     pub forced: Option<SimdTier>,
     /// `GAIA_PEXT` override was applied.
     pub pext_forced: bool,
+    /// `GAIA_THREATS` lowered the move-threat path.
+    pub threats_forced: bool,
 }
 
 static DISPATCH: OnceLock<CpuDispatch> = OnceLock::new();
@@ -214,6 +244,7 @@ pub struct Caps {
     pub avx512bw: bool,
     pub avx512vl: bool,
     pub avx512vnni: bool,
+    pub avx512vbmi: bool,
     pub avx512vbmi2: bool,
     pub bmi2: bool,
     /// AuthenticAMD.
@@ -231,6 +262,7 @@ fn detect() -> Caps {
         avx512bw: std::arch::is_x86_feature_detected!("avx512bw"),
         avx512vl: std::arch::is_x86_feature_detected!("avx512vl"),
         avx512vnni: std::arch::is_x86_feature_detected!("avx512vnni"),
+        avx512vbmi: std::arch::is_x86_feature_detected!("avx512vbmi"),
         avx512vbmi2: std::arch::is_x86_feature_detected!("avx512vbmi2"),
         bmi2: std::arch::is_x86_feature_detected!("bmi2"),
         amd,
@@ -275,6 +307,19 @@ fn read_simd_cap() -> Option<SimdTier> {
     }
 }
 
+fn read_threats_override() -> Option<MoveThreatsKind> {
+    let v = std::env::var("GAIA_THREATS").ok()?;
+    match v.to_ascii_lowercase().as_str() {
+        "bitboards" => Some(MoveThreatsKind::Bitboards),
+        "avx2" => Some(MoveThreatsKind::Avx2View),
+        "vbmi2" => Some(MoveThreatsKind::Vbmi2View),
+        other => {
+            eprintln!("info string GAIA_THREATS '{other}' ignored (bitboards|avx2|vbmi2)");
+            None
+        }
+    }
+}
+
 fn read_pext_override() -> Option<bool> {
     let v = std::env::var("GAIA_PEXT").ok()?;
     match v.as_str() {
@@ -296,6 +341,7 @@ fn read_pext_override() -> Option<bool> {
 struct Selection {
     tier: SimdTier,
     nnz: NnzKind,
+    threats: MoveThreatsKind,
     perm: PermKind,
     attacks: AttackKind,
     setwise512: bool,
@@ -345,6 +391,14 @@ fn choose(
         NnzKind::Generic
     };
 
+    let threats = if tier >= SimdTier::Avx512 && caps.avx512vbmi && caps.avx512vbmi2 {
+        MoveThreatsKind::Vbmi2View
+    } else if tier >= SimdTier::Avx2 {
+        MoveThreatsKind::Avx2View
+    } else {
+        MoveThreatsKind::Bitboards
+    };
+
     let perm = match tier {
         SimdTier::Vnni512 | SimdTier::Avx512 => PermKind::File512,
         SimdTier::Avx2 => PermKind::Avx2,
@@ -376,6 +430,7 @@ fn choose(
     Selection {
         tier,
         nnz,
+        threats,
         perm,
         attacks,
         setwise512: caps.avx512f,
@@ -399,6 +454,7 @@ fn resolve() -> CpuDispatch {
     let Selection {
         tier,
         nnz,
+        threats,
         perm,
         attacks,
         setwise512,
@@ -421,6 +477,20 @@ fn resolve() -> CpuDispatch {
         NnzKind::Generic => k_scalar::find_nnz_generic,
     };
 
+    // Like the tier cap, the request can only lower the choice; a build that pins VBMI2
+    // at compile time records straight through it and never reads the table.
+    let (threats, threats_forced) = match read_threats_override() {
+        Some(k) if k < threats => (k, true),
+        _ => (threats, false),
+    };
+    let move_threats = match threats {
+        MoveThreatsKind::Vbmi2View => {
+            move_threats::x86::record_vbmi2 as unsafe fn(&Position, &AccDelta, &mut MoveThreats)
+        }
+        MoveThreatsKind::Avx2View => move_threats::x86::record_avx2,
+        MoveThreatsKind::Bitboards => move_threats::record_scalar,
+    };
+
     match tier {
         SimdTier::Vnni512 => CpuDispatch {
             forward_dense: k_vnni512::forward_dense,
@@ -430,13 +500,16 @@ fn resolve() -> CpuDispatch {
             acc_add2_sub2: k_vnni512::acc_add2_sub2,
             finny_apply: k_vnni512::finny_apply,
             threat_batch: threat512::threat_batch,
+            move_threats,
             tier,
             nnz,
+            threats,
             perm,
             attacks,
             setwise512,
             forced,
             pext_forced,
+            threats_forced,
         },
         SimdTier::Avx512 => CpuDispatch {
             forward_dense: k_avx512::forward_dense,
@@ -446,13 +519,16 @@ fn resolve() -> CpuDispatch {
             acc_add2_sub2: k_avx512::acc_add2_sub2,
             finny_apply: k_avx512::finny_apply,
             threat_batch: threat512::threat_batch,
+            move_threats,
             tier,
             nnz,
+            threats,
             perm,
             attacks,
             setwise512,
             forced,
             pext_forced,
+            threats_forced,
         },
         SimdTier::Avx2 => CpuDispatch {
             forward_dense: k_avx2::forward_dense,
@@ -462,13 +538,16 @@ fn resolve() -> CpuDispatch {
             acc_add2_sub2: k_avx2::acc_add2_sub2,
             finny_apply: k_avx2::finny_apply,
             threat_batch: k_avx2::threat_batch,
+            move_threats,
             tier,
             nnz,
+            threats,
             perm,
             attacks,
             setwise512,
             forced,
             pext_forced,
+            threats_forced,
         },
         SimdTier::Scalar => CpuDispatch {
             forward_dense: k_scalar::forward_dense,
@@ -478,13 +557,16 @@ fn resolve() -> CpuDispatch {
             acc_add2_sub2: k_scalar::acc_add2_sub2,
             finny_apply: k_scalar::finny_apply,
             threat_batch: k_scalar::threat_batch,
+            move_threats,
             tier,
             nnz,
+            threats,
             perm,
             attacks,
             setwise512,
             forced,
             pext_forced,
+            threats_forced,
         },
     }
 }
@@ -505,6 +587,7 @@ mod tests {
             avx512bw: bw,
             avx512vl: vl,
             avx512vnni: vnni,
+            avx512vbmi: vbmi2,
             avx512vbmi2: vbmi2,
             bmi2: avx2, // BMI2 ships with AVX2 on every real CPU; overridden where it matters
             amd: false,
@@ -523,6 +606,7 @@ mod tests {
         let s = pick(c, None);
         assert_eq!(s.tier, SimdTier::Vnni512);
         assert_eq!(s.nnz, NnzKind::Compress512);
+        assert_eq!(s.threats, MoveThreatsKind::Vbmi2View);
         assert_eq!(s.perm, PermKind::File512);
         // AMD default: AVX2 attacks measured faster than PEXT in the
         // dispatched binary (Zen 5, +1.2%).
@@ -552,6 +636,22 @@ mod tests {
         let s = pick(caps(true, true, true, true, true, true, false), None);
         assert_eq!(s.tier, SimdTier::Vnni512);
         assert_eq!(s.nnz, NnzKind::Avx2Table);
+        // No byte permutation either: the move threats take the AVX2 view.
+        assert_eq!(s.threats, MoveThreatsKind::Avx2View);
+    }
+
+    #[test]
+    fn the_vbmi2_view_needs_vbmi_as_well() {
+        let mut c = caps(true, true, true, true, true, true, true);
+        c.avx512vbmi = false;
+        assert_eq!(pick(c, None).threats, MoveThreatsKind::Avx2View);
+    }
+
+    #[test]
+    fn the_move_threats_follow_a_lowered_tier() {
+        let all = caps(true, true, true, true, true, true, true);
+        assert_eq!(pick(all, Some(SimdTier::Avx2)).threats, MoveThreatsKind::Avx2View);
+        assert_eq!(pick(all, Some(SimdTier::Scalar)).threats, MoveThreatsKind::Bitboards);
     }
 
     #[test]
@@ -568,6 +668,7 @@ mod tests {
         let s = pick(caps(true, true, false, false, false, false, false), None);
         assert_eq!(s.tier, SimdTier::Avx2);
         assert_eq!(s.nnz, NnzKind::Avx2Table);
+        assert_eq!(s.threats, MoveThreatsKind::Avx2View);
         assert_eq!(s.perm, PermKind::Avx2);
         assert!(!s.setwise512);
     }

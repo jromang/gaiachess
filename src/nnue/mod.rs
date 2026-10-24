@@ -20,6 +20,7 @@
 //! Submodules:
 //!   - `features`: HalfKA PST indexing (12 king buckets, horizontal mirroring)
 //!   - `threats`: pairwise threat features (59,808), incremental dirty updates
+//!   - `move_threats`: the threat changes of a move, recorded when it is played
 //!   - `pawn_pairs`: 3-file pawn-pawn relations (4,560)
 //!   - `accumulator`: PST accumulator (Finny cache), incremental push/pop
 //!   - `network`: NNUEParams struct (~85 MB), weight loading (direct memcpy)
@@ -33,6 +34,7 @@ pub mod features;
 pub(crate) mod forward;
 pub mod integrity;
 pub(crate) mod kernels;
+pub(crate) mod move_threats;
 pub mod network;
 pub mod pawn_pairs;
 pub mod simd;
@@ -48,8 +50,6 @@ pub use network::{replica, replica_count, replicate};
 pub fn simd_label() -> &'static str {
     kernels::arm::label()
 }
-
-use std::mem::MaybeUninit;
 
 use crate::position::Position;
 use crate::types::*;
@@ -161,22 +161,6 @@ pub struct Network {
     params: Option<&'static network::NNUEParams>,
 }
 
-/// The board a chain slot names: the position itself, or one of the rebuilt plies.
-#[inline]
-fn board_at<'a>(
-    pos: &'a Position,
-    rebuilt: &'a [MaybeUninit<threats::RebuiltBoard>],
-    slot: u8,
-    occ: u64,
-) -> threats::BoardView<'a> {
-    if slot == u8::MAX {
-        threats::BoardView::of(pos)
-    } else {
-        // SAFETY: a slot is named only after `ensure_threats_updated` wrote it.
-        unsafe { rebuilt[slot as usize].assume_init_ref() }.view(occ)
-    }
-}
-
 impl Network {
     /// Create a new Network with pre-allocated accumulator stack.
     pub fn new() -> Self {
@@ -227,7 +211,8 @@ impl Network {
         self.threat_acc[0].update_full(params, pos);
     }
 
-    /// Push a new ply onto the PST accumulator stack.
+    /// Push a new ply onto the accumulator stacks, and record the attacks the move
+    /// creates and destroys.
     ///
     /// Must be called BEFORE `Position::make_move()` so we can read the
     /// moved and captured pieces from the unmodified board.
@@ -263,7 +248,9 @@ impl Network {
             },
             old_occ: pos.occupied(),
         };
-        self.threat_acc[self.index].accurate = [false; 2];
+        let threat_acc = &mut self.threat_acc[self.index];
+        threat_acc.accurate = [false; 2];
+        move_threats::record(pos, &self.accumulators[self.index].delta, &mut threat_acc.moved);
     }
 
     /// Push a null move onto the PST accumulator stack (lazy — no clone).
@@ -340,12 +327,13 @@ impl Network {
     }
 
     /// Bring the threat accumulator up-to-date from the nearest ancestor whose threats
-    /// are known, replaying the plies in between, or recompute it when none is close.
+    /// are known, applying the moves recorded in between, or recompute it when none
+    /// is close.
     ///
     /// A ply without a static eval (in check, lazy eval) leaves its threats unknown,
-    /// and every child of it used to pay a full recompute. Replaying two or three
-    /// plies costs a fraction of that, and the plies replayed become known for the
-    /// siblings that follow. Past `THREAT_CHAIN_MAX` plies the recompute is cheaper.
+    /// and every child of it used to pay a full recompute. Applying two or three
+    /// recorded moves costs a fraction of that, and the plies applied become known for
+    /// the siblings that follow. Past `THREAT_CHAIN_MAX` plies the recompute is cheaper.
     fn ensure_threats_updated(&mut self, pos: &Position) {
         let idx = self.index;
         let params = self.params();
@@ -364,51 +352,17 @@ impl Network {
             self.threat_acc[idx].update_full(params, pos);
             return;
         };
-        let len = idx - source;
-
-        // The boards of the plies between `pos` and the source, rebuilt backwards from
-        // the deltas and kept by reference: `slot[k]` says where the board k plies above
-        // `pos` lives — `POS` for the position itself, else an index into `rebuilt`. A
-        // null move leaves the board as it was, so its ply shares the slot of the ply
-        // after it. Nothing is copied but the arrays that have to be rebuilt.
-        const POS: u8 = u8::MAX;
-        let mut rebuilt: [MaybeUninit<threats::RebuiltBoard>; threats::THREAT_CHAIN_MAX] =
-            [const { MaybeUninit::uninit() }; threats::THREAT_CHAIN_MAX];
-        let mut slot = [POS; threats::THREAT_CHAIN_MAX + 1];
-        let mut occ = [0u64; threats::THREAT_CHAIN_MAX + 1];
-        occ[0] = pos.occupied();
-        let mut used = 0usize;
-        for k in 1..=len {
-            let delta = &self.accumulators[idx - k + 1].delta;
-            if delta.mv == Move::NONE {
-                slot[k] = slot[k - 1];
-                occ[k] = occ[k - 1];
-            } else {
-                // The slot being written is never the one being read: the board below
-                // lives in `pos` or in an earlier slot.
-                let (done, free) = rebuilt.split_at_mut(used);
-                let below = board_at(pos, done, slot[k - 1], occ[k - 1]);
-                below.rebuild_before_into(delta, &mut free[0]);
-                slot[k] = used as u8;
-                occ[k] = delta.old_occ;
-                used += 1;
-            }
-        }
 
         let mut replayed = true;
         for ply in (source + 1)..=idx {
-            let k = idx - ply;
-            let delta = &self.accumulators[ply].delta;
             let (left, right) = self.threat_acc.split_at_mut(ply);
             let parent = &left[ply - 1];
             let current = &mut right[0];
-            if delta.mv == Move::NONE {
+            if self.accumulators[ply].delta.mv == Move::NONE {
                 current.copy_from(parent);
                 continue;
             }
-            let new = board_at(pos, &rebuilt, slot[k], occ[k]);
-            let old = board_at(pos, &rebuilt, slot[k + 1], occ[k + 1]);
-            if !current.update_incremental(params, &new, &old, parent, delta) {
+            if !current.apply_moved(params, parent) {
                 // A king crossed the centre at this ply: nothing before it carries over.
                 replayed = false;
                 break;

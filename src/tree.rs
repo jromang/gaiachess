@@ -16,7 +16,11 @@
 //!   node's Enter and its Exit.
 //! - Nodes are recorded only after the node counter increments; early returns
 //!   before that point (stop, ply overflow, leaf-to-qsearch dispatch) emit
-//!   nothing.
+//!   nothing. One exception: the quiescence exits taken before its counter
+//!   (upcoming repetition that fails high, draw, GaiaTB score) are recorded as
+//!   an Enter/Exit pair (`X_REPETITION`, `X_DRAW`, `X_TB_DTM`) so that every
+//!   searched move has a child. Those leaves are not counted as nodes: a
+//!   subtree's record count can exceed the search's node count.
 //!
 //! File layout: header (magic, options, FEN, meta JSON) + records + 16-byte
 //! footer (record count + truncation flag). All integers little-endian.
@@ -130,6 +134,28 @@ macro_rules! tree_ret {
     }};
 }
 pub(crate) use tree_ret;
+
+/// Record a quiescence leaf that returns before the node counter (upcoming
+/// repetition, draw, GaiaTB probe) as one Enter and its Exit, then return
+/// `$val`. The node counter is left alone, so the search is unchanged.
+#[cfg(feature = "tree")]
+macro_rules! tree_leaf_ret {
+    ($td:expr, $ply:expr, $flags:expr, $alpha:expr, $beta:expr, $reason:expr, $val:expr) => {{
+        let v = $val;
+        if let Some(t) = $td.tree.as_deref_mut() {
+            t.enter($ply as u8, 0, $flags, $alpha, $beta);
+            t.exit($ply as u8, $reason, 0, 0, v, 0, 0);
+        }
+        return v;
+    }};
+}
+#[cfg(not(feature = "tree"))]
+macro_rules! tree_leaf_ret {
+    ($td:expr, $ply:expr, $flags:expr, $alpha:expr, $beta:expr, $reason:expr, $val:expr) => {{
+        return $val;
+    }};
+}
+pub(crate) use tree_leaf_ret;
 
 #[cfg(feature = "tree")]
 pub use imp::TreeRec;

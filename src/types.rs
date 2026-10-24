@@ -489,6 +489,19 @@ impl<T: Copy, const N: usize> ArrayBuf<T, N> {
         }
     }
 
+    /// Write `v` at index `i`, initialised or not. The first write to a slot must
+    /// come through here: `IndexMut` hands out a `&mut T`, which is only sound on a
+    /// slot already written.
+    #[inline(always)]
+    pub fn set(&mut self, i: usize, v: T) {
+        debug_assert!(i < N, "ArrayBuf::set: index {} out of capacity {}", i, N);
+        // SAFETY: i < N (asserted in debug, maintained by every caller); writing
+        // through MaybeUninit never reads the previous contents.
+        unsafe {
+            self.data.get_unchecked_mut(i).write(v);
+        }
+    }
+
     #[inline(always)]
     pub fn swap(&mut self, i: usize, j: usize) {
         self.data.swap(i, j);
@@ -523,6 +536,7 @@ impl<T: Copy, const N: usize> std::ops::Index<usize> for ArrayBuf<T, N> {
     }
 }
 
+// Rewrites only: the slot must already hold a value (see `set` for first writes).
 impl<T: Copy, const N: usize> std::ops::IndexMut<usize> for ArrayBuf<T, N> {
     #[inline(always)]
     fn index_mut(&mut self, i: usize) -> &mut T {
@@ -790,6 +804,23 @@ mod tests {
     }
 
     use super::*;
+
+    /// A first write goes through `set`, a rewrite may go through `IndexMut`, and
+    /// both are read back as written, at either end of the buffer.
+    #[test]
+    fn array_buf_first_writes_and_rewrites_read_back() {
+        let mut buf = ArrayBuf::<ScoredMove, 8>::new();
+        let m = Move::new(Square::E2, Square::E4);
+        buf.set(0, ScoredMove { score: 1, mv: m });
+        buf.set(7, ScoredMove { score: -3, mv: m });
+        assert_eq!(buf[0].score, 1);
+        assert_eq!(buf[7].score, -3);
+        buf[0] = ScoredMove { score: 5, mv: m };
+        buf.set(7, ScoredMove { score: 9, mv: m });
+        assert_eq!(buf[0].score, 5);
+        assert_eq!(buf[7].score, 9);
+        assert_eq!(buf.filled(1)[0].mv, m);
+    }
 
     #[test]
     fn dtm_score_short_stays_mate() {

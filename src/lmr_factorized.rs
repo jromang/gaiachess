@@ -8,8 +8,8 @@
 //! context still learns from the common ones it shares terms with. Subsets made
 //! impossible or redundant by the constraints below carry no weight.
 //!
-//! Constraints: pv -> ttpv, pv -> !cutnode, cutnode -> !pv, root -> pv.
-//! 96 canonical terms (one intercept, 9 main effects, the rest
+//! Constraints: pv -> ttpv, pv -> !cutnode, cutnode -> !pv, root -> pv, root -> !improving.
+//! 91 canonical terms (one intercept, 9 main effects, the rest
 //! pairs and triples), in 1/1024 ply; positive reduces more.
 
 use crate::tune;
@@ -44,6 +44,10 @@ pub fn context_mask(
     debug_assert!(!(pv && cutnode), "factorized LMR: pv -> !cutnode violated");
     debug_assert!(!(cutnode && pv), "factorized LMR: cutnode -> !pv violated");
     debug_assert!(!(root && !pv), "factorized LMR: root -> pv violated");
+    debug_assert!(
+        !(root && improving),
+        "factorized LMR: root -> !improving violated"
+    );
     ((pv as usize) << 0)
         | ((cutnode as usize) << 1)
         | ((improving as usize) << 2)
@@ -133,9 +137,6 @@ const fn eval(mask: usize) -> i32 {
     }
     if mask & 0x044 == 0x044 {
         s += tune::LMR_F_IMPROVING_GIVESCHECK();
-    }
-    if mask & 0x084 == 0x084 {
-        s += tune::LMR_F_IMPROVING_ROOT();
     }
     if mask & 0x104 == 0x104 {
         s += tune::LMR_F_IMPROVING_FH2();
@@ -266,9 +267,6 @@ const fn eval(mask: usize) -> i32 {
     if mask & 0x04c == 0x04c {
         s += tune::LMR_F_IMPROVING_TTMOVE_GIVESCHECK();
     }
-    if mask & 0x08c == 0x08c {
-        s += tune::LMR_F_IMPROVING_TTMOVE_ROOT();
-    }
     if mask & 0x10c == 0x10c {
         s += tune::LMR_F_IMPROVING_TTMOVE_FH2();
     }
@@ -284,20 +282,11 @@ const fn eval(mask: usize) -> i32 {
     if mask & 0x064 == 0x064 {
         s += tune::LMR_F_IMPROVING_QUIET_GIVESCHECK();
     }
-    if mask & 0x0a4 == 0x0a4 {
-        s += tune::LMR_F_IMPROVING_QUIET_ROOT();
-    }
     if mask & 0x124 == 0x124 {
         s += tune::LMR_F_IMPROVING_QUIET_FH2();
     }
-    if mask & 0x0c4 == 0x0c4 {
-        s += tune::LMR_F_IMPROVING_GIVESCHECK_ROOT();
-    }
     if mask & 0x144 == 0x144 {
         s += tune::LMR_F_IMPROVING_GIVESCHECK_FH2();
-    }
-    if mask & 0x184 == 0x184 {
-        s += tune::LMR_F_IMPROVING_ROOT_FH2();
     }
     if mask & 0x038 == 0x038 {
         s += tune::LMR_F_TTMOVE_TTPV_QUIET();
@@ -429,9 +418,6 @@ fn eval(mask: usize) -> i32 {
     if mask & 0x044 == 0x044 {
         s += tune::LMR_F_IMPROVING_GIVESCHECK();
     }
-    if mask & 0x084 == 0x084 {
-        s += tune::LMR_F_IMPROVING_ROOT();
-    }
     if mask & 0x104 == 0x104 {
         s += tune::LMR_F_IMPROVING_FH2();
     }
@@ -561,9 +547,6 @@ fn eval(mask: usize) -> i32 {
     if mask & 0x04c == 0x04c {
         s += tune::LMR_F_IMPROVING_TTMOVE_GIVESCHECK();
     }
-    if mask & 0x08c == 0x08c {
-        s += tune::LMR_F_IMPROVING_TTMOVE_ROOT();
-    }
     if mask & 0x10c == 0x10c {
         s += tune::LMR_F_IMPROVING_TTMOVE_FH2();
     }
@@ -579,20 +562,11 @@ fn eval(mask: usize) -> i32 {
     if mask & 0x064 == 0x064 {
         s += tune::LMR_F_IMPROVING_QUIET_GIVESCHECK();
     }
-    if mask & 0x0a4 == 0x0a4 {
-        s += tune::LMR_F_IMPROVING_QUIET_ROOT();
-    }
     if mask & 0x124 == 0x124 {
         s += tune::LMR_F_IMPROVING_QUIET_FH2();
     }
-    if mask & 0x0c4 == 0x0c4 {
-        s += tune::LMR_F_IMPROVING_GIVESCHECK_ROOT();
-    }
     if mask & 0x144 == 0x144 {
         s += tune::LMR_F_IMPROVING_GIVESCHECK_FH2();
-    }
-    if mask & 0x184 == 0x184 {
-        s += tune::LMR_F_IMPROVING_ROOT_FH2();
     }
     if mask & 0x038 == 0x038 {
         s += tune::LMR_F_TTMOVE_TTPV_QUIET();

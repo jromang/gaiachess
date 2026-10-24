@@ -271,17 +271,22 @@ pub struct RootMove {
     pub mv: Move,
     /// Score of the last completed iteration in which this move was the line's
     /// best (-SCORE_INFINITE while it never was). Exact, written by a settled
-    /// aspiration loop — unless `lower_bound` is set.
+    /// aspiration loop — unless `in_progress` is set.
     pub score: i32,
-    /// The iteration `score` comes from (0 while the move was never scored). The
+    /// The iteration `score` comes from (0 while the move was never scored), or, when
+    /// `in_progress`, the last completed iteration before the one that produced the
+    /// score — the depth it sorts at, one below the depth it is reported at. The
     /// root moves are kept sorted by depth first, so `root_moves[0]` is always the
     /// deepest completed result — the move played and the line reported when the
     /// search stops in the middle of an iteration.
     pub depth: i32,
-    /// `score` is the lower bound of a fail-high in an iteration that has not
-    /// settled. The move then stands at the last completed depth, ahead of the
-    /// previous best, so that a search stopped before the iteration settles plays
-    /// the move the fail-high has just proved better. The exact score clears it.
+    /// `score` comes from an iteration that has not settled: a fail-high bound, or an
+    /// exact score that raised alpha inside the window. The move then stands at the
+    /// last completed depth, ahead of the previous best, so that a search stopped
+    /// before the iteration settles plays the move it has just proved better. The
+    /// settled iteration clears it.
+    pub in_progress: bool,
+    /// `score` is the lower bound of a fail-high (implies `in_progress`).
     pub lower_bound: bool,
     /// The score this move had before `score` was last written.
     pub previous_score: i32,
@@ -299,6 +304,12 @@ pub struct RootMove {
     pub tb_score: i32,
     /// Cumulative nodes spent searching this move (for node fraction TM).
     pub nodes_spent: u64,
+    /// `pv` as it stood when the current iteration began, and its length (0 while
+    /// the move was never scored): the line the follow-PV guard walks when this move
+    /// heads a line of the iteration. The lines searched before it in the same
+    /// iteration rewrite the PVs of the moves behind them, hence the snapshot.
+    pub previous_pv: [Move; MAX_PLY + 1],
+    pub previous_pv_len: usize,
     /// Root move followed by the reply line already found while searching it.
     pub refutation: [Move; MAX_PLY + 1],
     pub refutation_len: usize,
@@ -314,11 +325,14 @@ impl RootMove {
             mv,
             score: -SCORE_INFINITE,
             depth: 0,
+            in_progress: false,
             lower_bound: false,
             previous_score: -SCORE_INFINITE,
             avg_score: SCORE_NONE,
             pv,
             pv_len: 1,
+            previous_pv: [Move::NONE; MAX_PLY + 1],
+            previous_pv_len: 0,
             sel_depth: 0,
             tb_rank: 0,
             tb_score: 0,
@@ -419,6 +433,12 @@ pub struct SharedState {
     /// The node counters of the pool's threads, summed by [`SharedState::nodes_searched`].
     /// Empty for a thread searching alone.
     node_counters: Vec<Arc<NodeCounter>>,
+    /// The tablebase hit counters of the pool's threads, summed by
+    /// [`SharedState::tb_hits`]. Empty for a thread searching alone.
+    tb_counters: Vec<Arc<NodeCounter>>,
+    /// How many threads the current search runs on: the capacity `cpuload` is
+    /// measured against. One for a lone search, whatever the pool's size.
+    searching_threads: usize,
 }
 
 impl SharedState {
@@ -432,12 +452,20 @@ impl SharedState {
             cpu_load: crate::cpuload::CpuLoad::new(),
             best_move_changes: AtomicU32::new(0),
             node_counters: Vec::new(),
+            tb_counters: Vec::new(),
+            searching_threads: 1,
         }
     }
 
     /// Nodes searched by the whole pool, each thread counted to its last 512.
     pub fn nodes_searched(&self) -> u64 {
         self.node_counters.iter().map(|c| c.get()).sum()
+    }
+
+    /// Tablebase hits of the whole pool in the tree, each thread counted to its last
+    /// 512 nodes. The root ranking is not in it: see [`ThreadData::reported_tb_hits`].
+    pub fn tb_hits(&self) -> u64 {
+        self.tb_counters.iter().map(|c| c.get()).sum()
     }
 
     /// The correction table of logical node `node`.
@@ -452,8 +480,10 @@ impl SharedState {
         unsafe { self.corr.get_unchecked(node) }
     }
 
-    pub fn cpu_load(&self, threads: usize) -> Option<u32> {
-        self.cpu_load.permille(threads)
+    /// Process load of the current search, in per mille of the threads it runs on.
+    pub fn cpu_load(&self) -> Option<u32> {
+        debug_assert!(self.searching_threads > 0, "a search on no thread");
+        self.cpu_load.permille(self.searching_threads)
     }
 
     /// Clear everything shared (`ucinewgame`, and between bench runs).
@@ -489,6 +519,8 @@ pub struct ThreadData {
     pub nodes: u64,
     /// `nodes`, published every 512 nodes for readers on other threads.
     pub node_counter: Arc<NodeCounter>,
+    /// `tb_hits`, published with `node_counter`.
+    pub tb_counter: Arc<NodeCounter>,
     /// Quiescence search node counter (diagnostic).
     pub qs_nodes: u64,
     pub history: ButterflyHistory,
@@ -573,7 +605,8 @@ pub struct ThreadData {
     /// group of `root_moves[pv_index]` when the root is in the tables, every root move
     /// otherwise. Set by the iterative deepening for each line.
     pub pv_last: usize,
-    /// Tablebase hit counter (reported as `tbhits` in UCI info).
+    /// Tablebase hits of this thread in the tree (the pool's sum, plus the root
+    /// ranking, is reported as `tbhits`: see [`ThreadData::reported_tb_hits`]).
     pub tb_hits: u64,
     /// Syzygy TB config for this search.
     #[cfg(feature = "syzygy")]
@@ -608,7 +641,8 @@ pub struct ThreadData {
     /// Optimism bonus indexed by Color. Computed at root from running avg score.
     /// Positive = side is optimistic (root scores well), blended into eval.
     pub optimism: [i32; 2],
-    /// Follow-PV guard: PV from the previous iteration
+    /// Follow-PV guard: the previous iteration's PV of the root move heading the line
+    /// under search (see [`RootMove::previous_pv`]).
     pub last_iteration_pv: [Move; MAX_PLY + 1],
     pub last_iteration_pv_len: usize,
     curr_line: Arc<CurrLineSlot>,
@@ -634,6 +668,14 @@ pub struct ThreadData {
 /// limit, three to seven times the move's budget, and `bestmove` wait for them.
 fn main_stops_the_pool(per_thread_nodes: bool, has_clock: bool) -> bool {
     !per_thread_nodes || has_clock
+}
+
+/// Whether a main thread whose search has ended must keep the pool searching: a ponder
+/// search until `ponderhit` or `stop`, an infinite one until `stop`. The helpers search
+/// on meanwhile, as the protocol forbids leaving either kind of search unasked.
+fn pool_must_hold(ponder_requested: bool, infinite: bool) -> bool {
+    !STOP.load(Ordering::Relaxed)
+        && ((ponder_requested && PONDER.load(Ordering::Relaxed)) || infinite)
 }
 
 /// Divides a fixed node budget into one share per thread; `None` for every other
@@ -687,6 +729,7 @@ impl ThreadData {
             pos: Position::from_fen(STARTPOS).expect("startpos"),
             nodes: 0,
             node_counter: Arc::new(NodeCounter::default()),
+            tb_counter: Arc::new(NodeCounter::default()),
             qs_nodes: 0,
             history: ButterflyHistory::new(),
             pawn_history: PawnHistory::new(),
@@ -819,15 +862,24 @@ impl ThreadData {
         )
     }
 
-    /// Check time/node limits every 512 nodes.
+    /// Check the node limit at every node, the clock and the rest every 512 nodes.
     /// For helper threads (infinite limits), this is effectively a no-op.
     /// During pondering, time/node limits are suspended until `ponderhit`.
     #[inline]
     pub fn check_limits(&mut self, shared: &SharedState) {
+        // The node budget is one comparison, so it is tested at every node: `go nodes
+        // N` searches N nodes, not up to the next multiple of 512 on every thread.
+        // In datagen, and whenever a node budget was split across the pool, the limit
+        // is this thread's alone: stop it like the deadline below — a thread spending
+        // its own share must not kill its siblings through the global STOP.
+        if !self.pondering && self.nodes >= self.tm.max_nodes() {
+            self.stop_on_own_limit();
+        }
         if self.nodes & 511 == 0 {
             // Publish the count for whoever adds them up: the main thread's info
             // lines, or the interface showing what the engine is doing.
             self.node_counter.set(self.nodes);
+            self.tb_counter.set(self.tb_hits);
 
             // The interface must never see a mute engine: after a second without a
             // line, the main thread says where it is. One clock read per 512 nodes,
@@ -864,28 +916,29 @@ impl ThreadData {
                 }
             }
 
-            // Skip time/node limits while pondering (search indefinitely).
-            // In datagen, and whenever a node budget was split across the pool, the
-            // limit is this thread's alone: stop it like the deadline below — a thread
-            // spending its own share must not kill its siblings through the global STOP.
+            // Skip the time limit while pondering (search indefinitely).
             // The deadline cannot fire before depth one is in hand: a move has to be
             // played, and the alternative is handing back whatever the first legal
-            // move happened to be. The node budget has no such guard, so a fixed-node
-            // search returns the same tree as ever.
-            if !self.pondering
-                && ((self.completed_depth >= 1 && self.tm.should_stop_hard())
-                    || self.nodes >= self.tm.max_nodes())
-            {
-                if self.datagen_mode || self.per_thread_nodes {
-                    self.stopped = true;
-                } else {
-                    STOP.store(true, Ordering::Relaxed);
-                }
+            // move happened to be. The node budget (above) has no such guard, so a
+            // fixed-node search returns the same tree as ever.
+            if !self.pondering && self.completed_depth >= 1 && self.tm.should_stop_hard() {
+                self.stop_on_own_limit();
             }
             // Per-thread deadline (datagen): stop this thread without touching global STOP
             if self.search_deadline > 0 && self.tm.elapsed_ms() >= self.search_deadline {
                 self.stopped = true;
             }
+        }
+    }
+
+    /// Ends the search on this thread's own limit: the thread alone in datagen and
+    /// when a node budget was split across the pool, the whole pool otherwise.
+    #[cold]
+    fn stop_on_own_limit(&mut self) {
+        if self.datagen_mode || self.per_thread_nodes {
+            self.stopped = true;
+        } else {
+            STOP.store(true, Ordering::Relaxed);
         }
     }
 
@@ -895,7 +948,8 @@ impl ThreadData {
     fn print_heartbeat(&self, now_ms: u64, shared: &SharedState) {
         let nodes = self.nodes.max(shared.nodes_searched());
         let nps = nodes * 1000 / now_ms.max(1);
-        let currmove = if self.root_move != Move::NONE {
+        // The move under search waits for the bound lines, as `currmove` does.
+        let currmove = if self.root_move != Move::NONE && search::long_search(nodes) {
             format!(
                 " currmove {} currmovenumber {}",
                 self.root_move.to_uci_960(self.pos.chess960),
@@ -908,9 +962,21 @@ impl ThreadData {
             "info depth {} seldepth {}{currmove} nodes {nodes} nps {nps} tbhits {} time {now_ms}",
             self.root_depth,
             self.seldepth,
-            self.tb_hits
+            self.reported_tb_hits(shared)
         );
         note_output(now_ms);
+    }
+
+    /// The `tbhits` of an info line: every thread's hits in the tree, and the root
+    /// ranking once. Each thread ranks the same root, so counting it per thread would
+    /// count it once per thread.
+    pub fn reported_tb_hits(&self, shared: &SharedState) -> u64 {
+        let tree = self.tb_hits.max(shared.tb_hits());
+        #[cfg(feature = "syzygy")]
+        if self.tb_config.root_in_tb {
+            return tree + self.root_moves.len() as u64;
+        }
+        tree
     }
 
     /// Check if this thread should stop searching.
@@ -981,6 +1047,7 @@ impl ThreadData {
         self.pv_index = 0;
         self.pv_last = 0;
         self.tb_hits = 0;
+        self.tb_counter.set(0);
         self.curr_line.clear();
         #[cfg(feature = "syzygy")]
         {
@@ -1143,6 +1210,10 @@ pub struct ThreadPool {
     numa: NumaConfig,
     /// Whether the threads are pinned to their nodes.
     bound: bool,
+    /// The last search was given a depth limit (`go depth N`). Only the main thread
+    /// holds it, so the election is skipped: a helper that finished N + 1 before the
+    /// main thread finished N would otherwise answer beyond the limit.
+    depth_limited: bool,
 }
 
 impl ThreadPool {
@@ -1156,6 +1227,7 @@ impl ThreadPool {
             numa_policy: NumaPolicy::Auto,
             numa: NumaConfig::single(1),
             bound: false,
+            depth_limited: false,
         };
         pool.rebuild(num_threads);
         pool
@@ -1261,6 +1333,11 @@ impl ThreadPool {
             .iter()
             .map(|td| Arc::clone(&td.node_counter))
             .collect();
+        self.shared.tb_counters = self
+            .threads
+            .iter()
+            .map(|td| Arc::clone(&td.tb_counter))
+            .collect();
         debug_assert!(
             self.threads
                 .iter()
@@ -1284,7 +1361,7 @@ impl ThreadPool {
         } else {
             1
         };
-        let giga = mb.saturating_mul(1024 * 1024) >= nodes * crate::largemem::GIGA_PAGE * 8;
+        let giga = crate::largemem::wants_giga_pages(mb, nodes);
         self.shared.tt.reallocate(mb, giga);
     }
 
@@ -1392,6 +1469,13 @@ impl ThreadPool {
     ) -> (Move, Option<Move>) {
         SEARCHING.store(true, Ordering::Relaxed);
         let _searching = SearchingGuard;
+        self.depth_limited = limits.depth.is_some();
+        // The info lines add up every thread's counter, those of the threads a lone
+        // search leaves idle included: they start this search at zero.
+        for td in &self.threads {
+            td.node_counter.set(0);
+            td.tb_counter.set(0);
+        }
         self.shared.tt.new_search();
         LAST_INFO_MS.store(0, Ordering::Relaxed);
 
@@ -1403,6 +1487,7 @@ impl ThreadPool {
         let lone = (self.threads.len() == 1 && !self.bound)
             || crate::skill::level() < crate::skill::FULL_STRENGTH;
         let searching = if lone { 1 } else { self.threads.len() };
+        self.shared.searching_threads = searching;
 
         // Prepare the threads that search. A pinned thread evaluates with its node's
         // copy of the network, chosen here, before the root refresh, so that a network
@@ -1470,6 +1555,8 @@ impl ThreadPool {
         }
 
         // Multi-thread: scope ensures all threads join before we return
+        let infinite = limits.infinite;
+        let ponder_requested = PONDER.load(Ordering::Relaxed);
         let bound = self.bound;
         let numa = &self.numa;
         std::thread::scope(|s| {
@@ -1500,6 +1587,15 @@ impl ThreadPool {
             // a fixed-node lane at several threads exists to avoid.
             let mut main_job = move || {
                 search::search(main_td, shared);
+                // An infinite or ponder search that ended on its own (depth ceiling,
+                // short mate, tables) keeps the pool searching until the interface
+                // releases it: lowering STOP here would end the helpers and hand back a
+                // `bestmove` nobody asked for yet. A root without a legal move is final.
+                if main_td.best_move.is_ok() {
+                    while pool_must_hold(ponder_requested, infinite) {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                }
                 if main_stops_the_pool(main_td.per_thread_nodes, main_td.tm.has_clock()) {
                     STOP.store(true, Ordering::Relaxed);
                 }
@@ -1521,16 +1617,49 @@ impl ThreadPool {
         });
         for td in &self.threads {
             td.node_counter.set(td.nodes);
+            td.tb_counter.set(td.tb_hits);
         }
 
         // Select best thread via weighted vote aggregation
         let best_idx = self.select_best_thread();
         self.last_best_idx = best_idx;
         self.inherit_time_state(best_idx);
+        #[cfg(feature = "syzygy")]
+        self.extend_elected_tb_pv();
 
         let best = self.threads[best_idx].best_move;
         let ponder = self.extract_ponder_move(best_idx);
         (best, ponder)
+    }
+
+    /// Walks the tables to mate on the line of an elected helper, as the main thread
+    /// does on its own lines when it prints them.
+    ///
+    /// With the root in the tables every thread searches it, and the vote may elect a
+    /// helper: its line, the one reported last and the one the ponder move is read
+    /// from, was never extended, and contradicted the main thread's lines. The clock is
+    /// the main thread's, which alone holds one.
+    #[cfg(feature = "syzygy")]
+    pub fn extend_elected_tb_pv(&mut self) {
+        let best_idx = self.last_best_idx;
+        if best_idx == 0 || best_idx >= self.threads.len() {
+            return;
+        }
+        let has_clock = self.threads[0].tm.has_clock();
+        let td: &mut ThreadData = &mut self.threads[best_idx];
+        if !td.tb_config.root_in_tb {
+            return;
+        }
+        let Some(rm) = td.root_moves.first_mut() else {
+            return;
+        };
+        // A certain result only (a cursed one never reaches mate in time), and not a
+        // mate, which is already a complete line.
+        if !is_tb_score(rm.tb_score) || is_mate_score(rm.score) || rm.pv_len == 0 {
+            return;
+        }
+        search::syzygy_extend_pv(&mut td.pos, rm, has_clock, 1);
+        debug_assert!(rm.pv_len > 0 && rm.pv[0] == rm.mv, "the extension kept the root move");
     }
 
     /// Hands the main thread the score the next move's time management compares
@@ -1575,14 +1704,21 @@ impl ThreadPool {
             // unfinished iteration stands there, reported as a lower bound.
             search::print_multi_pv_info(td, &self.shared, multi_pv);
         } else if td.best_move.is_ok() {
+            // No iteration finished, but a root the tables have ranked still has its
+            // score: report it, at depth 1, as any line of the search would.
+            #[cfg(feature = "syzygy")]
+            if td.tb_config.root_in_tb && td.root_moves[0].mv == td.best_move {
+                search::print_multi_pv_info(td, &self.shared, 1);
+                return;
+            }
             let elapsed = td.tm.total_elapsed_ms().max(1);
             let cpuload = self
                 .shared
-                .cpu_load(td.thread_count)
+                .cpu_load()
                 .map_or_else(String::new, |load| format!(" cpuload {load}"));
             out!(
                 "info depth 0 nodes {} time {elapsed}{cpuload} pv {}",
-                td.nodes,
+                td.nodes.max(self.shared.nodes_searched()),
                 td.best_move.to_uci_960(td.pos.chess960)
             );
         }
@@ -1600,8 +1736,9 @@ impl ThreadPool {
     /// depth 12 on a +7 outvoted the main thread at depth 13 on a −279 that had
     /// already published the refutation of their move.
     fn select_best_thread(&self) -> usize {
-        // Skip voting for single thread or multi-PV mode
-        if self.threads.len() <= 1 || self.multi_pv > 1 {
+        // Skip voting for single thread, multi-PV mode, or a depth limit: the main
+        // thread is the one bound to the requested depth.
+        if self.threads.len() <= 1 || self.multi_pv > 1 || self.depth_limited {
             return 0;
         }
 
@@ -1812,10 +1949,10 @@ mod tests {
 
         let share = BUDGET / THREADS as u64;
         for td in &pool.threads {
-            // The limit is checked every 512 nodes, and every count is seen once, so a
-            // thread overshoots by less than that.
+            // The limit is checked at every node, before the node is counted: a
+            // thread searches its share exactly.
             assert!(
-                td.nodes >= share && td.nodes <= share + 512,
+                td.nodes == share,
                 "thread {} searched {} nodes, expected about {}",
                 td.id,
                 td.nodes,
@@ -1833,7 +1970,7 @@ mod tests {
 
         let total: u64 = pool.threads.iter().map(|td| td.nodes).sum();
         assert!(
-            total >= BUDGET && total < BUDGET + 2048 * THREADS as u64,
+            total == BUDGET,
             "pool searched {total} nodes for a budget of {BUDGET}"
         );
     }
@@ -1881,7 +2018,7 @@ mod tests {
             "a lone thread must not think it owns a share"
         );
         assert!(
-            td.nodes >= 40_000 && td.nodes <= 40_512,
+            td.nodes == 40_000,
             "lone thread searched {} nodes for a budget of 40000",
             td.nodes
         );
@@ -2213,5 +2350,217 @@ mod tests {
         assert_eq!(best.to_uci(), "d1d8", "the back-rank mate");
         let elected = &pool.threads[pool.last_best_idx];
         assert_eq!(elected.root_moves[0].score, mate_in(1));
+    }
+}
+
+#[cfg(test)]
+mod pool_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// Runs `release` after `ms`, from another thread, as the interface would.
+    fn release_after(ms: u64, release: fn()) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(ms));
+            release();
+        })
+    }
+
+    fn silent_pool(threads: usize) -> ThreadPool {
+        let mut pool = ThreadPool::new(threads, 4);
+        for td in &mut pool.threads {
+            td.silent = true;
+        }
+        pool
+    }
+
+    /// `go infinite depth 4` on several threads: the main thread is done long before
+    /// the `stop`, and the pool must still wait for it.
+    #[test]
+    fn an_infinite_search_on_several_threads_waits_for_stop() {
+        let _guard = crate::skill::lock_level();
+        STOP.store(false, Ordering::Relaxed);
+        PONDER.store(false, Ordering::Relaxed);
+        let pos = Position::from_fen("6k1/5ppp/8/8/8/8/5PPP/R5K1 w - - 0 1").unwrap();
+        let mut pool = silent_pool(2);
+        let limits = SearchLimits {
+            infinite: true,
+            depth: Some(4),
+            ..SearchLimits::default()
+        };
+        let start = Instant::now();
+        let stopper = release_after(300, || STOP.store(true, Ordering::Relaxed));
+        let (best, _) = pool.start_search(&pos, limits);
+        let waited = start.elapsed();
+        stopper.join().unwrap();
+        STOP.store(false, Ordering::Relaxed);
+        assert_eq!(best.to_uci(), "a1a8", "the back-rank mate");
+        assert!(waited >= Duration::from_millis(250), "bestmove after {waited:?}, before stop");
+    }
+
+    /// A ponder search ended by its own depth limit holds the pool until `ponderhit`.
+    #[test]
+    fn a_ponder_search_on_several_threads_waits_for_ponderhit() {
+        let _guard = crate::skill::lock_level();
+        STOP.store(false, Ordering::Relaxed);
+        PONDER.store(true, Ordering::Relaxed);
+        let pos = Position::from_fen("8/8/4k3/8/8/4K3/8/8 w - - 0 1").unwrap();
+        let mut pool = silent_pool(2);
+        let start = Instant::now();
+        let hit = release_after(300, || PONDER.store(false, Ordering::Relaxed));
+        let (best, _) = pool.start_search(&pos, SearchLimits::depth(2));
+        let waited = start.elapsed();
+        hit.join().unwrap();
+        PONDER.store(false, Ordering::Relaxed);
+        STOP.store(false, Ordering::Relaxed);
+        assert!(best.is_ok());
+        assert!(waited >= Duration::from_millis(250), "bestmove after {waited:?}, before ponderhit");
+    }
+
+    /// `go depth N` on several threads answers at depth N: the main thread, the only
+    /// one bound to N, is the one reported, never a helper that got further.
+    #[test]
+    fn a_depth_limited_search_answers_at_the_requested_depth() {
+        let _guard = crate::skill::lock_level();
+        STOP.store(false, Ordering::Relaxed);
+        PONDER.store(false, Ordering::Relaxed);
+        let mut pool = silent_pool(4);
+        for fen in [
+            "r1bq1rk1/pp2ppbp/2np2p1/2n5/P3PP2/N1P2N2/1PB3PP/R1B1QRK1 b - - 0 1",
+            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+            "8/8/3k4/8/3KP3/8/8/8 w - - 0 1",
+        ] {
+            let pos = Position::from_fen(fen).unwrap();
+            for depth in [6, 8] {
+                let (best, _) = pool.start_search(&pos, SearchLimits::depth(depth));
+                assert_eq!(pool.last_best_idx, 0, "{fen} d{depth}: a helper was elected");
+                let main = &pool.threads[0];
+                assert_eq!(best, main.best_move);
+                assert_eq!(main.root_moves[0].depth, depth, "{fen} d{depth}");
+            }
+        }
+    }
+
+    /// `go nodes N` is held to N nodes at any thread count, even when the share of
+    /// each thread is far below the 512-node tick of the clock checks.
+    #[test]
+    fn a_small_node_budget_is_held_whatever_the_thread_count() {
+        let _guard = crate::skill::lock_level();
+        STOP.store(false, Ordering::Relaxed);
+        PONDER.store(false, Ordering::Relaxed);
+        let pos = Position::from_fen(
+            "r1bq1rk1/pp2ppbp/2np2p1/2n5/P3PP2/N1P2N2/1PB3PP/R1B1QRK1 b - - 0 1",
+        )
+        .unwrap();
+        for (threads, budget) in [(1, 100u64), (1, 1_000), (8, 2_000), (4, 999)] {
+            let mut pool = silent_pool(threads);
+            let (best, _) = pool.start_search(&pos, SearchLimits::nodes(budget));
+            STOP.store(false, Ordering::Relaxed);
+            assert!(best.is_ok());
+            let total: u64 = pool.threads.iter().map(|td| td.nodes).sum();
+            assert!(
+                total >= budget && total < budget + threads as u64,
+                "{threads} thread(s) searched {total} nodes for a budget of {budget}"
+            );
+        }
+    }
+
+    /// `tbhits` adds up the hits of every thread, those of GaiaTB included: it used to
+    /// show the printing thread's alone, and no GaiaTB hit at all.
+    #[cfg(gaiatb_embedded)]
+    #[test]
+    fn tbhits_counts_the_whole_pool_and_gaiatb() {
+        let _guard = crate::skill::lock_level();
+        STOP.store(false, Ordering::Relaxed);
+        PONDER.store(false, Ordering::Relaxed);
+        assert!(crate::dtm::init(), "embedded tables must load");
+        let pos = Position::from_fen("8/8/4k3/8/2r5/8/3QK3/8 w - - 0 1").unwrap();
+        let mut pool = silent_pool(4);
+        pool.start_search(&pos, SearchLimits::nodes(200_000));
+        STOP.store(false, Ordering::Relaxed);
+        let sum: u64 = pool.threads.iter().map(|td| td.tb_hits).sum();
+        assert!(pool.threads[1..].iter().any(|td| td.tb_hits > 0), "no helper hit");
+        assert!(pool.threads[0].tb_hits > 0, "GaiaTB hits are not counted");
+        let elected = &pool.threads[pool.last_best_idx];
+        assert!(
+            elected.reported_tb_hits(&pool.shared) >= sum,
+            "reported {} for {sum} hits in the pool",
+            elected.reported_tb_hits(&pool.shared)
+        );
+        assert_eq!(pool.shared.tb_hits(), sum, "the counters hold every hit after the join");
+    }
+
+    /// A lone search in a larger pool (a weakened level) reports its own nodes and
+    /// the load of its one thread, not the counters a previous multi-thread search
+    /// left in the idle helpers, nor a load divided by the whole pool.
+    #[test]
+    fn a_lone_search_after_a_pool_search_reports_its_own_counters() {
+        let _guard = crate::skill::lock_level();
+        STOP.store(false, Ordering::Relaxed);
+        PONDER.store(false, Ordering::Relaxed);
+        let pos = Position::from_fen(
+            "r1bq1rk1/pp2ppbp/2np2p1/2n5/P3PP2/N1P2N2/1PB3PP/R1B1QRK1 b - - 0 1",
+        )
+        .unwrap();
+        let mut pool = silent_pool(4);
+        pool.start_search(&pos, SearchLimits::nodes(100_000));
+        assert_eq!(pool.shared.searching_threads, 4);
+        assert!(pool.threads[1].node_counter.get() > 0, "the helpers searched");
+
+        crate::skill::set(10, 3);
+        STOP.store(false, Ordering::Relaxed);
+        pool.start_search(&pos, SearchLimits::depth(4));
+        crate::skill::set(crate::skill::FULL_STRENGTH, 0);
+        assert_eq!(pool.shared.searching_threads, 1, "cpuload measured against one thread");
+        assert_eq!(
+            pool.threads[0].nodes.max(pool.shared.nodes_searched()),
+            pool.threads[0].nodes,
+            "the idle helpers still count their last search"
+        );
+    }
+
+    /// `ucinewgame` makes the pool a new one: once cleared, a pool that has searched
+    /// other positions — or this one — searches the same tree as a pool just built,
+    /// node for node. The root's optimism and fail-high count once survived it, and a
+    /// test suite run in one process then depended on the order of its positions.
+    #[test]
+    fn a_cleared_pool_searches_like_a_new_one() {
+        let _guard = crate::skill::lock_level();
+        STOP.store(false, Ordering::Relaxed);
+        PONDER.store(false, Ordering::Relaxed);
+        let target = "3r1rk1/1b2bppp/2q1pn2/pp4Q1/3B1P2/PBN5/1PP3PP/R2R3K b - - 0 1";
+        let signature = |pool: &mut ThreadPool| {
+            let pos = Position::from_fen(target).unwrap();
+            let (best, _) = pool.start_search(&pos, SearchLimits::depth(10));
+            let td = &pool.threads[0];
+            (best, td.best_score, td.nodes)
+        };
+        let expected = signature(&mut silent_pool(1));
+        let mut pool = silent_pool(1);
+        for before in [
+            "2rr3k/pp3pp1/1nnqbN1p/3pN3/2pP4/2P3Q1/PPB4P/R4RK1 w - - 0 1",
+            STARTPOS,
+            target,
+        ] {
+            let pos = Position::from_fen(before).unwrap();
+            pool.start_search(&pos, SearchLimits::depth(10));
+            pool.clear();
+            assert_eq!(signature(&mut pool), expected, "the search of {before} leaked");
+        }
+    }
+
+    /// A root without a legal move has nothing to wait for, infinite or not.
+    #[test]
+    fn a_mated_root_returns_at_once_on_several_threads() {
+        let _guard = crate::skill::lock_level();
+        STOP.store(false, Ordering::Relaxed);
+        PONDER.store(false, Ordering::Relaxed);
+        let pos = Position::from_fen("R5k1/5ppp/8/8/8/8/5PPP/6K1 b - - 0 1").unwrap();
+        let mut pool = silent_pool(2);
+        let start = Instant::now();
+        let (best, _) = pool.start_search(&pos, SearchLimits::infinite());
+        assert!(!best.is_ok(), "no legal move");
+        assert!(start.elapsed() < Duration::from_secs(5), "a mated root waited for stop");
+        STOP.store(false, Ordering::Relaxed);
     }
 }

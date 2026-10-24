@@ -206,8 +206,12 @@ pub struct Position {
     /// Rights that survive a move from/to each square.
     pub castling_rights_mask: [u8; 64],
     pub ep_square: Square,
+    /// Saturates at 255: a FEN may start it anywhere up to there, and wrapping to 0 would
+    /// take the fifty-move draw and the repetition window away.
     pub halfmove_clock: u8,
-    pub fullmove_number: u16,
+    /// Wide enough that no game read from a FEN, however far its counter, can wrap it:
+    /// unmake undoes it by a decrement, so it cannot saturate the way the clock does.
+    pub fullmove_number: u32,
 
     /// Zobrist hash of the full position (incrementally updated).
     pub key: u64,
@@ -860,6 +864,14 @@ impl Position {
             let mut file: u8 = 0;
             let mut prev_was_digit = false;
             for ch in rank_str.chars() {
+                // A rank already full refuses anything more, digit or piece, before it is
+                // written: the ninth square of rank 8 is index 64, past the board.
+                if file >= 8 {
+                    return Err(FenParseError::RankLengthMismatch {
+                        rank: 8 - i,
+                        count: file + 1,
+                    });
+                }
                 match ch {
                     '1'..='8' => {
                         if prev_was_digit {
@@ -951,7 +963,7 @@ impl Position {
         pos.fullmove_number = parts
             .get(5)
             .and_then(|s| s.parse::<u32>().ok())
-            .map(|n| n.clamp(1, u16::MAX as u32) as u16)
+            .map(|n| n.clamp(1, u16::MAX as u32))
             .unwrap_or(1);
 
         // Drop an EP square that isn't a legal capture target.
@@ -962,7 +974,13 @@ impl Position {
                 pos.ep_square = Square::NONE;
             } else {
                 let cap_sq = Square((pos.ep_square.0 as i8 - pawn_push(us)) as u8);
-                if pos.board[cap_sq.index()] != Piece::new(PieceType::Pawn, !us) {
+                // The pawn that just pushed two squares crossed the EP square and left
+                // the one behind it: both are empty. An occupied EP square would let the
+                // capture land on a piece that make_move does not know is there.
+                let behind = Square((pos.ep_square.0 as i8 + pawn_push(us)) as u8);
+                if pos.board[cap_sq.index()] != Piece::new(PieceType::Pawn, !us)
+                    || pos.occupied() & (pos.ep_square.bb() | behind.bb()) != 0
+                {
                     pos.ep_square = Square::NONE;
                 }
             }
@@ -1012,7 +1030,8 @@ impl Position {
     /// over without them looks like an opening — which is the safe direction, an
     /// opening being the cheaper move to allocate for.
     pub fn game_ply(&self) -> i32 {
-        // Cast before doubling: the FEN parser clamps the counter to u16::MAX.
+        // Cast before doubling: the FEN parser clamps the counter to u16::MAX, and a game
+        // played on from there stays far below i32::MAX / 2.
         2 * (self.fullmove_number as i32 - 1) + (self.side_to_move == Color::Black) as i32
     }
 
@@ -1270,7 +1289,7 @@ impl Position {
         if moving_piece.piece_type() == PieceType::Pawn || captured != Piece::NONE {
             self.halfmove_clock = 0;
         } else {
-            self.halfmove_clock += 1;
+            self.halfmove_clock = self.halfmove_clock.saturating_add(1);
         }
         self.plies_from_null += 1;
 
@@ -2089,6 +2108,13 @@ impl Position {
                 ep.0,
                 cap_sq.0
             );
+            // The square the pawn crossed is empty: the capture lands there.
+            debug_assert!(
+                self.board[ep.index()] == Piece::NONE,
+                "check_validity: EP square {} is occupied by {:?}",
+                ep.0,
+                self.board[ep.index()]
+            );
         }
 
         // 9. Castling rights coherence
@@ -2176,12 +2202,9 @@ impl Position {
             );
         }
 
-        // 11. Halfmove clock
-        debug_assert!(
-            self.halfmove_clock <= 100,
-            "check_validity: halfmove_clock {} > 100",
-            self.halfmove_clock
-        );
+        // 11. Halfmove clock: no bound to check. A FEN may set it anywhere up to 255 and
+        // make_move saturates it there; past 100 the position is a fifty-move draw (or a
+        // mate), which is what draw_by_fifty_move_rule says, not an invalid position.
 
         // 12. Ply bound (catches BUG 4: history overflow)
         debug_assert!(
@@ -2542,6 +2565,29 @@ pub(crate) mod tests {
         ));
     }
 
+    /// A rank with a ninth square is refused before the square is written: on rank 8
+    /// it would index past the board, on a lower rank spill onto the rank above.
+    #[test]
+    fn a_rank_with_too_many_squares_is_an_error_not_a_panic() {
+        assert!(matches!(
+            Position::from_fen("rnbqkbnrr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"),
+            Err(FenParseError::RankLengthMismatch { rank: 8, count: 9 })
+        ));
+        assert!(matches!(
+            Position::from_fen("p8p/8/8/8/8/8/8/K6k w - - 0 1"),
+            Err(FenParseError::RankLengthMismatch { rank: 8, .. })
+        ));
+        assert!(matches!(
+            Position::from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNRR w KQkq - 0 1"),
+            Err(FenParseError::RankLengthMismatch { rank: 1, count: 9 })
+        ));
+        // A digit that runs past the end is caught by the final count, nothing written.
+        assert!(matches!(
+            Position::from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQK4 w Qkq - 0 1"),
+            Err(FenParseError::RankLengthMismatch { rank: 1, count: 9 })
+        ));
+    }
+
     #[test]
     fn test_fen_invalid_side_to_move() {
         assert!(matches!(
@@ -2779,6 +2825,65 @@ pub(crate) mod tests {
     /// make_move records an en passant square only where a pawn can take on it, and
     /// hashes it on the same condition. A FEN naming one nobody can take must not give
     /// the position a different key from the one the moves would have built.
+    /// The FEN accepts a clock up to 255 and a move number up to 65 535; a move played
+    /// from there must not wrap either to 0. A wrapped clock took the fifty-move draw
+    /// away from every child of the position.
+    #[test]
+    fn the_fen_counters_do_not_wrap_on_the_next_move() {
+        let mut pos = Position::from_fen("3k4/8/4K3/8/8/8/8/Q7 w - - 255 1").unwrap();
+        assert_eq!(pos.halfmove_clock, 255);
+        let mut buf = ArrayBuf::<Move, MAX_MOVES>::new();
+        let n = movegen::generate_legal_moves(&pos, &mut buf);
+        assert!(n > 0);
+        for i in 0..n {
+            let mv = buf[i];
+            pos.make_move(mv);
+            assert_eq!(pos.halfmove_clock, 255, "{mv:?}: the clock saturates");
+            assert!(pos.is_draw(1), "{mv:?}: every child is a fifty-move draw");
+            pos.unmake_move(mv);
+            assert_eq!(pos.halfmove_clock, 255, "{mv:?}: unmake restores the clock");
+        }
+
+        let mut pos = Position::from_fen("4k3/8/8/8/8/8/8/4K3 b - - 0 65535").unwrap();
+        assert_eq!(pos.fullmove_number, 65_535);
+        let mv = Move::new(Square::E8, Square::E7);
+        pos.make_move(mv);
+        assert_eq!(pos.fullmove_number, 65_536);
+        assert!(pos.game_ply() > 0);
+        assert_eq!(pos.to_fen(), "8/4k3/8/8/8/8/8/4K3 w - - 1 65536");
+        pos.unmake_move(mv);
+        assert_eq!(pos.fullmove_number, 65_535);
+    }
+
+    /// An en passant square with a piece on it, or on the square the pawn came from,
+    /// cannot follow a double push. Kept, it let the capture land on that piece and
+    /// unmake leave the mailbox and the bitboards disagreeing.
+    #[test]
+    fn a_fen_en_passant_square_with_a_piece_on_it_is_dropped() {
+        let occupied = Position::from_fen("4k3/8/3n4/3pP3/8/8/8/4K3 w - d6 0 1").unwrap();
+        assert_eq!(occupied.ep_square, Square::NONE);
+        let mut buf = ArrayBuf::<Move, MAX_MOVES>::new();
+        let n = movegen::generate_legal_moves(&occupied, &mut buf);
+        assert!(
+            (0..n).all(|i| buf[i].move_type() != MT_EN_PASSANT),
+            "no en passant capture onto the knight"
+        );
+        let mut pos = occupied.clone();
+        assert_eq!(crate::perft::perft(&mut pos, 2), {
+            let mut plain = Position::from_fen("4k3/8/3n4/3pP3/8/8/8/4K3 w - - 0 1").unwrap();
+            crate::perft::perft(&mut plain, 2)
+        });
+        assert_eq!(pos.to_fen(), occupied.to_fen(), "perft left the board as it found it");
+
+        // The origin square of the double push (d7) occupied: no double push happened.
+        let origin = Position::from_fen("4k3/3n4/8/3pP3/8/8/8/4K3 w - d6 0 1").unwrap();
+        assert_eq!(origin.ep_square, Square::NONE);
+
+        // Both squares empty: the capture stays available.
+        let real = Position::from_fen("4k3/8/8/3pP3/8/8/8/4K3 w - d6 0 1").unwrap();
+        assert_eq!(real.ep_square, Square::D6);
+    }
+
     #[test]
     fn a_fen_en_passant_square_nobody_can_take_is_dropped() {
         let spurious =

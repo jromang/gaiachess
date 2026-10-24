@@ -198,6 +198,12 @@ pub struct MovePicker {
     /// to bad captures. Skipped quiets thus never inflate the caller's
     /// move count.
     skip_quiets: bool,
+    /// Generated quiets left unyielded when the skip took effect (stats only).
+    #[cfg(feature = "stats")]
+    skipped_quiets: u32,
+    /// The skip took effect before the quiets were generated (stats only).
+    #[cfg(feature = "stats")]
+    skipped_ungenerated: bool,
 }
 
 impl MovePicker {
@@ -219,6 +225,10 @@ impl MovePicker {
             bad_cap_index: MAX_MOVES,
             depth,
             skip_quiets: false,
+            #[cfg(feature = "stats")]
+            skipped_quiets: 0,
+            #[cfg(feature = "stats")]
+            skipped_ungenerated: false,
         }
     }
 
@@ -227,6 +237,14 @@ impl MovePicker {
     /// Quiet checks are bypassed too: the caller guards only the move it prunes.
     pub fn skip_quiet_moves(&mut self) {
         self.skip_quiets = true;
+    }
+
+    /// What the quiet skip dropped at this node: the generated quiets it left
+    /// unyielded, and whether it took effect before the quiets were generated
+    /// (their number is then unknown). Nothing until the picker reaches the skip.
+    #[cfg(feature = "stats")]
+    pub fn skipped_quiets(&self) -> (u32, bool) {
+        (self.skipped_quiets, self.skipped_ungenerated)
     }
 
     /// True while the last yielded move came from the losing-capture stage
@@ -253,6 +271,10 @@ impl MovePicker {
             bad_cap_index: MAX_MOVES,
             depth: 0,
             skip_quiets: false,
+            #[cfg(feature = "stats")]
+            skipped_quiets: 0,
+            #[cfg(feature = "stats")]
+            skipped_ungenerated: false,
         }
     }
 
@@ -288,6 +310,15 @@ impl MovePicker {
                         | Stage::Quiets
                 )
             {
+                #[cfg(feature = "stats")]
+                {
+                    if self.stage == Stage::Quiets {
+                        debug_assert!(self.index <= self.count);
+                        self.skipped_quiets += (self.count - self.index) as u32;
+                    } else {
+                        self.skipped_ungenerated = true;
+                    }
+                }
                 self.stage = Stage::BadCaptures;
             }
             match self.stage {
@@ -387,7 +418,7 @@ impl MovePicker {
                             "movepick: bad captures overflow into active region"
                         );
                         self.bad_start -= 1;
-                        self.entries[self.bad_start] = ScoredMove { score: 0, mv: m };
+                        self.entries.set(self.bad_start, ScoredMove { score: 0, mv: m });
                         continue;
                     }
                     if QSEARCH {
@@ -541,7 +572,11 @@ impl MovePicker {
                     }
                     self.count = j;
                     self.index = 0;
-                    Self::partial_insertion_sort(&mut self.entries, 0, j, -3500 * self.depth);
+                    // Evasions are sorted in full: the depth-scaled limit would
+                    // leave every quiet evasion of a quiescence node (depth 0)
+                    // in generation order, and the first one often decides alone.
+                    let limit = if pos.checkers != 0 { i32::MIN } else { -3500 * self.depth };
+                    Self::partial_insertion_sort(&mut self.entries, 0, j, limit);
                     self.stage = Stage::Quiets;
                 }
 
@@ -664,6 +699,67 @@ mod tests {
                 assert!(!is_quiet(&pos, m), "{fen}: capture stage made {}", m.to_uci());
             }
         }
+    }
+
+    /// A quiescence node in check builds its picker at depth 0, where the quiet
+    /// stage's depth-scaled sort limit is 0: evasions with a negative history were
+    /// handed out in generation order. Here every quiet evasion scores below zero,
+    /// worst first in generation order; they must still come out best first.
+    #[test]
+    fn quiet_evasions_come_out_best_first_at_depth_zero() {
+        use crate::history::{CaptureHistory, PawnHistory, PieceToTable};
+        use crate::threads::{SS_OFFSET, StackEntry};
+        // The rook on a1 checks the king on e1; only quiet king steps answer it.
+        let pos = Position::from_fen("4k3/8/8/8/8/8/8/r3K3 w - - 0 1").unwrap();
+        assert!(pos.checkers != 0);
+        let stm = pos.side_to_move;
+
+        let mut quiets = ArrayBuf::<ScoredMove, MAX_MOVES>::new();
+        let n = movegen::generate_quiets(&pos, &mut quiets);
+        assert!(n >= 3, "only {n} quiet moves generated");
+        let mut history = Box::new(ButterflyHistory::new());
+        for i in 0..n {
+            let malus = -200 * (n - i) as i32;
+            history.update(stm, quiets[i].mv, pos.threats, malus);
+        }
+        for i in 0..n {
+            assert!(history.get(stm, quiets[i].mv, pos.threats) < 0);
+        }
+
+        let cap_history = Box::new(CaptureHistory::new());
+        let pawn_history = PawnHistory::new();
+        let tt = TT::new(1);
+        let mut empty: Box<PieceToTable> = Box::new([[0; Square::NUM]; Piece::NUM]);
+        let empty_ptr: *mut PieceToTable = &mut *empty;
+        let stack: Vec<StackEntry> = (0..SS_OFFSET + 2)
+            .map(|_| StackEntry { conthist_ptr: empty_ptr, ..StackEntry::default() })
+            .collect();
+
+        let mut picker = MovePicker::new(Move::NONE, [Move::NONE; 2], Move::NONE, 0);
+        let mut scores = Vec::new();
+        loop {
+            let m = picker.next::<false>(
+                &pos,
+                &history,
+                &cap_history,
+                &pawn_history,
+                &tt,
+                0,
+                &stack,
+                stm,
+            );
+            if m == Move::NONE {
+                break;
+            }
+            if is_quiet(&pos, m) {
+                scores.push(history.get(stm, m, pos.threats));
+            }
+        }
+        assert_eq!(scores.len(), n);
+        assert!(
+            scores.windows(2).all(|w| w[0] >= w[1]),
+            "quiet evasions out of order: {scores:?}"
+        );
     }
 
     #[test]

@@ -219,15 +219,16 @@ pub unsafe fn clamp_f32(x: float32x4_t, min: float32x4_t, max: float32x4_t) -> f
 
 /// Horizontal sum of four f32 vectors → scalar f32.
 ///
-/// Reduces 4 × float32x4_t (16 f32 total) to a single scalar.
+/// Reduces 4 × float32x4_t (16 f32 total, e0..e15 in lane order) to a single scalar,
+/// in the order of the x86 paths: t_i = (e_i + e_i+8) + (e_i+4 + e_i+12), then
+/// (t0 + t2) + (t1 + t3). Float addition does not associate, and any other order
+/// moves the output of L3 by an ulp on rare positions — enough to change the search
+/// (#40: 9 705 037 bench nodes on ARM64 against 9 421 704 on x86).
 #[inline(always)]
 pub unsafe fn horizontal_sum(x: [float32x4_t; 4]) -> f32 {
-    let sum01 = vaddq_f32(x[0], x[1]);
-    let sum23 = vaddq_f32(x[2], x[3]);
-    let sum = vaddq_f32(sum01, sum23);
-    let pair = vpadd_f32(vget_low_f32(sum), vget_high_f32(sum));
-    let final_sum = vpadd_f32(pair, pair);
-    vget_lane_f32::<0>(final_sum)
+    let sum = vaddq_f32(vaddq_f32(x[0], x[2]), vaddq_f32(x[1], x[3]));
+    let half = vadd_f32(vget_low_f32(sum), vget_high_f32(sum));
+    vget_lane_f32::<0>(vpadd_f32(half, half))
 }
 
 /// Number of float32x4_t vectors needed for horizontal_sum input.
@@ -285,6 +286,43 @@ mod tests {
             ))
         };
         assert_eq!(got, want);
+    }
+
+    /// The reduction tree of the x86 paths (AVX2 and AVX-512), in scalar.
+    fn x86_order(e: [f32; 16]) -> f32 {
+        let t = |i: usize| (e[i] + e[i + 8]) + (e[i + 4] + e[i + 12]);
+        (t(0) + t(2)) + (t(1) + t(3))
+    }
+
+    fn neon_sum(e: [f32; 16]) -> f32 {
+        unsafe {
+            let v = |i: usize| vld1q_f32(e[i..].as_ptr());
+            horizontal_sum([v(0), v(4), v(8), v(12)])
+        }
+    }
+
+    #[test]
+    fn horizontal_sum_adds_in_the_x86_order() {
+        // An order where it matters: e0 + e4 first rounds the 1 away, e0 + e8 first
+        // keeps both ones.
+        let mut e = [0.0f32; 16];
+        (e[0], e[4], e[8], e[12]) = (1e8, 1.0, -1e8, 1.0);
+        assert_eq!(x86_order(e), 2.0);
+        assert_eq!(neon_sum(e), 2.0);
+
+        // And bit for bit on values of every magnitude.
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        for _ in 0..10_000 {
+            let mut e = [0.0f32; 16];
+            for x in &mut e {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                let mantissa = (state >> 40) as f32 / (1u64 << 24) as f32 - 0.5;
+                *x = mantissa * 10f32.powi((state % 13) as i32 - 4);
+            }
+            assert_eq!(neon_sum(e).to_bits(), x86_order(e).to_bits(), "{e:?}");
+        }
     }
 
     #[test]

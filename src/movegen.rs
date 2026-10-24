@@ -15,7 +15,7 @@ use crate::types::*;
 fn emit(buf: &mut ArrayBuf<Move, MAX_MOVES>, count: &mut usize, m: Move) {
     debug_assert!(*count < MAX_MOVES, "emit: overflow at {}", *count);
     debug_assert!(m.is_ok(), "emit: invalid move {:?}", m);
-    buf[*count] = m;
+    buf.set(*count, m);
     *count += 1;
 }
 
@@ -24,7 +24,7 @@ fn emit(buf: &mut ArrayBuf<Move, MAX_MOVES>, count: &mut usize, m: Move) {
 fn emit_scored(buf: &mut ArrayBuf<ScoredMove, MAX_MOVES>, count: &mut usize, m: Move) {
     debug_assert!(*count < MAX_MOVES, "emit_scored: overflow at {}", *count);
     debug_assert!(m.is_ok(), "emit_scored: invalid move {:?}", m);
-    buf[*count] = ScoredMove { score: 0, mv: m };
+    buf.set(*count, ScoredMove { score: 0, mv: m });
     *count += 1;
 }
 

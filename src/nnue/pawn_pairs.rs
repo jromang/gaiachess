@@ -18,8 +18,17 @@ use crate::types::{Piece, Square};
 
 use super::PAWN_PAIR_SIZE;
 
-/// Maximum simultaneously active pawn-pair features per perspective.
-pub const MAX_ACTIVE_PAIRS: usize = 64;
+/// Capacity for the active pawn-pair features of one perspective. Every pair of pawns
+/// within one 3-file window is active, so sixteen pawns crowded on three files give
+/// C(16, 2) = 120: the bound is the number of pairs of pawns, not what games reach.
+pub const MAX_ACTIVE_PAIRS: usize = 128;
+const _: () = assert!(MAX_ACTIVE_PAIRS >= 16 * 15 / 2);
+
+/// Capacity for the pairs one move adds or removes. A move removes at most two pawns
+/// (the one that moved and one it took) and adds at most one, and a removed pawn pairs
+/// with at most the fifteen others: 15 + 14 = 29 pairs lost, 15 gained.
+pub const MAX_DELTA_PAIRS: usize = 64;
+const _: () = assert!(MAX_DELTA_PAIRS >= 15 + 14);
 
 const FILE_A: u64 = 0x0101_0101_0101_0101;
 
@@ -141,8 +150,8 @@ pub fn collect_delta_for_pov(
     new_black: u64,
     pov: usize,
     mirrored: bool,
-    subs: &mut [u32; MAX_ACTIVE_PAIRS],
-    adds: &mut [u32; MAX_ACTIVE_PAIRS],
+    subs: &mut [u32; MAX_DELTA_PAIRS],
+    adds: &mut [u32; MAX_DELTA_PAIRS],
 ) -> (usize, usize) {
     debug_assert!(pov < 2);
     let square_flip = (7 * mirrored as usize) ^ (56 * pov);
@@ -179,7 +188,7 @@ fn emit_touching(
     mut set_f: u64,
     mut set_e: u64,
     square_flip: usize,
-    out: &mut [u32; MAX_ACTIVE_PAIRS],
+    out: &mut [u32; MAX_DELTA_PAIRS],
 ) -> usize {
     debug_assert!(
         changed_f & !set_f == 0 && changed_e & !set_e == 0,
@@ -212,13 +221,13 @@ fn emit_partners(
     mut partners: u64,
     partner_off: usize,
     square_flip: usize,
-    out: &mut [u32; MAX_ACTIVE_PAIRS],
+    out: &mut [u32; MAX_DELTA_PAIRS],
     n: &mut usize,
 ) {
     while partners != 0 {
         let t = pop_lsb(&mut partners);
         let other = pawn_id(t, partner_off, square_flip);
-        debug_assert!(*n < MAX_ACTIVE_PAIRS, "too many pawn-pair features");
+        debug_assert!(*n < MAX_DELTA_PAIRS, "too many pawn-pair changes for one move");
         out[*n] = pair_index(id, other) as u32;
         *n += 1;
     }
@@ -312,8 +321,8 @@ mod tests {
                     for mirrored in [false, true] {
                         let before = full(old_wp, old_bp, pov, mirrored);
                         let after = full(new_wp, new_bp, pov, mirrored);
-                        let mut subs = [0u32; MAX_ACTIVE_PAIRS];
-                        let mut adds = [0u32; MAX_ACTIVE_PAIRS];
+                        let mut subs = [0u32; MAX_DELTA_PAIRS];
+                        let mut adds = [0u32; MAX_DELTA_PAIRS];
                         let (ns, na) = collect_delta_for_pov(
                             old_wp, old_bp, new_wp, new_bp, pov, mirrored, &mut subs, &mut adds,
                         );
@@ -337,6 +346,79 @@ mod tests {
             }
         }
         assert!(checked > 1000, "only {checked} cases checked");
+    }
+
+    /// Reachable structures with more active pairs than the old capacity of 64: the full
+    /// enumeration aborted the engine on them. Both counts, and the delta of every legal
+    /// move against the full enumerations.
+    #[test]
+    fn crowded_pawn_structures_fit_the_capacity() {
+        use crate::movegen;
+        use crate::types::{ArrayBuf, Move};
+        use std::collections::BTreeSet;
+
+        for (fen, expected) in [
+            ("k7/3pp2p/3pp2P/2PpP3/2PpP1p1/3PP3/3P4/K7 w - - 0 1", 71),
+            ("4k3/2pp3p/2pp3p/2pp4/2PP4/2PP3P/2PP3P/4K3 w - - 0 1", 72),
+        ] {
+            let mut pos = Position::from_fen(fen).unwrap();
+            let full = |pos: &Position, pov: usize, mirrored: bool| -> BTreeSet<u32> {
+                let mut feats = [0u32; MAX_ACTIVE_PAIRS];
+                let n = collect_for_pov(
+                    pos.pieces[Piece::WHITE_PAWN.index()],
+                    pos.pieces[Piece::BLACK_PAWN.index()],
+                    pov,
+                    mirrored,
+                    &mut feats,
+                );
+                assert_eq!(n, expected, "{fen} pov {pov} mirrored {mirrored}");
+                feats[..n].iter().copied().collect()
+            };
+            for pov in 0..2 {
+                for mirrored in [false, true] {
+                    assert_eq!(full(&pos, pov, mirrored).len(), expected);
+                }
+            }
+
+            let old_wp = pos.pieces[Piece::WHITE_PAWN.index()];
+            let old_bp = pos.pieces[Piece::BLACK_PAWN.index()];
+            let mut buf = ArrayBuf::<Move, 256>::new();
+            let n_moves = movegen::generate_legal_moves(&pos, &mut buf);
+            for i in 0..n_moves {
+                let mv = buf[i];
+                pos.make_move(mv);
+                let new_wp = pos.pieces[Piece::WHITE_PAWN.index()];
+                let new_bp = pos.pieces[Piece::BLACK_PAWN.index()];
+                for pov in 0..2 {
+                    for mirrored in [false, true] {
+                        let after = {
+                            let mut feats = [0u32; MAX_ACTIVE_PAIRS];
+                            let n = collect_for_pov(new_wp, new_bp, pov, mirrored, &mut feats);
+                            feats[..n].iter().copied().collect::<BTreeSet<u32>>()
+                        };
+                        let before = {
+                            let mut feats = [0u32; MAX_ACTIVE_PAIRS];
+                            let n = collect_for_pov(old_wp, old_bp, pov, mirrored, &mut feats);
+                            feats[..n].iter().copied().collect::<BTreeSet<u32>>()
+                        };
+                        let mut subs = [0u32; MAX_DELTA_PAIRS];
+                        let mut adds = [0u32; MAX_DELTA_PAIRS];
+                        let (ns, na) = collect_delta_for_pov(
+                            old_wp, old_bp, new_wp, new_bp, pov, mirrored, &mut subs, &mut adds,
+                        );
+                        let mut inc = before.clone();
+                        for f in &subs[..ns] {
+                            assert!(inc.remove(f), "{fen} {mv:?}: sub of an inactive pair");
+                        }
+                        for &f in &adds[..na] {
+                            assert!(inc.insert(f), "{fen} {mv:?}: add of an active pair");
+                        }
+                        assert_eq!(inc, after, "{fen} {mv:?} pov {pov} mirrored {mirrored}");
+                    }
+                }
+                pos.unmake_move(mv);
+            }
+        }
     }
 
     #[test]

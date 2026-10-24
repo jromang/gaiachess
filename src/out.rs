@@ -18,7 +18,12 @@ macro_rules! out {
     ($($arg:tt)*) => { $crate::out::line(format!($($arg)*)) };
 }
 
-/// A line of diagnostics: `info string`, load failures, anything a GUI may ignore.
+/// A line of diagnostics: anything a GUI may ignore, for a person reading stderr.
+///
+/// Not for what an option or a load came to — a network or tables that failed to load,
+/// a hash that could not be allocated: the GUI sent the command and must see its
+/// outcome, and some (ChessBase) never read stderr at all. Those are `info string`
+/// lines of protocol, through [`out!`].
 #[macro_export]
 macro_rules! outerr {
     () => { $crate::out::diagnostic(String::new()) };
@@ -90,13 +95,17 @@ mod imp {
     static STDOUT: Mutex<()> = Mutex::new(());
     static STDERR: Mutex<()> = Mutex::new(());
 
+    /// Write errors are dropped, here and below: once the GUI has closed its end of the
+    /// pipe there is nobody left to tell, and `println!` would panic on the broken pipe
+    /// — an abort, with a core dump the size of the hash table.
     pub fn line(s: String) {
         log_line("<<", &s);
         let _guard = STDOUT.lock().unwrap_or_else(|e| e.into_inner());
-        println!("{s}");
+        let mut stdout = std::io::stdout().lock();
+        let _ = writeln!(stdout, "{s}");
         // Windows pipes are block-buffered; a GUI reads UCI a line at a time and
         // will sit on an unflushed `info` until the 8 KiB buffer fills.
-        let _ = std::io::stdout().flush();
+        let _ = stdout.flush();
     }
 
     /// Write a group of protocol lines without allowing another producer to interleave.
@@ -114,8 +123,9 @@ mod imp {
     pub fn diagnostic(s: String) {
         log_line("<<", &s);
         let _guard = STDERR.lock().unwrap_or_else(|e| e.into_inner());
-        eprintln!("{s}");
-        let _ = std::io::stderr().flush();
+        let mut stderr = std::io::stderr().lock();
+        let _ = writeln!(stderr, "{s}");
+        let _ = stderr.flush();
     }
 }
 

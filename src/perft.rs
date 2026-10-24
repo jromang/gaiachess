@@ -55,8 +55,12 @@ pub fn perft(pos: &mut Position, depth: u32) -> u64 {
 
 /// [Divide](https://www.chessprogramming.org/Perft#Divide): run perft split by
 /// root move. Prints node count per move, useful for debugging move generation
-/// by comparing with a reference engine (`go perft`).
-pub fn divide(pos: &mut Position, depth: u32) {
+/// by comparing with a reference engine (`go perft`). Returns the total.
+///
+/// Spoken through `out!`, as the UCI loop's `go perft` prints it too; moves are written
+/// the way the position's castling convention wants them, so a Chess960 divide can be
+/// compared move by move.
+pub fn divide(pos: &mut Position, depth: u32) -> u64 {
     let start = Instant::now();
 
     let mut buf: ArrayBuf<Move, MAX_MOVES> = ArrayBuf::new();
@@ -68,7 +72,7 @@ pub fn divide(pos: &mut Position, depth: u32) {
         pos.make_move(m);
         let nodes = if depth <= 1 { 1 } else { perft(pos, depth - 1) };
         pos.unmake_move(m);
-        println!("{}: {}", m.to_uci(), nodes);
+        crate::out!("{}: {}", m.to_uci_960(pos.chess960), nodes);
         total += nodes;
     }
 
@@ -78,10 +82,11 @@ pub fn divide(pos: &mut Position, depth: u32) {
     } else {
         0
     };
-    println!();
-    println!("Nodes: {}", total);
-    println!("Time:  {:.3}s", elapsed.as_secs_f64());
-    println!("NPS:   {}", nps);
+    crate::out!();
+    crate::out!("Nodes: {}", total);
+    crate::out!("Time:  {:.3}s", elapsed.as_secs_f64());
+    crate::out!("NPS:   {}", nps);
+    total
 }
 
 #[cfg(test)]

@@ -559,6 +559,58 @@ fn decompress_embedded() -> &'static NNUEParams {
     materialise(&data, hash)
 }
 
+/// Puts the embedded network back in service if `EvalFile` replaced it: what
+/// `setoption name EvalFile value <internal>`, the option's default, asks for. Returns
+/// whether the network changed, in which case the caller must clear what was learned
+/// with the other one.
+///
+/// Installed like any network, through [`materialise`] — so the name of the shared
+/// image and of the node copies follows, and the sharing policy is respected — rather
+/// than by forgetting the runtime network, which the embedded one may itself be.
+#[cfg(all(feature = "nnue", net_embedded))]
+pub fn load_internal() -> bool {
+    if !matches!(
+        *SOURCE.lock().unwrap_or_else(|e| e.into_inner()),
+        Some(NetSource::File(_))
+    ) {
+        return false;
+    }
+    let data = embedded_file_bytes();
+    let params = materialise(&data, super::integrity::content_hash(&data));
+    // The file's network is left where it is, for the reason given on `load_from_bytes`.
+    RUNTIME_PARAMS.store(
+        params as *const NNUEParams as *mut NNUEParams,
+        Ordering::Release,
+    );
+    *SOURCE.lock().unwrap_or_else(|e| e.into_inner()) = Some(NetSource::Embedded);
+    NETWORK_GENERATION.fetch_add(1, Ordering::Release);
+    refresh_replicas();
+    true
+}
+
+/// Without an embedded network there is nothing to go back to.
+#[cfg(not(all(feature = "nnue", net_embedded)))]
+pub fn load_internal() -> bool {
+    false
+}
+
+/// Checks that `data`, a network read again from where the one in service came from,
+/// is still that network: whole, sound, and with the same weights.
+///
+/// Changing the sharing policy reinstalls the weights from their source, and keeps the
+/// table, the accumulator caches and the generation as they are — which is only right
+/// if the weights are the same. A file replaced since it was loaded would otherwise
+/// swap networks under a warm table without a word, and a truncated one would panic.
+fn check_same_network(data: &[u8], in_service: u64) -> Result<(), String> {
+    super::integrity::verify(data)?;
+    if super::integrity::content_hash(data) != in_service {
+        return Err(String::from(
+            "the network has changed since it was loaded; load it again with EvalFile",
+        ));
+    }
+    Ok(())
+}
+
 /// Change whether the weights are shared with the other engine processes.
 ///
 /// The weights themselves do not change, so the transposition table and the
@@ -574,22 +626,31 @@ pub fn set_shared(enabled: bool) -> Result<NetBacking, String> {
     if policy.load(Ordering::Relaxed) == enabled {
         return backing().ok_or_else(|| String::from("no network loaded yet"));
     }
-    policy.store(enabled, Ordering::Relaxed);
 
+    // Read and checked before anything changes: a refusal leaves the policy and the
+    // backing as they were, so the same request can be made again.
+    let in_service = MASTER_HASH.load(Ordering::Relaxed);
     let source = SOURCE.lock().unwrap_or_else(|e| e.into_inner());
     let data = match source.as_ref() {
         Some(NetSource::File(path)) => {
-            std::fs::read(path).map_err(|e| format!("Failed to re-read {path}: {e}"))?
+            let data = std::fs::read(path).map_err(|e| format!("Failed to re-read {path}: {e}"))?;
+            check_same_network(&data, in_service).map_err(|e| format!("{path}: {e}"))?;
+            data
         }
         #[cfg(all(feature = "nnue", net_embedded))]
-        Some(NetSource::Embedded) => embedded_file_bytes(),
+        Some(NetSource::Embedded) => {
+            let data = embedded_file_bytes();
+            check_same_network(&data, in_service)?;
+            data
+        }
         #[cfg(not(all(feature = "nnue", net_embedded)))]
         Some(NetSource::Embedded) => return Err(String::from("no embedded network")),
         None => return Err(String::from("no network loaded yet")),
     };
     drop(source);
+    policy.store(enabled, Ordering::Relaxed);
 
-    let params = materialise(&data, super::integrity::content_hash(&data));
+    let params = materialise(&data, in_service);
     // The old backing is left where it is, for the reason given on
     // `load_from_bytes`: a search thread may be reading through it.
     RUNTIME_PARAMS.store(
@@ -828,6 +889,24 @@ mod tests {
     }
 
     use super::*;
+
+    /// A network read again to change the sharing policy is accepted only if it is the
+    /// one in service. A file rewritten since `EvalFile` used to be installed without a
+    /// word under the old network's table and caches, and a truncated one panicked.
+    #[test]
+    fn a_reread_network_must_be_the_one_in_service() {
+        let mut data = vec![0u8; NNUE_FILE_SIZE];
+        data[0] = 1;
+        let in_service = super::super::integrity::content_hash(&data);
+        assert_eq!(check_same_network(&data, in_service), Ok(()));
+
+        let mut rewritten = data.clone();
+        rewritten[1] = 2;
+        let refused = check_same_network(&rewritten, in_service).unwrap_err();
+        assert!(refused.contains("EvalFile"), "{refused}");
+
+        assert!(check_same_network(&data[..1000], in_service).is_err());
+    }
 
     /// Lay a linear row out the way the trainer writes the file:
     /// `permuted[j] = original[FILE_PERM[j]]`, in blocks of 8 over 64-groups.

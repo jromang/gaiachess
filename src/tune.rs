@@ -170,7 +170,7 @@ macro_rules! fixed {
 
 tunable! {
     // === Aspiration windows (5) ===
-    /// Initial aspiration window half-width (centipawns).
+    /// Initial aspiration window half-width (search units).
     ASP_INITIAL_DELTA = 14, 5, 40, 2;
     /// Minimum depth to enable aspiration windows.
     ASP_MIN_DEPTH = 6, 2, 8, 1;
@@ -179,22 +179,22 @@ tunable! {
     /// Delta threshold to fall back to full window.
     ASP_FALLBACK_DELTA = 319, 200, 1000, 50;
     /// Widening divisor: `delta += delta / X`.
-    ASP_WIDEN_DIV = 6, 2, 6, 1;
+    ASP_WIDEN_DIV = 6, 2, 10, 1;
 
     // === Reverse futility pruning (3) ===
     /// Maximum depth for reverse futility pruning.
-    RFP_MAX_DEPTH = 14, 4, 16, 1;
-    /// RFP margin per ply (centipawns).
+    RFP_MAX_DEPTH = 14, 4, 20, 1;
+    /// RFP margin per ply (search units).
     RFP_MARGIN = 88, 20, 200, 10;
-    /// RFP minimum margin (centipawns).
+    /// RFP minimum margin (search units).
     RFP_MIN = 15, 0, 100, 5;
     /// RFP ttHit multiplier: reduce the RFP margin multiplier when there is no TT hit.
     RFP_NO_TT_DISCOUNT = 27, 10, 40, 2;
 
     // === Razoring (3) ===
-    /// Razoring base margin (centipawns).
+    /// Razoring base margin (search units).
     RAZOR_BASE = 311, 100, 600, 25;
-    /// Razoring quadratic depth² coefficient (centipawns).
+    /// Razoring quadratic depth² coefficient (search units).
     RAZOR_QUAD = 213, 100, 500, 25;
     /// Razoring alpha max: do not razor in decisive positions.
     RAZOR_ALPHA_MAX = 1767, 512, 4096, 128;
@@ -218,15 +218,15 @@ tunable! {
     // === Futility pruning (3) ===
     /// Maximum depth to apply futility pruning.
     FP_MAX_DEPTH = 11, 4, 16, 1;
-    /// Futility pruning margin per depth (centipawns).
+    /// Futility pruning margin per depth (search units).
     FP_COEFF = 111, 30, 200, 10;
-    /// Futility pruning base margin subtracted (centipawns).
+    /// Futility pruning base margin subtracted (search units).
     FP_BASE = 110, 30, 300, 15;
 
     // === Bad-noisy futility pruning (4) ===
     /// Apply BNFP while lmr_depth in 1024ths of a ply is at most X (~8.9 ply).
     BNFP_DEPTH_LIMIT = 9338, 1024, 16384, 256;
-    /// BNFP base margin added to static eval (centipawns).
+    /// BNFP base margin added to static eval (search units).
     BNFP_BASE = 149, 0, 400, 16;
     /// BNFP margin per 1024ths of lmr_depth.
     BNFP_MULT = 78, 0, 256, 8;
@@ -234,7 +234,8 @@ tunable! {
     BNFP_CAPTURED = 1080, 256, 2048, 64;
 
     // === History pruning (1) ===
-    /// History pruning margin: prune quiets with history < X * depth.
+    /// History pruning margin: prune quiets with
+    /// `history < (X + HIST_PRUNE_DEPTH * depth / 1024) * (depth + improving - 1)`.
     HIST_PRUNE_MARGIN = -3480, -10000, -1000, 500;
     /// History pruning depth gradient: `HIST_PRUNE_MARGIN + X * depth / 1024`.
     HIST_PRUNE_DEPTH = 3566, -5000, 5000, 500;
@@ -242,10 +243,10 @@ tunable! {
     // === Opponent worsening + hindsight (5) ===
     /// Opponent worsening threshold: static_eval + prev_eval > X.
     OW_THRESHOLD = 25, -50, 100, 5;
-    /// RFP bonus when opponent position is worsening (centipawns).
+    /// RFP bonus when opponent position is worsening (search units).
     RFP_OW_BONUS = 8, 0, 100, 5;
     /// Min prior reduction (plies) for hindsight depth++.
-    HINDSIGHT_INC_MIN_R = 2, 2, 5, 1;
+    HINDSIGHT_INC_MIN_R = 2, 1, 5, 1;
     /// Min prior reduction (plies) for hindsight depth--.
     HINDSIGHT_DEC_MIN_R = 2, 1, 4, 1;
     /// Eval sum threshold for hindsight depth--.
@@ -267,15 +268,15 @@ tunable! {
     /// Minimum depth to attempt singular extension.
     SE_MIN_DEPTH = 6, 3, 10, 1;
     /// TT depth margin for SE: `tt_depth >= depth - X`.
-    SE_TT_DEPTH_MARGIN = 3, 1, 6, 1;
-    /// Double extension margin below singular_beta (centipawns).
+    SE_TT_DEPTH_MARGIN = 3, 1, 8, 1;
+    /// Double extension margin below singular_beta (search units).
     SE_DOUBLE_MARGIN = 9, 1, 60, 3;
     /// Double extension depth gradient: `SE_DOUBLE_MARGIN + X * depth / 1024`.
     SE_DOUBLE_DEPTH = -46, -120, 60, 5;
-    /// Triple extension margin below singular_beta (centipawns).
+    /// Triple extension margin below singular_beta (search units).
     SE_TRIPLE_MARGIN = 114, 30, 300, 15;
     /// Triple extension depth gradient: `SE_TRIPLE_MARGIN + X * depth / 1024`.
-    SE_TRIPLE_DEPTH = 143, -200, 200, 20;
+    SE_TRIPLE_DEPTH = 143, -200, 400, 20;
     /// Max cumulative double+ extensions along a path.
     SE_MAX_DOUBLE_EXT = 9, 2, 12, 1;
     /// Extra depth-proportional SE margin on ex-PV nodes (tt_pv && !PV).
@@ -303,7 +304,7 @@ tunable! {
 
     // === Null move pruning (5) ===
     /// Minimum depth for null move pruning.
-    NMP_MIN_DEPTH = 5, 2, 6, 1;
+    NMP_MIN_DEPTH = 5, 2, 8, 1;
     /// Base null move reduction.
     NMP_BASE_R = 4, 2, 8, 1;
     /// Depth divisor: `depth / X` added to R.
@@ -328,8 +329,8 @@ tunable! {
 
     // === ProbCut (3) ===
     /// Minimum depth for ProbCut pruning.
-    PROBCUT_MIN_DEPTH = 7, 3, 8, 1;
-    /// ProbCut beta margin (centipawns above beta). The references sit around a
+    PROBCUT_MIN_DEPTH = 7, 3, 10, 1;
+    /// ProbCut beta margin (search units above beta). The references sit around a
     /// pawn or more; at 170 a rook-for-knight sacrifice was cut on the strength
     /// of the recapture alone, the follow-up never searched.
     PROBCUT_MARGIN = 218, 100, 500, 20;
@@ -347,11 +348,11 @@ tunable! {
     LMR_LOG_MUL = 630, 256, 1280, 40;
     /// Constant offset added to the LMR log-log term (1/1024 ply).
     LMR_LOG_BASE = -83, -512, 512, 32;
-    /// Quiet move base penalty (centipawns).
+    /// Quiet move base penalty (1/1024 ply).
     LMR_QUIET_BASE = 1691, 1000, 3000, 100;
     /// Quiet history: `X * combined_history / 1024` subtracted.
-    LMR_QUIET_HIST_MUL = 90, 50, 400, 20;
-    /// Capture base penalty (centipawns).
+    LMR_QUIET_HIST_MUL = 90, 0, 400, 20;
+    /// Capture base penalty (1/1024 ply).
     LMR_CAPTURE_BASE = 1087, 500, 2500, 100;
     /// Capture history: `X * cap_hist / 1024` subtracted.
     LMR_CAPTURE_HIST_MUL = 169, 30, 300, 15;
@@ -360,7 +361,7 @@ tunable! {
     /// TT PV score bonus: `X * (tt_score > alpha)`.
     LMR_TTPV_SCORE_MUL = 441, 200, 1200, 50;
     /// TT PV depth bonus: `X * (tt_depth >= depth)`.
-    LMR_TTPV_DEPTH_MUL = 1312, 300, 1500, 60;
+    LMR_TTPV_DEPTH_MUL = 1312, 300, 3000, 60;
     /// TT PV depth-linear term: `X * depth`.
     LMR_TTPV_DEPTH_LIN = 20, 0, 64, 8;
     /// Cut node depth gradient: `X * depth / 1024` (the flat part lives in the factorized term).
@@ -372,9 +373,9 @@ tunable! {
     /// Max not-improving penalty.
     /// Cap on the not-improving magnitude term. 1080 = the former 1300 less the
     /// 220 flat part that moved into the factorized intercept.
-    LMR_NOT_IMPROVING_MAX = 888, 500, 2500, 100;
+    LMR_NOT_IMPROVING_MAX = 888, 0, 2500, 100;
     /// Bad TT score penalty added to R.
-    LMR_BAD_TT_SCORE = 247, 200, 1200, 50;
+    LMR_BAD_TT_SCORE = 247, 0, 1200, 50;
     /// LMR penalty when TT depth is shallower than current depth (1/1024 ply).
     /// A shallow TT entry is weaker evidence for the move, so reduce it more.
     LMR_TT_SHALLOW_DEPTH = 154, 50, 800, 40;
@@ -402,13 +403,13 @@ tunable! {
     LMR_TTM_CAPTURE = 1079, -1024, 1536, 64;
     /// Reduce less for a killer move (reference: -1084 on both killers, never
     /// the countermove — the exclusion is deliberate there).
-    LMR_KILLER_SUB = 40, 0, 2048, 64;
+    LMR_KILLER_SUB = 40, -1024, 2048, 64;
     /// Parent reduction fed back into the child's reduction, in 1/1024 ply per
     /// ply the parent was reduced (reference: +199).
     LMR_PARENT_RED_MUL = 50, -256, 512, 24;
     /// Extra reduction for captures the picker already ranked as losing (T35;
     /// the reference gives noisy moves a flat base, 2896 against 188).
-    LMR_BADCAP_EXTRA = 163, 0, 4096, 128;
+    LMR_BADCAP_EXTRA = 163, -1024, 4096, 128;
 
     /// Reduce more for every time alpha was raised at this node (1/1024 ply
     /// per raise): once the node has found improvements, the rest is late.
@@ -419,7 +420,7 @@ tunable! {
     // ply; positive reduces more. Seeded with the reference values.
     LMR_F_BASE = 141, -3072, 3072, 128;
     LMR_F_PV = -161, -3072, 3072, 128;
-    LMR_F_CUTNODE = 2576, -3072, 3072, 128;
+    LMR_F_CUTNODE = 2576, -3072, 4096, 128;
     LMR_F_IMPROVING = -242, -3072, 3072, 128;
     LMR_F_TTMOVE = -95, -3072, 3072, 128;
     LMR_F_TTPV = -257, -3072, 3072, 128;
@@ -442,7 +443,6 @@ tunable! {
     LMR_F_IMPROVING_TTPV = -36, -3072, 3072, 128;
     LMR_F_IMPROVING_QUIET = 33, -3072, 3072, 128;
     LMR_F_IMPROVING_GIVESCHECK = -305, -3072, 3072, 128;
-    LMR_F_IMPROVING_ROOT = -86, -3072, 3072, 128;
     LMR_F_IMPROVING_FH2 = -118, -3072, 3072, 128;
     LMR_F_TTMOVE_TTPV = 147, -3072, 3072, 128;
     LMR_F_TTMOVE_QUIET = 113, -3072, 3072, 128;
@@ -486,17 +486,13 @@ tunable! {
     LMR_F_IMPROVING_TTMOVE_TTPV = 194, -3072, 3072, 128;
     LMR_F_IMPROVING_TTMOVE_QUIET = -367, -3072, 3072, 128;
     LMR_F_IMPROVING_TTMOVE_GIVESCHECK = 99, -3072, 3072, 128;
-    LMR_F_IMPROVING_TTMOVE_ROOT = 453, -3072, 3072, 128;
     LMR_F_IMPROVING_TTMOVE_FH2 = -111, -3072, 3072, 128;
     LMR_F_IMPROVING_TTPV_QUIET = 130, -3072, 3072, 128;
     LMR_F_IMPROVING_TTPV_GIVESCHECK = -127, -3072, 3072, 128;
     LMR_F_IMPROVING_TTPV_FH2 = 113, -3072, 3072, 128;
     LMR_F_IMPROVING_QUIET_GIVESCHECK = -487, -3072, 3072, 128;
-    LMR_F_IMPROVING_QUIET_ROOT = -449, -3072, 3072, 128;
     LMR_F_IMPROVING_QUIET_FH2 = -58, -3072, 3072, 128;
-    LMR_F_IMPROVING_GIVESCHECK_ROOT = -76, -3072, 3072, 128;
     LMR_F_IMPROVING_GIVESCHECK_FH2 = 76, -3072, 3072, 128;
-    LMR_F_IMPROVING_ROOT_FH2 = 210, -3072, 3072, 128;
     LMR_F_TTMOVE_TTPV_QUIET = -129, -3072, 3072, 128;
     LMR_F_TTMOVE_TTPV_GIVESCHECK = -343, -3072, 3072, 128;
     LMR_F_TTMOVE_TTPV_FH2 = 137, -3072, 3072, 128;
@@ -522,7 +518,7 @@ tunable! {
     /// Deeper tier 2 base: `score > best_score + X` → +2 depth for major tactical moves.
     DEEPER2_BASE = 960, 400, 1200, 50;
     /// Shallower base: `score < best_score + X + reduced_depth`.
-    SHALLOWER_BASE = 22, 0, 30, 3;
+    SHALLOWER_BASE = 22, 0, 60, 3;
 
     // === Qsearch pruning (3) ===
     /// Qsearch futility base: `stand_pat + X` (unified delta + futility).
@@ -533,7 +529,7 @@ tunable! {
     /// (good history relaxes the SEE margin, bad history tightens it)
     QS_SEE_HIST_DIV = 68, 16, 128, 8;
     /// Non-PV qsearch move count limit.
-    QS_MOVE_COUNT_LIMIT = 3, 2, 6, 1;
+    QS_MOVE_COUNT_LIMIT = 3, 2, 10, 1;
 
     // === IIR (1) ===
     /// IIR depth threshold: `depth >= X + 2 * cut_node`.
@@ -560,7 +556,7 @@ tunable! {
 
     // === Move ordering (6) ===
     /// MVV multiplier in capture scoring: `PIECE_VALUE[victim] * X`.
-    MVV_MULTIPLIER = 12, 4, 64, 4;
+    MVV_MULTIPLIER = 12, 1, 64, 4;
     /// Good/bad capture split: base SEE threshold (centipawns, negative).
     GOOD_CAP_BASE = -137, -300, 0, 16;
     /// Good/bad capture split: capture history divisor shifting the threshold.
@@ -662,6 +658,98 @@ mod tests {
     #[test]
     fn test_fixed_defaults() {
         assert_eq!(MOVE_OVERHEAD(), 40);
+    }
+
+    /// Names declared in the `tunable!` and `fixed!` blocks of this file.
+    fn declared_parameters() -> Vec<String> {
+        let text = include_str!("tune.rs");
+        let mut names = Vec::new();
+        let mut inside = false;
+        for line in text.lines() {
+            if line.starts_with("tunable! {") || line.starts_with("fixed! {") {
+                // `fixed! {}` opens and closes on the same line.
+                inside = !line.trim_end().ends_with('}');
+                continue;
+            }
+            if !inside {
+                continue;
+            }
+            if line == "}" {
+                inside = false;
+                continue;
+            }
+            let line = line.trim();
+            if line.starts_with("//") || line.starts_with('#') {
+                continue;
+            }
+            if let Some((name, _)) = line.split_once('=') {
+                let name = name.trim();
+                if !name.is_empty()
+                    && name
+                        .bytes()
+                        .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+                {
+                    names.push(name.to_string());
+                }
+            }
+        }
+        names
+    }
+
+    /// Every `.rs` file under `dir`, recursively.
+    fn rust_sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                rust_sources(&path, out);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    /// Whether `code` calls the getter `name()`: the name as a whole word, followed
+    /// by an opening parenthesis.
+    fn calls(code: &str, name: &str) -> bool {
+        let bytes = code.as_bytes();
+        let is_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+        code.match_indices(name).any(|(i, _)| {
+            let before = i.checked_sub(1).map(|j| bytes[j]);
+            let after = code[i + name.len()..].trim_start().as_bytes().first().copied();
+            !before.is_some_and(is_word) && after == Some(b'(')
+        })
+    }
+
+    /// A parameter nothing reads is a knob SPSA turns for nothing: it spends the
+    /// tuner's budget and reports a value that changes no search. Every declared
+    /// parameter must be called somewhere outside this file (comments excluded).
+    #[test]
+    fn every_parameter_is_read_by_the_engine() {
+        let names = declared_parameters();
+        assert!(names.len() > 80, "the parameter list was not parsed: {names:?}");
+
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        rust_sources(&src, &mut files);
+        let code: String = files
+            .iter()
+            .filter(|p| p.file_name().is_none_or(|n| n != "tune.rs"))
+            .map(|p| {
+                std::fs::read_to_string(p)
+                    .unwrap()
+                    .lines()
+                    .map(|l| l.split_once("//").map_or(l, |(code, _)| code))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let unused: Vec<&String> = names.iter().filter(|n| !calls(&code, n)).collect();
+        assert!(
+            unused.is_empty(),
+            "tunable parameters never read outside tune.rs: {unused:?}"
+        );
     }
 
     #[cfg(feature = "spsa")]

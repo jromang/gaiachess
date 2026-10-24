@@ -221,7 +221,15 @@ fn dfrc_start_fen(rng: &mut Rng) -> String {
 /// Iterative deepening guarantees a valid result from the last completed depth.
 const DATAGEN_SEARCH_DEADLINE: u64 = 10_000; // 10 seconds
 
-fn prepare_datagen_search(td: &mut ThreadData, pos: &Position, limits: &SearchLimits) {
+fn prepare_datagen_search(
+    td: &mut ThreadData,
+    shared: &SharedState,
+    pos: &Position,
+    limits: &SearchLimits,
+) {
+    // Age the table as a search in a game does: the replacement policy weighs an
+    // entry's age, and with a frozen age it keeps entries of earlier moves forever.
+    shared.tt.new_search();
     td.prepare_search(pos, limits);
     // Override: prepare_search gives id!=0 infinite limits, we need real limits
     let game_ply = td.pos.game_ply();
@@ -302,6 +310,18 @@ fn to_viri_outcome(result_white: u8) -> GameOutcome {
     }
 }
 
+/// Whether the game is over by the rules of chess: threefold repetition, or fifty moves
+/// without a capture or a pawn move (checkmate excepted).
+///
+/// Not the search's rule. Inside a search a position met once before is scored as a
+/// draw, since the side that could avoid it is assumed not to; here the position is the
+/// game itself, and a side ahead may repeat once and play on. Calling the game drawn at
+/// the second occurrence gave a draw to games one side was winning.
+fn game_is_drawn(pos: &Position) -> bool {
+    // A ply of 0 is the root's view: only a threefold counts as a repetition.
+    pos.is_draw(0)
+}
+
 /// The two sides each bring their own thread data and shared state, which is what
 /// makes the list long; they are borrowed, not owned, so there is nothing to bundle.
 #[allow(clippy::too_many_arguments)]
@@ -360,7 +380,7 @@ fn play_game(
         };
 
         STOP.store(false, Ordering::Relaxed);
-        prepare_datagen_search(td, &pos, &limits);
+        prepare_datagen_search(td, shared, &pos, &limits);
         search::search(td, shared);
 
         // Per-thread deadline hit: skip this game (position is too tactical for PeSTO)
@@ -396,7 +416,7 @@ fn play_game(
         }
 
         // Check for draws
-        if pos.is_draw(i32::MAX) {
+        if game_is_drawn(&pos) {
             result = 1;
             break;
         }
@@ -454,7 +474,7 @@ fn play_game(
         };
 
         STOP.store(false, Ordering::Relaxed);
-        prepare_datagen_search(td, &pos, &limits);
+        prepare_datagen_search(td, shared, &pos, &limits);
         search::search(td, shared);
 
         // Per-thread deadline hit: skip this game (position too tactical for PeSTO)
@@ -1059,6 +1079,33 @@ mod tests {
     /// The header size is pinned by hand because marlinformat does not export it.
     /// A position costs four bytes, not thirty-two: reading the header size as the
     /// position size made the resume counter seven times too low.
+    /// Twofold is not a draw in a game: 1.Nf3 Nf6 2.Ng1 Ng8 brings the start position
+    /// back once and the game goes on; played twice, it is the third occurrence.
+    #[test]
+    fn a_game_is_drawn_at_the_third_occurrence_not_the_second() {
+        let mut pos = Position::from_fen(STARTPOS).unwrap();
+        let cycle = [
+            Move::new(Square::G1, Square::F3),
+            Move::new(Square::G8, Square::F6),
+            Move::new(Square::F3, Square::G1),
+            Move::new(Square::F6, Square::G8),
+        ];
+        assert!(!game_is_drawn(&pos));
+        for (i, &mv) in cycle.iter().enumerate() {
+            pos.make_move(mv);
+            assert!(!game_is_drawn(&pos), "first cycle, ply {}", i + 1);
+        }
+        for (i, &mv) in cycle.iter().enumerate() {
+            pos.make_move(mv);
+            let last = i + 1 == cycle.len();
+            assert_eq!(game_is_drawn(&pos), last, "second cycle, ply {}", i + 1);
+        }
+
+        // The fifty-move rule still ends the game.
+        let fifty = Position::from_fen("4k3/8/8/8/8/8/8/R3K3 w - - 100 80").unwrap();
+        assert!(game_is_drawn(&fifty));
+    }
+
     #[test]
     fn a_position_costs_four_bytes_not_thirty_two() {
         let path = "data/mini.vf";

@@ -164,6 +164,14 @@ impl Killers {
         }
     }
 
+    /// Forget the killers of one ply. A node calls it for its children's ply on
+    /// entry, so that a killer is always a refutation found under the same parent.
+    #[inline]
+    pub fn clear_ply(&mut self, ply: usize) {
+        debug_assert!(ply <= MAX_PLY, "Killers::clear_ply: ply {} > MAX_PLY", ply);
+        self.table[ply] = [Move::NONE; 2];
+    }
+
     /// Get the two killer moves at a given ply.
     #[inline]
     pub fn get(&self, ply: usize) -> [Move; 2] {

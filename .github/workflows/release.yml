@@ -30,12 +30,21 @@ jobs:
           # full text, so the loss happened past the shell. --notes-file round-trips
           # byte for byte.
           cat > "$RUNNER_TEMP/release-notes.md" <<'NOTES'
-          ## What's new in 4.4.1
+          ## What's new in 4.4.2
 
-          - **New network** `gaianet-t2b-t5`, trained with a new recipe.
-          - **About forty search fixes** (UCI `stop`/`ponderhit`/`go mate`, MultiPV, SEE,
-            quiescence, tablebases).
-          - **GaiaTB tables shared between processes** on Linux, like the network.
+          - **New network** `gaianet-t2b-t6`: the 4.4.1 recipe, trained at full length.
+          - **About 6 % more nodes per second**: threat features are now updated from
+            the move played, on every SIMD tier.
+          - **About fifty fixes** from a second audit of the search and the UCI layer:
+            `stop`, `quit` and `isready` ordering, `go infinite` and `go ponder` with
+            several threads, `go nodes` exact at any thread count, `go perft` and `bench`
+            in the UCI loop, malformed input on stdin, MultiPV, tablebase lines, and
+            several search corrections.
+          - **GUIs no longer see the move under search ahead of the line that contains
+            it**: `currmove` now waits for the same point as the aspiration bound lines.
+          - **ARM64 searches the same tree as x86-64**: the network's last layer now sums
+            in the same order on NEON.
+          - **Displayed scores recalibrated** for the new network.
 
           ## Download
 

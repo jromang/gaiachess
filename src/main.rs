@@ -62,7 +62,7 @@ enum Cmd {
         /// Corpus to read (viriformat .vf)
         #[bpaf(short('i'), long, argument("PATH"))]
         input: std::path::PathBuf,
-        /// Text output: `<FEN> | <score> | <result>`, both white-relative
+        /// Output corpus (viriformat .vf): the same games, white-relative evaluations
         #[bpaf(short('o'), long, argument("PATH"))]
         output: std::path::PathBuf,
         /// Soft node budget per position; hard cap = 100x
@@ -146,9 +146,22 @@ enum Cmd {
         /// Syzygy tablebase path: probe the tables in the tree during the dump, as a game would
         #[bpaf(long)]
         syzygy: Option<String>,
-        /// Load the embedded 3+4 piece DTM tables (GaiaTB), as the UCI loop does after `uciok`
+        /// Accepted for older command lines: GaiaTB is now loaded by default
         #[bpaf(long)]
         gaiatb: bool,
+        /// Do not load the embedded 3+4 piece DTM tables (GaiaTB), which the UCI loop loads
+        /// at the first `isready` or `go`
+        #[bpaf(long)]
+        no_gaiatb: bool,
+        /// Nalimov tablebase paths, as with `setoption name NalimovPath`
+        #[bpaf(long)]
+        nalimov: Option<String>,
+        /// Nalimov cache size in MiB, as with `setoption name NalimovCache` (1-1024)
+        #[bpaf(long)]
+        nalimov_cache: Option<u32>,
+        /// Chess960 mode, as with UCI_Chess960: castling in king-takes-rook notation
+        #[bpaf(long)]
+        chess960: bool,
         /// FEN position or "startpos" (use quotes for multi-word FEN)
         #[bpaf(positional("FEN"))]
         fen: String,
@@ -517,16 +530,29 @@ fn real_main(cmd: Cmd, stdin: ProbedStdin) {
             moves,
             syzygy,
             gaiatb,
+            no_gaiatb,
+            nalimov,
+            nalimov_cache,
+            chess960,
             fen,
         } => {
+            // The dump searches the tree a game would: the tables the UCI loop loads by
+            // default are loaded here by default too.
             #[cfg(feature = "syzygy")]
             if let Some(ref path) = syzygy
                 && !tb::init(path)
             {
                 eprintln!("WARNING: Failed to load Syzygy tablebases from {path}");
             }
+            #[cfg(not(feature = "syzygy"))]
+            if syzygy.is_some() {
+                eprintln!("WARNING: --syzygy requires --features syzygy (ignored)");
+            }
+            if gaiatb && no_gaiatb {
+                eprintln!("WARNING: --gaiatb and --no-gaiatb both given: GaiaTB stays unloaded");
+            }
             #[cfg(all(feature = "gaiatb", gaiatb_embedded))]
-            if gaiatb && !dtm::init() {
+            if !no_gaiatb && !dtm::init() {
                 eprintln!("WARNING: failed to load the embedded GaiaTB tables");
             }
             #[cfg(not(all(feature = "gaiatb", gaiatb_embedded)))]
@@ -534,6 +560,27 @@ fn real_main(cmd: Cmd, stdin: ProbedStdin) {
                 eprintln!(
                     "WARNING: --gaiatb requires --features gaiatb with embedded tables (ignored)"
                 );
+            }
+            #[cfg(feature = "nalimov")]
+            {
+                // The cache first: the prober is built with the size configured at init.
+                if let Some(mb) = nalimov_cache {
+                    nalimov::set_cache_size_mb(mb.clamp(1, 1024));
+                }
+                if let Some(ref paths) = nalimov {
+                    if nalimov::init(paths) {
+                        eprintln!(
+                            "Nalimov tablebases loaded ({}-piece) from {paths}",
+                            nalimov::max_pieces()
+                        );
+                    } else {
+                        eprintln!("WARNING: Failed to load Nalimov tablebases from {paths}");
+                    }
+                }
+            }
+            #[cfg(not(feature = "nalimov"))]
+            if nalimov.is_some() || nalimov_cache.is_some() {
+                eprintln!("WARNING: --nalimov requires --features nalimov (ignored)");
             }
             let opts = dump::DumpOptions {
                 fen,
@@ -546,6 +593,7 @@ fn real_main(cmd: Cmd, stdin: ProbedStdin) {
                 min_record_depth,
                 qs_moves,
                 max_mb,
+                chess960,
             };
             dump::run(&opts);
         }
@@ -608,10 +656,16 @@ fn real_main(cmd: Cmd, stdin: ProbedStdin) {
                 } else {
                     "runtime"
                 };
+                let threats_forced = if d.threats_forced {
+                    " (GAIA_THREATS forced)"
+                } else {
+                    ""
+                };
                 println!(
-                    "SIMD:        {} ({how}), nnz {}{forced}",
+                    "SIMD:        {} ({how}), nnz {}, move threats {}{threats_forced}{forced}",
                     d.tier.name(),
                     d.nnz.name(),
+                    d.threats.name(),
                 );
                 let slider = cpu::effective_attacks();
                 let setwise = if cpu::effective_setwise512() {

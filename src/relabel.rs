@@ -11,23 +11,18 @@
 //! used as a terminal polish gave +25.4. The strongest engines' 2026 gains have the same
 //! shape — their whole training corpus re-scored by a stronger network.
 //!
-//! Output is plain text, one position per line:
+//! Output is viriformat, like the input: every game comes out with the same start
+//! position, the same moves and the same outcome, and only the evaluation stored with
+//! each move changes. The trainer then reads it with `format = viriformat`, through the
+//! same filters as any other corpus — which a list of positions could not offer: the
+//! move played (that `skip_tactical` needs), the ply and the game boundaries would be
+//! lost, and an A/B of new labels against old ones would also be an A/B of filters.
+//! A position the engine cannot score (a FEN it refuses, a search that runs out of
+//! time) keeps the evaluation it came with, so a game is never shortened.
 //!
-//! ```text
-//! <FEN> | <score> | <result>
-//! ```
-//!
-//! deliberately, rather than a binary format. `bullet-utils convert --from text` turns
-//! it into bulletformat, which the trainer reads natively, and a text intermediate can
-//! be read by a human — which matters for a file whose whole purpose is a number per
-//! position. It costs about 67 bytes per position instead of 4.5, so a run is sized in
-//! the tens of millions of positions, not billions: a fine-tune's worth, which is the
-//! scale at which labels have actually been measured to matter here.
-//!
-//! **Both numbers are white-relative**, and that is the trap this file exists to not
-//! fall into again. Viriformat stores white-relative evaluations, bulletformat's text
-//! reader expects white-relative, and our search returns a score from the side to
-//! move's point of view. Writing the search score unchanged flips the target on half
+//! **The evaluations are white-relative**, and that is the trap this file exists to not
+//! fall into again. Viriformat stores white-relative evaluations, and our search
+//! returns a score from the side to move's point of view. Writing the search score unchanged flips the target on half
 //! the positions — invisible in the loss, and it cost this project the whole of gen1v2.
 //! `tools/scripts/fix_vf_eval_sign.py --check` is the probe that catches it. This file
 //! also carries its own: it compares every score it writes with the one already in the
@@ -65,6 +60,8 @@ const SEARCH_DEADLINE_MS: u64 = 10_000;
 
 static POSITIONS_DONE: AtomicU64 = AtomicU64::new(0);
 static GAMES_DONE: AtomicU64 = AtomicU64::new(0);
+/// Positions written with their original evaluation, because no search scored them.
+static POSITIONS_KEPT: AtomicU64 = AtomicU64::new(0);
 static FINISHED: AtomicBool = AtomicBool::new(false);
 
 /// Agreement between the score we write and the one that was already there.
@@ -105,11 +102,6 @@ impl Reader {
         }
         games
     }
-}
-
-/// One position's worth of output, already in the convention the trainer expects.
-fn line(fen: &str, white_score: i32, white_result: f32) -> String {
-    format!("{fen} | {white_score} | {white_result:.1}\n")
 }
 
 /// Re-score `input` into `output`, using `nodes` soft nodes per position.
@@ -181,6 +173,10 @@ pub fn run(input: &Path, output: &Path, nodes: u64, threads: usize, max_position
         done as f64 / seconds,
         output.display(),
     );
+    let kept = POSITIONS_KEPT.load(Ordering::Relaxed);
+    if kept > 0 {
+        println!("relabel: {kept} positions kept their original evaluation (no search score)");
+    }
     report_agreement();
 }
 
@@ -222,7 +218,7 @@ fn worker(id: usize, reader: &Mutex<Reader>, part: &Path, nodes: u64, max_positi
             return;
         }
     };
-    let shared = SharedState::new(1, 1);
+    let mut shared = SharedState::new(1, 1);
     let mut td = Box::new(ThreadData::new(1));
     let limits = SearchLimits::soft_nodes(
         nodes,
@@ -242,74 +238,126 @@ fn worker(id: usize, reader: &Mutex<Reader>, part: &Path, nodes: u64, max_positi
         }
 
         for game in &games {
-            // The outcome is the game's, not ours to revise: we are re-scoring
-            // positions, not replaying the game.
-            let white_result = match game.outcome() {
-                viriformat::dataformat::WDL::Win => 1.0,
-                viriformat::dataformat::WDL::Draw => 0.5,
-                viriformat::dataformat::WDL::Loss => 0.0,
-            };
-
-            let mut fens = Vec::with_capacity(game.len());
-            game.visit_positions(|board, old_eval| fens.push((board.to_string(), old_eval)));
-
-            for (fen, old_eval) in &fens {
-                // Checked per position, not merely per batch: a worker holds sixty-four
-                // games, so a batch-level check alone would overshoot a small run by
-                // more than the run itself.
-                if max_positions > 0 && POSITIONS_DONE.load(Ordering::Relaxed) >= max_positions {
-                    let _ = out.flush();
-                    return;
-                }
-                let Ok(pos) = Position::from_fen(fen) else {
-                    // A position the engine will not accept is not one to guess at.
-                    continue;
-                };
-                STOP.store(false, Ordering::Relaxed);
-                td.prepare_search(&pos, &limits);
-                let game_ply = td.pos.game_ply();
-                td.tm = crate::timeman::TimeManager::new(
-                    &limits,
-                    game_ply,
-                    &mut td.original_time_adjust,
-                );
-                td.search_deadline = SEARCH_DEADLINE_MS;
-                td.datagen_mode = true;
-                search::search(&mut td, &shared);
-
-                let score = td.best_score;
-                if td.stopped || score == SCORE_NONE || score.abs() > SCORE_INFINITE {
-                    continue;
-                }
-                let white_score = if pos.side_to_move == Color::White {
-                    score
-                } else {
-                    -score
-                };
-                debug_assert!(white_score.abs() <= SCORE_INFINITE);
-
-                // Compare with the label already in the file, which is white-relative by
-                // construction. Only where both are decisive: near zero the sign of an
-                // evaluation is noise, and would dilute the very signal being watched.
-                if old_eval.abs() >= SIGN_PROBE_THRESHOLD
-                    && white_score.abs() >= SIGN_PROBE_THRESHOLD
-                {
-                    AGREE_N.fetch_add(1, Ordering::Relaxed);
-                    if old_eval.signum() == white_score.signum() {
-                        AGREE_SAME_SIGN.fetch_add(1, Ordering::Relaxed);
-                    }
-                    AGREE_ABS_DIFF.fetch_add(
-                        (white_score - old_eval).unsigned_abs() as u64,
-                        Ordering::Relaxed,
-                    );
-                }
-                let _ = out.write_all(line(fen, white_score, white_result).as_bytes());
-                POSITIONS_DONE.fetch_add(1, Ordering::Relaxed);
+            // Checked per game, not merely per batch: a worker holds sixty-four games,
+            // so a batch-level check alone would overshoot a small run by more than the
+            // run itself. A game is written whole, so a run stops at most one game per
+            // worker past its target.
+            if max_positions > 0 && POSITIONS_DONE.load(Ordering::Relaxed) >= max_positions {
+                let _ = out.flush();
+                return;
             }
+
+            // A game's labels must not depend on which games this worker saw before it,
+            // and which games a worker sees depends on how the threads race for the
+            // batches: the same file relabelled with another thread count would get
+            // other labels. Datagen clears the same state at every game for the same
+            // reason.
+            shared.clear();
+            td.clear_histories();
+
+            let (relabelled, kept) = relabel_game(game, &mut td, &shared, &limits);
+            debug_assert_eq!(relabelled.len(), game.len());
+            if relabelled.serialise_into(&mut out).is_err() {
+                eprintln!("relabel: worker {id} cannot write {}", part.display());
+                return;
+            }
+            POSITIONS_DONE.fetch_add(game.len() as u64, Ordering::Relaxed);
+            POSITIONS_KEPT.fetch_add(kept, Ordering::Relaxed);
             GAMES_DONE.fetch_add(1, Ordering::Relaxed);
         }
     }
     let _ = out.flush();
+}
+
+/// The same game, the same moves and the same outcome, with each position's evaluation
+/// replaced by this engine's, white-relative. Returns the game and the number of
+/// positions that kept their original evaluation because no search could score them.
+///
+/// The game is rebuilt rather than reduced to a list of positions so that the trainer
+/// reads it through the same loader and the same filters as any other corpus: the move
+/// played (which `skip_tactical` needs), the ply and the game boundaries all survive.
+fn relabel_game(
+    game: &Game,
+    td: &mut ThreadData,
+    shared: &SharedState,
+    limits: &SearchLimits,
+) -> (Game, u64) {
+    let mut positions = Vec::with_capacity(game.len());
+    game.visit_positions(|board, old_eval| positions.push((board.to_string(), old_eval)));
+    debug_assert_eq!(positions.len(), game.len());
+
+    // The header — start position, outcome and all — is carried over as it was: the
+    // outcome is the game's, not ours to revise.
+    let mut out = Game {
+        initial_position: game.initial_position,
+        moves: Vec::with_capacity(game.len()),
+    };
+    let mut kept = 0u64;
+    for ((fen, old_eval), mv) in positions.iter().zip(game.moves()) {
+        let eval = match score_position(fen, td, shared, limits) {
+            Some(white_score) => {
+                sign_probe(*old_eval, white_score);
+                white_score
+            }
+            None => {
+                // A position the engine will not accept, or a search that ran out of
+                // time, is not one to guess at: it keeps the label it came with.
+                kept += 1;
+                *old_eval
+            }
+        };
+        debug_assert!(i16::try_from(eval).is_ok(), "eval {eval} does not fit an i16");
+        out.add_move(mv, eval.clamp(i16::MIN as i32, i16::MAX as i32) as i16);
+    }
+    (out, kept)
+}
+
+/// This engine's white-relative score of `fen`, or `None` if it has none to give.
+fn score_position(
+    fen: &str,
+    td: &mut ThreadData,
+    shared: &SharedState,
+    limits: &SearchLimits,
+) -> Option<i32> {
+    let pos = Position::from_fen(fen).ok()?;
+    STOP.store(false, Ordering::Relaxed);
+    td.prepare_search(&pos, limits);
+    let game_ply = td.pos.game_ply();
+    td.tm = crate::timeman::TimeManager::new(limits, game_ply, &mut td.original_time_adjust);
+    td.search_deadline = SEARCH_DEADLINE_MS;
+    td.datagen_mode = true;
+    // Each position is a new search, aged as one in a game is: the replacement policy
+    // weighs an entry's age.
+    shared.tt.new_search();
+    search::search(td, shared);
+
+    let score = td.best_score;
+    if td.stopped || score == SCORE_NONE || score.abs() > SCORE_INFINITE {
+        return None;
+    }
+    let white_score = if pos.side_to_move == Color::White {
+        score
+    } else {
+        -score
+    };
+    debug_assert!(white_score.abs() <= SCORE_INFINITE);
+    Some(white_score)
+}
+
+/// Compare a new label with the one already in the file, which is white-relative by
+/// construction. Only where both are decisive: near zero the sign of an evaluation is
+/// noise, and would dilute the very signal being watched.
+fn sign_probe(old_eval: i32, white_score: i32) {
+    if old_eval.abs() >= SIGN_PROBE_THRESHOLD && white_score.abs() >= SIGN_PROBE_THRESHOLD {
+        AGREE_N.fetch_add(1, Ordering::Relaxed);
+        if old_eval.signum() == white_score.signum() {
+            AGREE_SAME_SIGN.fetch_add(1, Ordering::Relaxed);
+        }
+        AGREE_ABS_DIFF.fetch_add(
+            (white_score - old_eval).unsigned_abs() as u64,
+            Ordering::Relaxed,
+        );
+    }
 }
 
 /// A line a minute, because a run of this shape is measured in hours and its only
@@ -363,13 +411,47 @@ fn concatenate(parts: &[std::path::PathBuf], output: &Path) {
 mod tests {
     use super::*;
 
-    /// The one convention this file cannot get wrong twice.
+    /// A relabelled game is the same game: start position, moves and outcome as they
+    /// were, through a write and a read. Only the evaluations change, and they are
+    /// white-relative — the one convention this file cannot get wrong twice. White is a
+    /// queen up with Black to move, so every label, whoever is to move, is positive.
     #[test]
-    fn a_line_is_white_relative_and_readable() {
-        assert_eq!(
-            line("8/8/8/8/8/8/8/K6k w - - 0 1", -125, 0.5),
-            "8/8/8/8/8/8/8/K6k w - - 0 1 | -125 | 0.5\n"
-        );
+    fn a_relabelled_game_keeps_its_moves_and_outcome_with_white_relative_labels() {
+        use viriformat::chess::board::{Board, GameOutcome, WinType};
+
+        const OLD_EVAL: i16 = -999;
+        let mut board = Board::new();
+        board
+            .set_from_fen("rnb1kbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR b KQkq - 0 1")
+            .unwrap();
+        let mut game = Game::new(&board);
+        for _ in 0..8 {
+            let mv = board.legal_moves()[0];
+            game.add_move(mv, OLD_EVAL);
+            assert!(board.make_move_simple(mv));
+        }
+        game.set_outcome(GameOutcome::WhiteWin(WinType::Adjudication));
+
+        let shared = SharedState::new(1, 1);
+        let mut td = Box::new(ThreadData::new(1));
+        let limits = SearchLimits::soft_nodes(3_000, 300_000);
+        let (relabelled, kept) = relabel_game(&game, &mut td, &shared, &limits);
+
+        assert_eq!(kept, 0, "every position was scored");
+        assert_eq!(relabelled.initial_position, game.initial_position);
+        assert!(relabelled.moves().eq(game.moves()), "the same moves");
+        assert_eq!(relabelled.outcome(), game.outcome());
+        let mut labels = Vec::new();
+        relabelled.visit_positions(|_, eval| labels.push(eval));
+        assert_eq!(labels.len(), game.len());
+        for (ply, &eval) in labels.iter().enumerate() {
+            assert!(eval > 0, "ply {ply}: white is a queen up, label {eval}");
+        }
+
+        let mut bytes = Vec::new();
+        relabelled.serialise_into(&mut bytes).unwrap();
+        let read = Game::deserialise_from(&mut bytes.as_slice(), Vec::new()).unwrap();
+        assert_eq!(read, relabelled, "the output reads back as viriformat");
     }
 
     /// Black to move, engine says +200 for black: the file must hold −200.

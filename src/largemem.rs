@@ -30,6 +30,17 @@ pub const HUGE_PAGE: usize = 2 * 1024 * 1024;
 /// One gibibyte, the size of an explicit huge page.
 pub const GIGA_PAGE: usize = 1024 * 1024 * 1024;
 
+/// Whether a table of `mb` MiB spread over `nodes` memory nodes is worth 1 GiB pages:
+/// at least eight of them per node.
+///
+/// Compared in mebibytes: in bytes the right-hand side alone is 2³³ per node, which
+/// overflows a 32-bit `usize` (the browser build) and panics in a debug build.
+pub fn wants_giga_pages(mb: usize, nodes: usize) -> bool {
+    const MB_PER_GIGA_PAGE: usize = GIGA_PAGE / (1024 * 1024);
+    debug_assert!(nodes >= 1, "a table lives on at least one node");
+    mb >= nodes.saturating_mul(8 * MB_PER_GIGA_PAGE)
+}
+
 /// How a block ended up backed, for diagnostics.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Backing {
@@ -211,7 +222,7 @@ mod sys {
         // ends: transparent huge pages need the alignment.
         let size = round_up(len, HUGE_PAGE);
         let Some(base) = map(size + HUGE_PAGE, 0) else {
-            outerr!("info string could not allocate {} MB", len >> 20);
+            out!("info string could not allocate {} MB", len >> 20);
             std::process::abort();
         };
         let base_addr = base.as_ptr() as usize;
@@ -398,7 +409,7 @@ mod sys {
         match NonNull::new(p.cast::<u8>()) {
             Some(p) => (p, len, Backing::Small),
             None => {
-                outerr!("info string could not allocate {} MB", len >> 20);
+                out!("info string could not allocate {} MB", len >> 20);
                 std::process::abort();
             }
         }
@@ -442,6 +453,19 @@ mod sys {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Eight 1 GiB pages per node, decided in mebibytes so that no product overflows a
+    /// 32-bit `usize` (it used to, computed in bytes).
+    #[test]
+    fn giga_pages_from_eight_per_node() {
+        assert!(!wants_giga_pages(8_191, 1));
+        assert!(wants_giga_pages(8_192, 1));
+        assert!(!wants_giga_pages(65_535, 8));
+        assert!(wants_giga_pages(65_536, 8));
+        assert!(!wants_giga_pages(16, 1));
+        assert!(!wants_giga_pages(usize::MAX - 1, usize::MAX));
+        assert!(wants_giga_pages(usize::MAX, usize::MAX));
+    }
 
     #[test]
     fn blocks_come_back_zeroed_and_writable() {

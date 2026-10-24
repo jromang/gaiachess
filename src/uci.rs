@@ -4,7 +4,9 @@
 //! them on the main thread. Search uses Lazy SMP: the main thread blocks
 //! during search while the stdin reader thread can still receive `stop`.
 
+use std::collections::BTreeSet;
 use std::io::BufRead;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::mpsc;
 
@@ -67,21 +69,47 @@ static SHOW_CURR_LINE: AtomicBool = AtomicBool::new(false);
 /// blindly would wipe out an event the reader has already seen for this very search.
 /// The counts say which search an event was meant for (see [`arm_search_flags`]).
 static GO_READ: AtomicU64 = AtomicU64::new(0);
-/// The `go` (by [`GO_READ`]) that the last `stop` or `quit` was read after.
-static STOP_READ: AtomicU64 = AtomicU64::new(0);
-/// The `go` (by [`GO_READ`]) that the last `ponderhit` was read after.
-static HIT_READ: AtomicU64 = AtomicU64::new(0);
+/// The `go` (by [`GO_READ`]) whose search the session armed last. The reader acts on
+/// the flags at once only for that one; an event meant for a later `go` waits for it.
+static GO_ARMED: AtomicU64 = AtomicU64::new(0);
+/// The `go`s (by [`GO_READ`]) whose `bestmove` the session has given.
+static GO_DONE: AtomicU64 = AtomicU64::new(0);
+/// Commands queued by the reader that wait for the running search to end — `ucinewgame`
+/// and `setoption` (see [`waits_for_the_search`]) — and that the session has not taken
+/// off the queue yet.
+static ORDERED_PENDING: AtomicU64 = AtomicU64::new(0);
+/// The `go`s (by [`GO_READ`]) a `stop` or `quit` was read after, not armed yet.
+static STOPPED_GOS: Mutex<BTreeSet<u64>> = Mutex::new(BTreeSet::new());
+/// The `go`s (by [`GO_READ`]) a `ponderhit` was read after, not armed yet.
+static HIT_GOS: Mutex<BTreeSet<u64>> = Mutex::new(BTreeSet::new());
+
+/// Records that an event was read after the `go`-th `go`.
+fn note_event(gos: &Mutex<BTreeSet<u64>>, go: u64) {
+    gos.lock().unwrap_or_else(|e| e.into_inner()).insert(go);
+}
+
+/// Whether an event was read after the `go`-th `go`, forgetting it along with every
+/// event of the searches before it, which are over.
+fn take_event(gos: &Mutex<BTreeSet<u64>>, go: u64) -> bool {
+    let mut gos = gos.lock().unwrap_or_else(|e| e.into_inner());
+    let found = gos.contains(&go);
+    *gos = gos.split_off(&(go + 1));
+    debug_assert!(gos.iter().all(|&g| g > go));
+    found
+}
 
 /// Sets STOP and PONDER for the search of the `go`-th `go`, keeping any `stop` or
 /// `ponderhit` the reader has already read after it.
 ///
-/// Lowered first and checked after: the reader records which `go` an event follows
-/// before acting on it, so an event landing between the two steps is seen by the
-/// check, and one landing before the first step is restored by it. An event read
-/// after an earlier `go` belongs to that search and is left behind. Sequentially
-/// consistent throughout, as the argument needs a store then a load to be ordered on
-/// both threads. Without a reader (tests, the browser build) nothing is ever recorded
-/// and the search starts clean, as it always did.
+/// Each event is kept for the exact `go` it was read after: one read after a later
+/// `go`, still in the queue, is not this search's, and one read after an earlier `go`
+/// belonged to a search that is over. Announced first, lowered next, checked last: the
+/// reader notes an event before it looks whether its search is the armed one, so an
+/// event noted before the check is seen by it, and one noted after finds this search
+/// armed and raises the flag itself, after it was lowered. Sequentially consistent
+/// throughout, as the argument needs a store then a load to be ordered on both
+/// threads. Without a reader (tests, the browser build) nothing is ever noted and the
+/// search starts clean, as it always did.
 fn arm_search_flags(go: u64, ponder: bool) {
     arm_flags(go, ponder, &STOP, &PONDER);
 }
@@ -90,12 +118,13 @@ fn arm_search_flags(go: u64, ponder: bool) {
 /// without raising the process-wide STOP under every other test's search.
 fn arm_flags(go: u64, ponder: bool, stop: &AtomicBool, pondering: &AtomicBool) {
     debug_assert!(go > 0, "a search is armed for a go that was counted");
+    GO_ARMED.store(go, Ordering::SeqCst);
     stop.store(false, Ordering::SeqCst);
     pondering.store(ponder, Ordering::SeqCst);
-    if STOP_READ.load(Ordering::SeqCst) >= go {
+    if take_event(&STOPPED_GOS, go) {
         stop.store(true, Ordering::SeqCst);
     }
-    if HIT_READ.load(Ordering::SeqCst) >= go {
+    if take_event(&HIT_GOS, go) {
         pondering.store(false, Ordering::SeqCst);
     }
 }
@@ -147,6 +176,7 @@ const UCI_COMMANDS: &[&str] = &[
     "quit",
     "d",
     "eval",
+    "bench",
 ];
 
 /// Skip unknown leading tokens so `joho debug on` still enables debug.
@@ -171,53 +201,126 @@ fn skill_seed() -> u64 {
 /// only one to read it, or the bytes one reader has buffered are lost to the other.
 ///
 /// `stop` and `quit` set the global STOP flag here, in the reader, so a search stops
-/// even though the main thread is blocked in start_search(). Each `go`, `stop` and
-/// `ponderhit` is counted as well, so the session can tell which search an event was
-/// meant for when it gets round to the `go` (see [`arm_search_flags`]).
+/// even though the main thread is blocked in start_search(). Each `stop` and
+/// `ponderhit` is noted for the `go` it follows as well, so that one read ahead of its
+/// search waits for the session to get round to that `go` (see [`arm_search_flags`]).
 pub fn spawn_stdin_reader() -> mpsc::Receiver<String> {
     let (tx, rx) = mpsc::channel::<String>();
     std::thread::spawn(move || {
-        let stdin = std::io::stdin();
-        for line in stdin.lock().lines() {
-            match line {
-                Ok(l) => {
-                    let tokens: Vec<&str> = l.split_whitespace().collect();
-                    let rest = skip_unknown_prefix(&tokens);
-                    match rest {
-                        ["go", ..] => {
-                            GO_READ.fetch_add(1, Ordering::SeqCst);
-                        }
-                        ["stop", ..] | ["quit", ..] => {
-                            STOP_READ.store(GO_READ.load(Ordering::SeqCst), Ordering::SeqCst);
-                            STOP.store(true, Ordering::SeqCst);
-                        }
-                        ["ponderhit", ..] => {
-                            HIT_READ.store(GO_READ.load(Ordering::SeqCst), Ordering::SeqCst);
-                            PONDER.store(false, Ordering::SeqCst);
-                        }
-                        ["debug", "on", ..] => {
-                            DEBUG.store(true, Ordering::Relaxed);
-                        }
-                        ["debug", "off", ..] => {
-                            DEBUG.store(false, Ordering::Relaxed);
-                        }
-                        ["isready", ..] if crate::threads::SEARCHING.load(Ordering::Relaxed) => {
-                            // Spec: answer immediately without stopping the search.
-                            // Do not queue the line: the session would emit a second readyok.
-                            out!("readyok");
-                            continue;
-                        }
-                        _ => {}
-                    }
-                    if tx.send(l).is_err() {
-                        break;
-                    }
-                }
-                Err(_) => break,
-            }
-        }
+        let flags = ReaderFlags {
+            stop: &STOP,
+            ponder: &PONDER,
+        };
+        read_commands(std::io::stdin().lock(), &tx, &flags);
     });
     rx
+}
+
+/// The search flags the stdin reader acts on: the process-wide ones, or a test's own,
+/// so that a test can feed the reader a `stop` without stopping every other test's
+/// search.
+struct ReaderFlags<'a> {
+    stop: &'a AtomicBool,
+    ponder: &'a AtomicBool,
+}
+
+/// The stdin reader's loop, on any byte source: reads lines until the input ends and
+/// passes each one on to the session.
+///
+/// Lines are read as bytes and decoded leniently. A GUI on Windows may well send its
+/// strings in its own code page — a `SyzygyPath` under a user folder with an
+/// accented name, an `UCI_Opponent` spelt the same way — and a line that is not UTF-8
+/// must cost at most a replacement character, never the reader: without it nothing
+/// reads `stop` any more.
+fn read_commands(mut input: impl BufRead, tx: &mpsc::Sender<String>, flags: &ReaderFlags) {
+    let mut buf = Vec::new();
+    loop {
+        buf.clear();
+        // `read_until` already retries on `Interrupted`; any other error ends the input.
+        match input.read_until(b'\n', &mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+        let line = String::from_utf8_lossy(&buf)
+            .trim_end_matches(['\n', '\r'])
+            .to_owned();
+        debug_assert!(!line.contains('\n'), "one line at a time");
+        if !read_line(line, tx, flags) {
+            return;
+        }
+    }
+    // The end of the input is a `quit` nobody sent: the protocol has no other way to
+    // end a `go infinite` or a `go ponder`, and with stdin gone nothing will ever stop
+    // them. It is not queued, though: the caller deciding whether to open the board
+    // must still see the channel close.
+    read_stop(flags);
+}
+
+/// `stop` or `quit`: noted for the last `go` read, and its search stopped now if it
+/// is the one running — otherwise when the session arms it (see [`arm_search_flags`]).
+fn read_stop(flags: &ReaderFlags) {
+    let go = GO_READ.load(Ordering::SeqCst);
+    note_event(&STOPPED_GOS, go);
+    if GO_ARMED.load(Ordering::SeqCst) == go {
+        flags.stop.store(true, Ordering::SeqCst);
+    }
+}
+
+/// Acts on one line the moment the reader sees it, then queues it for the session.
+/// Returns `false` once the session has gone and nobody will read the queue any more.
+fn read_line(line: String, tx: &mpsc::Sender<String>, flags: &ReaderFlags) -> bool {
+    let tokens: Vec<&str> = line.split_whitespace().collect();
+    let rest = skip_unknown_prefix(&tokens);
+    match rest {
+        ["go", ..] => {
+            GO_READ.fetch_add(1, Ordering::SeqCst);
+        }
+        ["stop", ..] | ["quit", ..] => read_stop(flags),
+        ["ponderhit", ..] => {
+            let go = GO_READ.load(Ordering::SeqCst);
+            note_event(&HIT_GOS, go);
+            if GO_ARMED.load(Ordering::SeqCst) == go {
+                flags.ponder.store(false, Ordering::SeqCst);
+            }
+        }
+        ["debug", "on", ..] => {
+            DEBUG.store(true, Ordering::Relaxed);
+        }
+        ["debug", "off", ..] => {
+            DEBUG.store(false, Ordering::Relaxed);
+        }
+        ["isready", ..] if ready_now() => {
+            // Spec: answer immediately without stopping the search.
+            // Do not queue the line: the session would emit a second readyok.
+            out!("readyok");
+            return true;
+        }
+        tokens if waits_for_the_search(tokens) => {
+            // Counted before it is queued, so an `isready` read next sees it.
+            ORDERED_PENDING.fetch_add(1, Ordering::SeqCst);
+        }
+        _ => {}
+    }
+    tx.send(line).is_ok()
+}
+
+/// Whether the reader may answer `isready` itself instead of queuing it.
+///
+/// Only while a `go` it has read is still waiting for its `bestmove` — queued, being
+/// set up or searching: the session would otherwise answer it only after the search,
+/// and the protocol wants an answer at once. And only when nothing queued has to wait
+/// for that search: a GUI sends `isready` behind `ucinewgame` or a `setoption Hash` to
+/// know when they are done, and answering before the session has even reached them
+/// would send its next `go` into a table still being cleared.
+fn ready_now() -> bool {
+    GO_READ.load(Ordering::SeqCst) > GO_DONE.load(Ordering::SeqCst)
+        && ORDERED_PENDING.load(Ordering::SeqCst) == 0
+}
+
+/// Commands that the session only carries out once the search before them is over, so
+/// that an `isready` behind them must wait for them too.
+fn waits_for_the_search(tokens: &[&str]) -> bool {
+    matches!(tokens, ["ucinewgame", ..] | ["setoption", ..])
 }
 
 /// Main UCI loop. Blocks until `quit`, or until stdin ends.
@@ -279,9 +382,9 @@ impl UciSession {
             static LOADED: AtomicBool = AtomicBool::new(false);
             if !LOADED.swap(true, Ordering::Relaxed) {
                 if crate::dtm::init() {
-                    outerr!("info string GaiaTB loaded (3+4 piece DTM tablebases)");
+                    out!("info string GaiaTB loaded (3+4 piece DTM tablebases)");
                 } else {
-                    outerr!("info string GaiaTB: failed to load embedded tablebases");
+                    out!("info string GaiaTB: failed to load embedded tablebases");
                 }
             }
         }
@@ -320,6 +423,20 @@ impl UciSession {
 
             ["position", rest @ ..] => parse_position(rest, &mut self.pos, self.chess960),
 
+            ["go", "perft", rest @ ..] => {
+                // Counted like any `go`, as the reader counted it: the events read after
+                // the next one must still find their search.
+                self.go_count += 1;
+                match rest.first().and_then(|d| d.parse::<u32>().ok()) {
+                    Some(depth) => {
+                        crate::perft::divide(&mut self.pos.clone(), depth);
+                    }
+                    None => out!("info string go perft needs a depth"),
+                }
+                // No search and no bestmove, but this `go` is over.
+                GO_DONE.store(self.go_count, Ordering::SeqCst);
+            }
+
             ["go", rest @ ..] => {
                 self.ensure_ready();
                 self.forget_other_levels();
@@ -354,6 +471,8 @@ impl UciSession {
                 } else {
                     out!("bestmove {}", best.to_uci_960(self.chess960));
                 }
+                // From here on an `isready` is the session's to answer, in its turn.
+                GO_DONE.store(self.go_count, Ordering::SeqCst);
                 PONDER.store(false, Ordering::Relaxed);
                 // Search statistics summary on stderr (invisible to GUIs)
                 #[cfg(feature = "stats")]
@@ -404,6 +523,28 @@ impl UciSession {
 
             ["eval", ..] => print_eval(&self.pos),
 
+            // `bench [depth] [threads]`, as on the command line. No search of the
+            // session's can be running: it handles one line at a time, and a `go` only
+            // returns with its bestmove. The bench brings its own table and thread data,
+            // so nothing of the session's is touched — but it would search at the
+            // session's skill level, which is the process's: full strength for the run,
+            // so that the node count is the one the bench is checked against.
+            #[cfg(not(target_arch = "wasm32"))]
+            ["bench", args @ ..] => {
+                let depth = args
+                    .first()
+                    .and_then(|d| d.parse::<i32>().ok())
+                    .filter(|&d| d >= 1);
+                let threads = args.get(1).and_then(|t| t.parse::<usize>().ok());
+                let level = crate::skill::level();
+                crate::skill::set(crate::skill::FULL_STRENGTH, skill_seed());
+                crate::bench::run(
+                    depth,
+                    threads.map(|t| t.clamp(1, crate::threads::MAX_THREADS)),
+                );
+                crate::skill::set(level, skill_seed());
+            }
+
             ["quit", ..] => return false,
 
             _ => {}
@@ -430,7 +571,7 @@ impl UciSession {
         out!("option name NormalizeScore type check default true");
         out!("option name Move Overhead type spin default 40 min 0 max 5000");
         out!("option name UseSoftNodes type check default false");
-        out!("option name Debug Log File type string default");
+        out!("option name Debug Log File type string default <empty>");
         out!("option name Clear Hash type button");
         #[cfg(any(target_os = "linux", windows))]
         out!("option name SharedNetwork type check default true");
@@ -485,17 +626,13 @@ fn wait_for_release(ponder_requested: bool, infinite: bool) {
     }
 
     #[cfg(not(target_arch = "wasm32"))]
-    {
-        crate::threads::SEARCHING.store(true, Ordering::Relaxed);
-        while must_hold_bestmove(
-            ponder_requested,
-            infinite,
-            PONDER.load(Ordering::Relaxed),
-            STOP.load(Ordering::Relaxed),
-        ) {
-            std::thread::sleep(std::time::Duration::from_millis(1));
-        }
-        crate::threads::SEARCHING.store(false, Ordering::Relaxed);
+    while must_hold_bestmove(
+        ponder_requested,
+        infinite,
+        PONDER.load(Ordering::Relaxed),
+        STOP.load(Ordering::Relaxed),
+    ) {
+        std::thread::sleep(std::time::Duration::from_millis(1));
     }
 }
 
@@ -517,6 +654,12 @@ pub fn uci_loop(rx: mpsc::Receiver<String>, first: Option<String>) {
     let mut session = UciSession::new();
     let mut pending = first;
     while let Some(line) = pending.take().or_else(|| rx.recv().ok()) {
+        let tokens: Vec<&str> = line.split_whitespace().collect();
+        if waits_for_the_search(skip_unknown_prefix(&tokens)) {
+            // Every line here came through the reader, which counted this one.
+            let before = ORDERED_PENDING.fetch_sub(1, Ordering::SeqCst);
+            debug_assert!(before > 0, "a command was taken off the queue twice");
+        }
         if !session.command(&line) {
             break;
         }
@@ -584,6 +727,15 @@ fn next_val<T: std::str::FromStr>(iter: &mut std::slice::Iter<'_, &str>) -> Opti
     iter.next().and_then(|s| s.parse().ok())
 }
 
+/// Parse the next token as a time in milliseconds, a negative one counting as none left.
+///
+/// A GUI that lets a clock run past zero before it flags — a time margin — sends the
+/// overdraft as it is, `wtime -50`. Read as unsigned it failed to parse, the clock was
+/// taken as absent, and the `go` with no bound left searched until `stop`.
+fn next_ms(iter: &mut std::slice::Iter<'_, &str>) -> Option<u64> {
+    next_val::<i64>(iter).map(|t| t.max(0) as u64)
+}
+
 /// Parse `go` command options into SearchLimits and an optional `searchmoves` filter.
 fn parse_go(tokens: &[&str], pos: &Position) -> (SearchLimits, Vec<Move>) {
     let stm = pos.side_to_move as usize;
@@ -606,10 +758,10 @@ fn parse_go(tokens: &[&str], pos: &Position) -> (SearchLimits, Vec<Move>) {
                         Some(n.saturating_mul(crate::timeman::SOFT_NODES_HARD_FACTOR));
                 }
             }
-            "movetime" => limits.movetime = next_val(&mut iter),
+            "movetime" => limits.movetime = next_ms(&mut iter),
             "mate" => limits.mate = next_val(&mut iter),
-            "wtime" => clocks[Color::White as usize] = next_val(&mut iter),
-            "btime" => clocks[Color::Black as usize] = next_val(&mut iter),
+            "wtime" => clocks[Color::White as usize] = next_ms(&mut iter),
+            "btime" => clocks[Color::Black as usize] = next_ms(&mut iter),
             "winc" => incs[Color::White as usize] = next_val(&mut iter).unwrap_or(0),
             "binc" => incs[Color::Black as usize] = next_val(&mut iter).unwrap_or(0),
             "movestogo" => limits.movestogo = next_val(&mut iter),
@@ -763,7 +915,10 @@ fn parse_setoption(
             USE_SOFT_NODES.store(value.eq_ignore_ascii_case("true"), Ordering::Relaxed);
         }
         "debug log file" => {
-            if let Err(e) = crate::out::set_debug_log(&value) {
+            // The protocol spells an empty string `<empty>`: it closes the log, and
+            // must not open a file of that name.
+            let path = if value == "<empty>" { "" } else { &value };
+            if let Err(e) = crate::out::set_debug_log(path) {
                 out!("info string Debug Log File: {e}");
             }
         }
@@ -773,29 +928,32 @@ fn parse_setoption(
             // The new backing announces itself from where it is installed;
             // only a refusal has to be reported from here.
             if let Err(e) = crate::nnue::network::set_shared(value.eq_ignore_ascii_case("true")) {
-                outerr!("info string SharedNetwork: {e}");
+                out!("info string SharedNetwork: {e}");
             }
         }
         "evalfile" => {
             if value == "<internal>" {
-                outerr!("info string Using default evaluation");
+                // Back to the network built in, if a file had replaced it: the table
+                // and caches were filled by the other one.
+                if crate::nnue::network::load_internal() {
+                    pool.clear();
+                }
+                out!("info string Using default evaluation");
             } else {
                 use crate::nnue::integrity::Provenance;
                 match crate::nnue::network::load_from_file(&value) {
                     Ok(Provenance::Verified) => {
-                        outerr!(
-                            "info string Loaded NNUE network from {value} (integrity verified)"
-                        );
+                        out!("info string Loaded NNUE network from {value} (integrity verified)");
                         pool.clear();
                     }
                     Ok(Provenance::Legacy) => {
-                        outerr!(
+                        out!(
                             "info string Loaded NNUE network from {value} (legacy, no integrity footer)"
                         );
                         pool.clear();
                     }
                     Err(e) => {
-                        outerr!("info string Failed to load network: {e}");
+                        out!("info string Failed to load network: {e}");
                     }
                 }
             }
@@ -805,12 +963,19 @@ fn parse_setoption(
             {
                 if value == "<empty>" {
                     crate::tb::free();
-                } else if !crate::tb::init(&value) {
-                    outerr!("info string Failed to load Syzygy tablebases from {value}");
+                } else {
+                    // Said every time, found or not: a wrong path is otherwise silent,
+                    // and the GUI's user would play on believing the tables are there.
+                    crate::tb::init(&value);
+                    let (wdl, dtz) = crate::tb::file_counts();
+                    out!(
+                        "info string Found {wdl} WDL and {dtz} DTZ tablebase files (up to {}-man).",
+                        crate::tb::max_pieces()
+                    );
                 }
             }
             #[cfg(not(feature = "syzygy"))]
-            outerr!("info string SyzygyPath requires --features syzygy");
+            out!("info string SyzygyPath requires --features syzygy");
         }
         "nalimovpath" => {
             #[cfg(feature = "nalimov")]
@@ -818,16 +983,16 @@ fn parse_setoption(
                 if value == "<empty>" {
                     crate::nalimov::free();
                 } else if !crate::nalimov::init(&value) {
-                    outerr!("info string Failed to load Nalimov tablebases from {value}");
+                    out!("info string Failed to load Nalimov tablebases from {value}");
                 } else {
-                    outerr!(
+                    out!(
                         "info string Nalimov tablebases loaded ({}-piece) from {value}",
                         crate::nalimov::max_pieces()
                     );
                 }
             }
             #[cfg(not(feature = "nalimov"))]
-            outerr!("info string NalimovPath requires --features nalimov");
+            out!("info string NalimovPath requires --features nalimov");
         }
         "clear hash" => {
             pool.clear();
@@ -880,9 +1045,9 @@ fn parse_setoption(
                 if let Ok(mb) = value.parse::<u32>() {
                     let mb = mb.clamp(1, 1024);
                     if crate::nalimov::set_cache_size_mb(mb) {
-                        outerr!("info string Nalimov cache set to {mb} MiB");
+                        out!("info string Nalimov cache set to {mb} MiB");
                     } else {
-                        outerr!("info string Failed to resize Nalimov cache to {mb} MiB");
+                        out!("info string Failed to resize Nalimov cache to {mb} MiB");
                     }
                 }
             }
@@ -892,13 +1057,13 @@ fn parse_setoption(
             {
                 let enabled = value.eq_ignore_ascii_case("true");
                 crate::online_tb::set_enabled(enabled);
-                outerr!(
+                out!(
                     "info string OnlineTB {}",
                     if enabled { "enabled" } else { "disabled" }
                 );
             }
             #[cfg(not(feature = "online-tb"))]
-            outerr!("info string OnlineTB requires --features online-tb");
+            out!("info string OnlineTB requires --features online-tb");
         }
         _ => {
             #[cfg(feature = "spsa")]
@@ -906,7 +1071,7 @@ fn parse_setoption(
                 if let Ok(v) = value.parse::<i32>()
                     && crate::tune::set_param(&name, v)
                 {
-                    outerr!("info string set {} = {}", name, v);
+                    out!("info string set {} = {}", name, v);
                 }
             }
         }
@@ -937,8 +1102,13 @@ fn print_board(pos: &Position) {
 
 /// Print evaluation breakdown (debug command `eval`).
 fn print_eval(pos: &Position) {
-    let pesto_score = eval::evaluate(pos);
-    out!("PeSTO eval: {} cp (white POV)", pesto_score);
+    // Same point of view as the network's line below, and the same refusal in check:
+    // the static evaluation is not defined there.
+    if pos.checkers == 0 {
+        out!("PeSTO eval: {} cp (STM POV)", eval::evaluate(pos));
+    } else {
+        out!("PeSTO eval: N/A (in check)");
+    }
 
     if nnue::network::has_network() {
         let mut net = nnue::Network::new();
@@ -1077,6 +1247,129 @@ mod tests {
         assert_eq!(sessions, 2, "expected two session markers: {text}");
     }
 
+    /// A `SyzygyPath` is answered whatever it found: a wrong path used to load nothing
+    /// without a word, its failure branch being dead. A network that fails to load says
+    /// so too.
+    #[cfg(feature = "syzygy")]
+    #[test]
+    fn options_that_load_say_what_they_loaded() {
+        let _guard = lock_transcript();
+        let text = transcript(
+            "syzygy",
+            &[
+                "setoption name SyzygyPath value /nonexistent/gaiachess/syzygy",
+                "setoption name EvalFile value /nonexistent/gaiachess/net.bin",
+            ],
+        );
+        assert!(
+            text.contains("Found 0 WDL and 0 DTZ tablebase files (up to 0-man)."),
+            "{text}"
+        );
+        assert!(text.contains("Failed to load network"), "{text}");
+        assert_eq!(crate::tb::max_pieces(), 0);
+    }
+
+    /// `go perft N` counts the move tree, as perft harnesses expect, instead of starting
+    /// a search that only `stop` would end; Chess960 castles are written as the GUI
+    /// writes them.
+    #[test]
+    fn go_perft_divides_instead_of_searching() {
+        let _guard = lock_transcript();
+        let text = transcript("perft", &["position startpos", "go perft 3"]);
+        assert!(text.contains("<< Nodes: 8902"), "{text}");
+        assert!(text.contains("<< e2e4: 600"), "{text}");
+        assert!(!text.contains("bestmove"), "a search was started: {text}");
+
+        let text = transcript(
+            "perft960",
+            &[
+                "setoption name UCI_Chess960 value true",
+                "position fen nrkbnqbr/pppppppp/8/8/8/8/PPPPPPPP/BBNRKQNR w HDhb - 0 1",
+                "go perft 3",
+                "position fen 4k3/8/8/8/8/8/8/R3K2R w KQ - 0 1",
+                "go perft 1",
+            ],
+        );
+        assert!(text.contains("<< Nodes: 8544"), "{text}");
+        assert!(text.contains("<< e1h1: 1"), "{text}");
+        assert!(text.contains("<< e1a1: 1"), "{text}");
+    }
+
+    /// `bench` runs inside a session, at full strength whatever level the session plays
+    /// at, and leaves that level as it found it. It used to be ignored without a word.
+    #[test]
+    fn bench_runs_in_the_session_and_keeps_its_level() {
+        let _guard = lock_transcript();
+        let text = transcript(
+            "bench",
+            &["setoption name Skill Level value 5", "bench 1", "isready"],
+        );
+        assert!(text.contains("<< readyok"), "{text}");
+        assert_eq!(
+            crate::skill::level(),
+            5,
+            "the session's level was not restored"
+        );
+        crate::skill::set(crate::skill::FULL_STRENGTH, 0);
+    }
+
+    /// The PeSTO line of `eval` is from the side to move, as its label says, and is not
+    /// computed in check, where the static evaluation is undefined (a debug build used
+    /// to panic there). The label used to say white's point of view.
+    #[test]
+    fn eval_prints_pesto_from_the_side_to_move() {
+        let _guard = lock_transcript();
+        let pesto = |text: &str| -> i32 {
+            let line = text.lines().find(|l| l.contains("PeSTO eval:")).unwrap();
+            assert!(line.contains("(STM POV)"), "{line}");
+            line.split_whitespace().nth(4).unwrap().parse().unwrap()
+        };
+        // White is a rook down; with black to move the score is black's, so positive.
+        let no_rook = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBN1";
+        let white = transcript(
+            "eval-w",
+            &[&format!("position fen {no_rook} w Qkq - 0 1"), "eval"],
+        );
+        let black = transcript(
+            "eval-b",
+            &[&format!("position fen {no_rook} b Qkq - 0 1"), "eval"],
+        );
+        assert!(pesto(&white) < 0, "{white}");
+        assert!(pesto(&black) > 0, "{black}");
+
+        let check = transcript(
+            "eval-check",
+            &["position startpos moves e2e4 f7f6 d2d4 g7g5 d1h5", "eval"],
+        );
+        assert!(check.contains("PeSTO eval: N/A (in check)"), "{check}");
+    }
+
+    /// `<empty>`, the protocol's empty string and the option's advertised default, closes
+    /// the log. It used to open a file called `<empty>` in the working directory.
+    #[test]
+    fn debug_log_file_empty_closes_the_log() {
+        let _guard = lock_transcript();
+        let path = std::env::temp_dir().join(format!(
+            "gaiachess-uci-log-empty-{}.txt",
+            std::process::id()
+        ));
+        crate::out::set_debug_log(path.to_str().expect("utf-8 temp path")).unwrap();
+        let mut session = UciSession::new();
+        session.command("setoption name Debug Log File value <empty>");
+        crate::out::log_input("after the log was closed");
+        crate::out::set_debug_log("").unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            !std::path::Path::new("<empty>").exists(),
+            "a file named <empty> was created"
+        );
+        assert!(
+            !text.contains("after the log"),
+            "the log stayed open: {text}"
+        );
+    }
+
     /// The debug log and the display options are one set of globals for the whole
     /// process, and the harness runs tests in parallel: without this, one test's capture
     /// swallows another's output, or clears the log out from under it.
@@ -1132,44 +1425,247 @@ mod tests {
             .unwrap_or_else(|| panic!("no score cp line in: {text}"))
     }
 
+    /// The flags a test hands the reader and arms its searches with, in place of the
+    /// process-wide STOP and PONDER.
+    struct TestFlags {
+        stop: AtomicBool,
+        ponder: AtomicBool,
+    }
+
+    impl TestFlags {
+        fn new() -> TestFlags {
+            TestFlags {
+                stop: AtomicBool::new(false),
+                ponder: AtomicBool::new(false),
+            }
+        }
+
+        fn arm(&self, go: u64, ponder: bool) {
+            arm_flags(go, ponder, &self.stop, &self.ponder);
+        }
+
+        fn stopped(&self) -> bool {
+            self.stop.load(Ordering::SeqCst)
+        }
+
+        fn pondering(&self) -> bool {
+            self.ponder.load(Ordering::SeqCst)
+        }
+    }
+
+    /// Puts the reader's bookkeeping back to what a session without a reader sees.
+    fn reset_reader() {
+        GO_READ.store(0, Ordering::SeqCst);
+        GO_ARMED.store(0, Ordering::SeqCst);
+        GO_DONE.store(0, Ordering::SeqCst);
+        ORDERED_PENDING.store(0, Ordering::SeqCst);
+        STOPPED_GOS.lock().unwrap().clear();
+        HIT_GOS.lock().unwrap().clear();
+    }
+
+    /// Feeds `input` to the stdin reader's loop and hands back the lines it queued for
+    /// the session.
+    ///
+    /// The caller must hold [`lock_transcript`]: the reader counts `go`, `stop` and
+    /// `ponderhit` in the process-wide bookkeeping every session reads.
+    fn read_input(input: &[u8], flags: &TestFlags) -> Vec<String> {
+        let (tx, rx) = mpsc::channel();
+        let reader_flags = ReaderFlags {
+            stop: &flags.stop,
+            ponder: &flags.ponder,
+        };
+        read_commands(input, &tx, &reader_flags);
+        drop(tx);
+        rx.iter().collect()
+    }
+
+    /// Hands the reader each line of `lines` as it would read them, but without the end
+    /// of the input that follows them in [`read_input`].
+    fn feed(flags: &TestFlags, lines: &str) -> Vec<String> {
+        let (tx, rx) = mpsc::channel();
+        let reader_flags = ReaderFlags {
+            stop: &flags.stop,
+            ponder: &flags.ponder,
+        };
+        for line in lines.lines() {
+            assert!(read_line(line.to_owned(), &tx, &reader_flags));
+        }
+        rx.try_iter().collect()
+    }
+
+    /// A line that is not UTF-8 — a Windows GUI sending a name in its code page — costs
+    /// a replacement character and nothing else. It used to end the reader: the engine
+    /// quit, or sat in an infinite search that no `stop` could reach any more.
+    #[test]
+    fn a_line_that_is_not_utf8_does_not_end_the_reader() {
+        let _guard = lock_transcript();
+        let flags = TestFlags::new();
+        let lines = read_input(
+            b"setoption name UCI_Opponent value none 2500 human M\xfcller\r\nuci\nd",
+            &flags,
+        );
+        assert_eq!(
+            lines,
+            [
+                "setoption name UCI_Opponent value none 2500 human M\u{fffd}ller",
+                "uci",
+                "d"
+            ]
+        );
+        reset_reader();
+    }
+
+    /// The end of the input stops the last search as a `quit` would, without queuing a
+    /// line: `go infinite` or `go ponder` piped in and the pipe closed used to search for
+    /// ever, as nothing was left to read their `stop`.
+    #[test]
+    fn the_end_of_the_input_stops_the_last_search() {
+        let _guard = lock_transcript();
+        reset_reader();
+        let flags = TestFlags::new();
+
+        // Read ahead of the session: the search is stopped as it is armed.
+        let lines = read_input(b"position startpos\ngo infinite\n", &flags);
+        assert_eq!(
+            lines,
+            ["position startpos", "go infinite"],
+            "no quit is queued"
+        );
+        flags.arm(1, false);
+        assert!(flags.stopped(), "the search was not stopped");
+
+        // While the search runs: stopped on the spot.
+        flags.arm(1, false);
+        assert!(!flags.stopped());
+        assert!(read_input(b"", &flags).is_empty());
+        assert!(flags.stopped(), "the running search was not stopped");
+
+        reset_reader();
+    }
+
     /// A `stop` or `ponderhit` the reader saw before the session reached its `go`
     /// survives the arming of that search, and one meant for an earlier search does not
     /// leak into the next. Used to be erased: `go infinite` then `stop` sent together
     /// left the engine searching for ever.
     #[test]
     fn events_read_ahead_of_their_go_survive_the_arming() {
-        // The counters are read by every session's `go`: keep the transcript tests out.
+        // The bookkeeping is read by every session's `go`: keep the transcript tests out.
         let _guard = lock_transcript();
-        let (stop, ponder) = (AtomicBool::new(false), AtomicBool::new(false));
-        let read = |go: u64, stop: u64, hit: u64| {
-            GO_READ.store(go, Ordering::SeqCst);
-            STOP_READ.store(stop, Ordering::SeqCst);
-            HIT_READ.store(hit, Ordering::SeqCst);
-        };
+        reset_reader();
+        let flags = TestFlags::new();
 
         // go, stop: both read before the session handles the go.
-        read(1, 1, 0);
-        arm_flags(1, false, &stop, &ponder);
-        assert!(stop.load(Ordering::SeqCst), "the stop was meant for this search");
+        feed(&flags, "go infinite\nstop\n");
+        flags.arm(1, false);
+        assert!(flags.stopped(), "the stop was meant for this search");
 
         // That stop belonged to search 1; search 2 starts clean.
-        read(2, 1, 0);
-        arm_flags(2, false, &stop, &ponder);
-        assert!(!stop.load(Ordering::SeqCst), "an earlier search's stop leaked");
+        feed(&flags, "go infinite\n");
+        flags.arm(2, false);
+        assert!(!flags.stopped(), "an earlier search's stop leaked");
 
         // go ponder, ponderhit: the search starts on the clock.
-        read(3, 1, 3);
-        arm_flags(3, true, &stop, &ponder);
-        assert!(!ponder.load(Ordering::SeqCst), "the ponderhit was lost");
-        assert!(!stop.load(Ordering::SeqCst));
+        feed(&flags, "go ponder\nponderhit\n");
+        flags.arm(3, true);
+        assert!(!flags.pondering(), "the ponderhit was lost");
+        assert!(!flags.stopped());
 
         // go ponder with no hit yet: pondering.
-        read(4, 1, 3);
-        arm_flags(4, true, &stop, &ponder);
-        assert!(ponder.load(Ordering::SeqCst));
+        feed(&flags, "go ponder\n");
+        flags.arm(4, true);
+        assert!(flags.pondering());
 
-        // Back to what a session without a reader sees.
-        read(0, 0, 0);
+        reset_reader();
+    }
+
+    /// `isready` is answered by the reader while a `go` it read has no `bestmove` yet,
+    /// unless a command that waits for that search is queued ahead of it. It used to be
+    /// answered only while the search proper ran: too late when written with the `go`,
+    /// and too early ahead of a queued `ucinewgame`.
+    #[test]
+    fn isready_is_answered_at_once_only_when_nothing_queued_waits() {
+        let _guard = lock_transcript();
+        reset_reader();
+        let flags = TestFlags::new();
+
+        // No search: the session answers it, in its turn.
+        assert_eq!(feed(&flags, "isready"), ["isready"]);
+
+        // Written with the go: answered at once, not queued.
+        assert_eq!(
+            feed(&flags, "position startpos\ngo infinite\nisready"),
+            ["position startpos", "go infinite"]
+        );
+
+        // Behind a ucinewgame that waits for the search: after it, by the session.
+        assert_eq!(
+            feed(&flags, "stop\nucinewgame\nisready"),
+            ["stop", "ucinewgame", "isready"]
+        );
+        reset_reader();
+
+        // A plain position behind a ponder search holds nothing back.
+        assert_eq!(
+            feed(&flags, "go ponder\nposition startpos moves e2e4\nisready"),
+            ["go ponder", "position startpos moves e2e4"]
+        );
+
+        // Once the bestmove is out, the session answers again.
+        GO_DONE.store(GO_READ.load(Ordering::SeqCst), Ordering::SeqCst);
+        assert_eq!(feed(&flags, "isready"), ["isready"]);
+        reset_reader();
+    }
+
+    /// An event belongs to the `go` it was read after, and to no other. A `quit` read
+    /// behind two queued searches used to stop both: the first one, which should have run
+    /// to its depth, answered with the first move generated.
+    #[test]
+    fn an_event_read_ahead_stops_only_its_own_search() {
+        let _guard = lock_transcript();
+        reset_reader();
+        let flags = TestFlags::new();
+
+        // go, position, go, quit written in one go: only the second search is stopped.
+        feed(
+            &flags,
+            "go depth 12\nposition startpos moves e2e4\ngo depth 12\nquit",
+        );
+        flags.arm(1, false);
+        assert!(
+            !flags.stopped(),
+            "the quit stopped the search before its go"
+        );
+        flags.arm(2, false);
+        assert!(flags.stopped(), "the quit did not stop its own search");
+        reset_reader();
+
+        // go, stop, go, stop: both searches are stopped.
+        feed(&flags, "go infinite\nstop\ngo infinite\nstop\n");
+        flags.arm(1, false);
+        assert!(flags.stopped());
+        flags.arm(2, false);
+        assert!(flags.stopped());
+        reset_reader();
+
+        // A ponderhit read after the second go leaves the first one pondering.
+        feed(&flags, "go ponder\ngo ponder\nponderhit\n");
+        flags.arm(1, true);
+        assert!(
+            flags.pondering(),
+            "the hit for search 2 ended search 1's ponder"
+        );
+        flags.arm(2, true);
+        assert!(!flags.pondering(), "the hit for search 2 was lost");
+        reset_reader();
+
+        // A stop read after a go still queued leaves the running search alone.
+        feed(&flags, "go infinite\n");
+        flags.arm(1, false);
+        feed(&flags, "go infinite\nstop\n");
+        assert!(!flags.stopped(), "the stop for search 2 stopped search 1");
+        flags.arm(2, false);
+        assert!(flags.stopped());
+        reset_reader();
     }
 
     /// `go infinite` keeps its move until `stop`, whatever ended the search; a ponder
@@ -1178,14 +1674,38 @@ mod tests {
     #[test]
     fn a_bestmove_is_held_until_the_interface_may_have_it() {
         // (ponder requested, infinite, PONDER, STOP) -> held
-        assert!(must_hold_bestmove(false, true, false, false), "infinite waits for stop");
-        assert!(!must_hold_bestmove(false, true, false, true), "stop releases infinite");
-        assert!(must_hold_bestmove(true, false, true, false), "ponder waits for its hit");
-        assert!(!must_hold_bestmove(true, false, false, false), "ponderhit releases it");
-        assert!(!must_hold_bestmove(true, false, true, true), "stop releases a ponder");
-        assert!(must_hold_bestmove(true, true, false, false), "a hit does not end infinite");
-        assert!(!must_hold_bestmove(false, false, false, false), "a bounded go never waits");
-        assert!(!must_hold_bestmove(false, false, true, false), "PONDER alone means nothing");
+        assert!(
+            must_hold_bestmove(false, true, false, false),
+            "infinite waits for stop"
+        );
+        assert!(
+            !must_hold_bestmove(false, true, false, true),
+            "stop releases infinite"
+        );
+        assert!(
+            must_hold_bestmove(true, false, true, false),
+            "ponder waits for its hit"
+        );
+        assert!(
+            !must_hold_bestmove(true, false, false, false),
+            "ponderhit releases it"
+        );
+        assert!(
+            !must_hold_bestmove(true, false, true, true),
+            "stop releases a ponder"
+        );
+        assert!(
+            must_hold_bestmove(true, true, false, false),
+            "a hit does not end infinite"
+        );
+        assert!(
+            !must_hold_bestmove(false, false, false, false),
+            "a bounded go never waits"
+        );
+        assert!(
+            !must_hold_bestmove(false, false, true, false),
+            "PONDER alone means nothing"
+        );
     }
 
     /// A game longer than the 1024 saved states — 1372 plies here — is parsed and
@@ -1198,7 +1718,11 @@ mod tests {
         tokens.extend(game.iter().map(String::as_str));
         let mut pos = Position::from_fen(STARTPOS).unwrap();
         parse_position(&tokens, &mut pos, false);
-        assert_eq!(pos.fullmove_number as usize, 1 + game.len() / 2, "every move was played");
+        assert_eq!(
+            pos.fullmove_number as usize,
+            1 + game.len() / 2,
+            "every move was played"
+        );
         assert!(pos.ply < 512, "history still {} states deep", pos.ply);
 
         let _guard = crate::skill::lock_level();
@@ -1478,6 +2002,25 @@ mod tests {
         let (limits, _) = parse_go(&["mate", "3"], &pos);
         assert_eq!(limits.mate, Some(3));
         assert!(!limits.infinite);
+    }
+
+    /// A clock run past zero is a clock with nothing left, not a clock missing: `go
+    /// wtime -50` used to search until `stop`.
+    #[test]
+    fn a_negative_time_is_no_time_left() {
+        let pos = Position::from_fen(STARTPOS).unwrap();
+        let (limits, _) = parse_go(&["wtime", "-50", "btime", "1000"], &pos);
+        assert_eq!(limits.time, Some(0));
+        assert!(!limits.infinite);
+
+        let (limits, _) = parse_go(&["movetime", "-5"], &pos);
+        assert_eq!(limits.movetime, Some(0));
+        assert!(!limits.infinite);
+
+        // Black to move reads its own clock.
+        let black = Position::from_fen("4k3/8/8/8/8/8/8/4K3 b - - 0 1").unwrap();
+        let (limits, _) = parse_go(&["wtime", "1000", "btime", "-1", "binc", "20"], &black);
+        assert_eq!((limits.time, limits.inc), (Some(0), 20));
     }
 
     #[test]

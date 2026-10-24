@@ -214,7 +214,7 @@ libc. Windows and macOS need nothing extra.
 # Download the default network, the one named by DEFAULT_NET in defaults.conf
 # (all networks: https://huggingface.co/jromanghf/gaiachess-networks)
 curl -L -o nets/gaianet.bin \
-  "https://huggingface.co/jromanghf/gaiachess-networks/resolve/main/gaianet-t2b-t5.bin"
+  "https://huggingface.co/jromanghf/gaiachess-networks/resolve/main/gaianet-t2b-t6.bin"
 
 # Build with the network embedded
 MODEL=nets/gaianet.bin RUSTFLAGS="-C target-cpu=native" cargo build --release --features nnue

@@ -14,26 +14,21 @@
 //!
 //! Lookup tables are computed at compile time.
 //!
-//! **Incremental updates**: `ThreatAccumulator` stores per-ply threat
-//! values. On eval, dirty threats are computed from `AccDelta` (which pieces moved/captured),
-//! enumerating threats only for changed pieces (~2-4) + x-ray sliders (~0-2), instead of
-//! all ~30 pieces. Pawn pairs are re-enumerated from the pawn bitboards (at most 64).
-
-use std::mem::MaybeUninit;
+//! **Incremental updates**: when a move is played (`Network::push`, before `make_move`),
+//! the attacks it creates and destroys are recorded for its ply (`move_threats`). The
+//! record carries no perspective: it is mapped to feature indices and applied when the
+//! ply's accumulator is first needed. Pawn pairs come from the pawn bitboards before
+//! and after the move.
 
 use crate::bitboard::{
-    BISHOP_DELTAS, ROOK_DELTAS, attackers_to, bishop_attacks, init_king_attacks,
-    init_knight_attacks, init_pawn_attacks, king_attacks, knight_attacks, pawn_attacks, pop_lsb,
-    rook_attacks, sliding_attack_otf,
+    BISHOP_DELTAS, ROOK_DELTAS, attackers_to, init_king_attacks, init_knight_attacks,
+    init_pawn_attacks, pop_lsb, sliding_attack_otf,
 };
 use crate::position::Position;
-use crate::types::{
-    ArrayBuf, Color, MT_CASTLING, MT_EN_PASSANT, MT_NORMAL, MT_PROMOTION, Move, Piece, PieceType,
-    Square, pawn_push,
-};
+use crate::types::{ArrayBuf, Color, Piece, Square};
 
-use super::accumulator::AccDelta;
 use super::kernels::dispatch::threat_batch;
+use super::move_threats::{self, MoveThreats};
 use super::network::{self, Aligned, NNUEParams};
 use super::pawn_pairs;
 use super::{L1_SIZE, OUTPUT_BUCKETS, THREAT_FEATURE_COUNT, THREAT_OFFSET};
@@ -335,18 +330,6 @@ fn threat_piece_idx(p: Piece) -> usize {
     (p.0 as usize >> 1) | ((p.0 as usize & 1) << 3)
 }
 
-/// Compute attacks for a given piece from a given square with given occupancy.
-#[inline]
-fn piece_attacks_bb(piece: Piece, sq: Square, occ: u64) -> u64 {
-    match piece.piece_type() {
-        PieceType::Pawn => pawn_attacks(sq, piece.color()),
-        PieceType::Knight => knight_attacks(sq),
-        PieceType::Bishop => bishop_attacks(sq, occ),
-        PieceType::Rook => rook_attacks(sq, occ),
-        PieceType::Queen => bishop_attacks(sq, occ) | rook_attacks(sq, occ),
-        PieceType::King => king_attacks(sq),
-    }
-}
 
 // ============================================================
 // Full threat computation (reference / standalone)
@@ -592,98 +575,15 @@ pub fn compute_full_threats_with(
 }
 
 // ============================================================
-// ThreatAccumulator — per-ply threat state with dirty incremental updates
+// ThreatAccumulator — per-ply threat state
 // ============================================================
 
 /// How many plies `ensure_threats_updated` walks back to find known threats before
 /// it recomputes from scratch. A full recompute costs about four incremental steps
-/// on the bench (~1.0 µs against ~0.25 µs), so a longer chain is not worth replaying.
+/// on the bench (~1.0 µs against ~0.25 µs), so a longer chain is not worth applying.
 pub(super) const THREAT_CHAIN_MAX: usize = 4;
 
-/// What a threat update reads of the board, borrowed from a `Position` or from the
-/// arrays of an intermediate ply rebuilt from the deltas that followed it.
-#[derive(Clone, Copy)]
-pub(super) struct BoardView<'a> {
-    pub(super) pieces: &'a [u64; 12],
-    pub(super) board: &'a [Piece; 64],
-    pub(super) occ: u64,
-    pub(super) king_sq: [Square; 2],
-}
-
-/// The arrays of a ply that no `Position` holds any more, rebuilt from the ply after
-/// it and the delta that separated them.
-#[derive(Clone, Copy)]
-pub(super) struct RebuiltBoard {
-    pieces: [u64; 12],
-    board: [Piece; 64],
-}
-
-impl<'a> BoardView<'a> {
-    pub(super) fn of(pos: &'a Position) -> Self {
-        BoardView {
-            pieces: &pos.pieces,
-            board: &pos.board,
-            occ: pos.occupied(),
-            king_sq: [pos.king_sq(Color::White), pos.king_sq(Color::Black)],
-        }
-    }
-
-    /// Rebuild in `out` the board one ply earlier, before `delta` was played on this
-    /// one. Built in place: a rebuilt board that is first assembled elsewhere and then
-    /// moved into its slot is read back with wide loads right after the narrow stores
-    /// that patched it, and the store-to-load forwarding that fails there cost more
-    /// than the rebuild itself.
-    pub(super) fn rebuild_before_into(
-        &self,
-        delta: &AccDelta,
-        out: &mut MaybeUninit<RebuiltBoard>,
-    ) {
-        debug_assert!(
-            delta.mv != Move::NONE,
-            "a null move has no board to rebuild"
-        );
-        let slot = out.as_mut_ptr();
-        // SAFETY: both arrays are copied whole into the slot before being patched, so
-        // the slot is fully initialised when this returns; nothing reads it before.
-        unsafe {
-            let pieces = std::ptr::addr_of_mut!((*slot).pieces);
-            let board = std::ptr::addr_of_mut!((*slot).board);
-            std::ptr::write(pieces, *self.pieces);
-            std::ptr::write(board, *self.board);
-            undo_move_pieces(&mut *pieces, delta);
-            undo_move_board(&mut *board, delta);
-        }
-    }
-}
-
-impl RebuiltBoard {
-    /// This board as a view; `occ` is the occupancy the delta recorded for it.
-    pub(super) fn view(&self, occ: u64) -> BoardView<'_> {
-        let wk = self.pieces[Piece::new(PieceType::King, Color::White).index()];
-        let bk = self.pieces[Piece::new(PieceType::King, Color::Black).index()];
-        debug_assert!(wk != 0 && bk != 0, "a rebuilt board has lost a king");
-        debug_assert_eq!(
-            occ,
-            self.pieces.iter().fold(0u64, |acc, &bb| acc | bb),
-            "the recorded occupancy disagrees with the rebuilt bitboards"
-        );
-        BoardView {
-            pieces: &self.pieces,
-            board: &self.board,
-            occ,
-            king_sq: [
-                Square(wk.trailing_zeros() as u8),
-                Square(bk.trailing_zeros() as u8),
-            ],
-        }
-    }
-}
-
-/// Per-ply threat accumulator with dirty incremental updates.
-///
-/// Instead of collecting all ~50 features and diffing sorted lists, we enumerate
-/// threats only for the 2-4 pieces that changed (from AccDelta) plus x-ray sliders
-/// whose attack rays pass through changed squares.
+/// Per-ply threat accumulator, with the record of the move that led to it.
 pub struct ThreatAccumulator {
     /// Accumulated threat weight sums per perspective [white, black].
     pub values: Aligned<[[i16; L1_SIZE]; 2]>,
@@ -693,6 +593,8 @@ pub struct ThreatAccumulator {
     pub(super) mirrored: [bool; 2],
     /// Whether each perspective's threats are up-to-date.
     pub accurate: [bool; 2],
+    /// What the move into this ply changed, recorded when it was played.
+    pub(super) moved: MoveThreats,
 }
 
 impl ThreatAccumulator {
@@ -702,6 +604,7 @@ impl ThreatAccumulator {
             psqt: [[0i32; OUTPUT_BUCKETS]; 2],
             mirrored: [false; 2],
             accurate: [false; 2],
+            moved: MoveThreats::new(),
         }
     }
 
@@ -725,39 +628,18 @@ impl ThreatAccumulator {
         }
     }
 
-    /// Incremental update using move delta information.
-    ///
-    /// Enumerates threats only for pieces that changed position (~2-4 pieces)
-    /// plus x-ray sliders (~0-2). Returns false if incremental is not possible
-    /// (caller should fall back to full recompute).
-    ///
-    /// Uses old_occ for ALL removals and new_occ for ALL additions (no sequential
-    /// simulation). Co-removed/co-added piece interactions are handled separately
-    /// to avoid double-counting.
-    pub(super) fn update_incremental(
-        &mut self,
-        params: &NNUEParams,
-        new: &BoardView,
-        old: &BoardView,
-        parent: &ThreatAccumulator,
-        delta: &AccDelta,
-    ) -> bool {
-        let mv = delta.mv;
-        if mv == Move::NONE {
-            return false;
-        }
+    /// Apply the recorded move to the parent's threats. Returns false when a king
+    /// changed half on the way: nothing before it carries over, and the caller
+    /// recomputes from scratch.
+    pub(super) fn apply_moved(&mut self, params: &NNUEParams, parent: &ThreatAccumulator) -> bool {
+        let rec = &self.moved;
 
-        let old_occ = old.occ;
-        let new_occ = new.occ;
-        let king_sq = new.king_sq;
-
-        // Check both perspectives can do incremental. The pair is built in a local and
-        // stored in one write: two byte stores followed by a two-byte reload of the same
-        // field would defeat store-to-load forwarding, and that reload was the single
-        // hottest instruction of the whole update.
+        // The pair is built in a local and stored in one write: two byte stores
+        // followed by a two-byte reload of the same field would defeat store-to-load
+        // forwarding.
         let mut mirrored = [false; 2];
         for pov in 0..2 {
-            let m = king_sq[pov].file() >= 4;
+            let m = rec.king_sq[pov].file() >= 4;
             if !parent.accurate[pov] || parent.mirrored[pov] != m {
                 return false;
             }
@@ -765,90 +647,40 @@ impl ThreatAccumulator {
         }
         self.mirrored = mirrored;
 
-        let old_pieces: &[u64; 12] = old.pieces;
-        let old_board: &[Piece; 64] = old.board;
-
-        // Determine piece changes
-        let mut removes: PieceSet = [(Piece::NONE, Square::NONE); 4];
-        let mut adds: PieceSet = [(Piece::NONE, Square::NONE); 4];
-        let (n_rem, n_add) = piece_changes(delta, &mut removes, &mut adds);
-
-        // Build bitmasks for exclusion and x-ray filtering
-        let mut remove_bb = 0u64;
-        for i in 0..n_rem {
-            remove_bb |= 1u64 << removes[i].1.0;
-        }
-        let mut add_bb = 0u64;
-        for i in 0..n_add {
-            add_bb |= 1u64 << adds[i].1.0;
-        }
-        let changed_sq_bb = remove_bb | add_bb;
-
-        let weights_base = params.ft_threat_weights.0.as_ptr();
-
-        // One enumeration serves both perspectives: an attack is the same fact seen
-        // from either side, only its feature index depends on the side and on the
-        // mirroring of that side's king. Each (attacker, victim) pair found is
-        // therefore mapped twice rather than searched for twice.
+        // One record serves both perspectives: an attack is the same fact seen from
+        // either side, only its feature index depends on the side and on the mirroring
+        // of that side's king. Pairs the feature set leaves out map to no index.
         let mut dirty = DirtyPair::new();
-
-        // === Phase 1: old threats to remove (all with old_occ) ===
-        for i in 0..n_rem {
-            let (piece, sq) = removes[i];
-            let exclude = remove_bb & !(1u64 << sq.0);
-            collect_piece_threats(
-                &mut dirty, &mirrored, piece, sq, old_occ, old_pieces, old_board, false, exclude,
-            );
-        }
-        for i in 0..n_rem {
-            for j in (i + 1)..n_rem {
-                collect_pairwise_threat(
-                    &mut dirty, &mirrored, removes[i], removes[j], old_occ, false,
+        for (list, add) in [(rec.adds(), true), (rec.subs(), false)] {
+            for &e in list {
+                let (att, att_sq, def, def_sq) = move_threats::decode(e);
+                dirty.push_threat(
+                    threat_feature_pair(
+                        &mirrored,
+                        threat_piece_idx(att),
+                        threat_piece_idx(def),
+                        att_sq,
+                        def_sq,
+                    ),
+                    add,
                 );
             }
         }
-
-        // === Phase 2: new threats to add (all with new_occ) ===
-        for i in 0..n_add {
-            let (piece, sq) = adds[i];
-            let exclude = add_bb & !(1u64 << sq.0);
-            collect_piece_threats(
-                &mut dirty, &mirrored, piece, sq, new_occ, new.pieces, new.board, true, exclude,
-            );
-        }
-        for i in 0..n_add {
-            for j in (i + 1)..n_add {
-                collect_pairwise_threat(&mut dirty, &mirrored, adds[i], adds[j], new_occ, true);
-            }
-        }
-
-        // === Phase 3: X-ray slider changes ===
-        collect_xray_changes(
-            &mut dirty,
-            &mirrored,
-            old_occ,
-            new_occ,
-            new.pieces,
-            old_board,
-            new.board,
-            changed_sq_bb,
-        );
 
         // === Pawn pairs: only the pairs touching a changed pawn ===
         // The pairs among untouched pawns are common to the old and new sets;
         // subtracting and re-adding them would move some forty weight rows for
         // nothing, and those rows were most of what an update touched.
-        let old_wp = old_pieces[Piece::WHITE_PAWN.index()];
-        let old_bp = old_pieces[Piece::BLACK_PAWN.index()];
-        let new_wp = new.pieces[Piece::WHITE_PAWN.index()];
-        let new_bp = new.pieces[Piece::BLACK_PAWN.index()];
+        let [old_wp, old_bp] = rec.pawns_before;
+        let [new_wp, new_bp] = rec.pawns_after;
         let pawns_changed = old_wp != new_wp || old_bp != new_bp;
+        let weights_base = params.ft_threat_weights.0.as_ptr();
 
         for pov in 0..2 {
             let d = &mut dirty.by_pov[pov];
             if pawns_changed {
-                let mut pp_subs = [0u32; pawn_pairs::MAX_ACTIVE_PAIRS];
-                let mut pp_adds = [0u32; pawn_pairs::MAX_ACTIVE_PAIRS];
+                let mut pp_subs = [0u32; pawn_pairs::MAX_DELTA_PAIRS];
+                let mut pp_adds = [0u32; pawn_pairs::MAX_DELTA_PAIRS];
                 let (n_subs, n_adds) = pawn_pairs::collect_delta_for_pov(
                     old_wp,
                     old_bp,
@@ -901,190 +733,6 @@ impl ThreatAccumulator {
     }
 }
 
-// ============================================================
-// Feature collection (populate DirtyFeatures for batch apply)
-// ============================================================
-
-/// Collect all threat features involving piece@sq into dirty list.
-///
-/// The position is passed as the pieces of it this needs — occupancy, bitboards, the
-/// side being encoded — rather than as a `&Position`, so the caller can hand it the
-/// old board and the new one in the same call.
-#[allow(clippy::too_many_arguments)]
-fn collect_piece_threats(
-    dirty: &mut DirtyPair,
-    mirrored: &[bool; 2],
-    piece: Piece,
-    sq: Square,
-    occ: u64,
-    pieces: &[u64; 12],
-    board: &[Piece; 64],
-    is_add: bool,
-    exclude_bb: u64,
-) {
-    let piece_idx = threat_piece_idx(piece);
-    let sq_idx = sq.0 as usize;
-    let mask = !(1u64 << sq.0) & !exclude_bb;
-
-    // Threats FROM piece@sq
-    let attacks = piece_attacks_bb(piece, sq, occ);
-    let mut targets = attacks & occ & mask;
-    while targets != 0 {
-        let target_sq = pop_lsb(&mut targets);
-        let target = board[target_sq.index()];
-        if target == Piece::NONE {
-            continue;
-        }
-        dirty.push_threat(
-            threat_feature_pair(
-                mirrored,
-                piece_idx,
-                threat_piece_idx(target),
-                sq_idx,
-                target_sq.0 as usize,
-            ),
-            is_add,
-        );
-    }
-
-    // Threats TO piece@sq
-    let mut attackers = attackers_to(sq, occ, pieces) & mask;
-    while attackers != 0 {
-        let att_sq = pop_lsb(&mut attackers);
-        let att = board[att_sq.index()];
-        if att == Piece::NONE {
-            continue;
-        }
-        dirty.push_threat(
-            threat_feature_pair(
-                mirrored,
-                threat_piece_idx(att),
-                piece_idx,
-                att_sq.0 as usize,
-                sq_idx,
-            ),
-            is_add,
-        );
-    }
-}
-
-/// Collect pairwise threat between two co-removed or co-added pieces.
-fn collect_pairwise_threat(
-    dirty: &mut DirtyPair,
-    mirrored: &[bool; 2],
-    (piece_a, sq_a): (Piece, Square),
-    (piece_b, sq_b): (Piece, Square),
-    occ: u64,
-    is_add: bool,
-) {
-    let idx_a = threat_piece_idx(piece_a);
-    let idx_b = threat_piece_idx(piece_b);
-
-    if piece_attacks_bb(piece_a, sq_a, occ) & (1u64 << sq_b.0) != 0 {
-        dirty.push_threat(
-            threat_feature_pair(mirrored, idx_a, idx_b, sq_a.0 as usize, sq_b.0 as usize),
-            is_add,
-        );
-    }
-    if piece_attacks_bb(piece_b, sq_b, occ) & (1u64 << sq_a.0) != 0 {
-        dirty.push_threat(
-            threat_feature_pair(mirrored, idx_b, idx_a, sq_b.0 as usize, sq_a.0 as usize),
-            is_add,
-        );
-    }
-}
-
-/// Collect x-ray slider changes between old and new occupancy.
-#[allow(clippy::too_many_arguments)]
-fn collect_xray_changes(
-    dirty: &mut DirtyPair,
-    mirrored: &[bool; 2],
-    old_occ: u64,
-    new_occ: u64,
-    new_pieces: &[u64; 12],
-    old_board: &[Piece; 64],
-    new_board: &[Piece; 64],
-    changed_sq_bb: u64,
-) {
-    let bishop_like = new_pieces[Piece::WHITE_BISHOP.index()]
-        | new_pieces[Piece::BLACK_BISHOP.index()]
-        | new_pieces[Piece::WHITE_QUEEN.index()]
-        | new_pieces[Piece::BLACK_QUEEN.index()];
-    let rook_like = new_pieces[Piece::WHITE_ROOK.index()]
-        | new_pieces[Piece::BLACK_ROOK.index()]
-        | new_pieces[Piece::WHITE_QUEEN.index()]
-        | new_pieces[Piece::BLACK_QUEEN.index()];
-
-    let mut affected = 0u64;
-    let mut csq = changed_sq_bb;
-    while csq != 0 {
-        let sq = pop_lsb(&mut csq);
-        affected |= bishop_attacks(sq, 0) & bishop_like;
-        affected |= rook_attacks(sq, 0) & rook_like;
-    }
-    affected &= !changed_sq_bb;
-
-    while affected != 0 {
-        let s_sq = pop_lsb(&mut affected);
-        let slider = new_board[s_sq.index()];
-        debug_assert!(slider != Piece::NONE);
-        let slider_idx = threat_piece_idx(slider);
-
-        let (old_attacks, new_attacks) = match slider.piece_type() {
-            PieceType::Bishop => (bishop_attacks(s_sq, old_occ), bishop_attacks(s_sq, new_occ)),
-            PieceType::Rook => (rook_attacks(s_sq, old_occ), rook_attacks(s_sq, new_occ)),
-            PieceType::Queen => (
-                bishop_attacks(s_sq, old_occ) | rook_attacks(s_sq, old_occ),
-                bishop_attacks(s_sq, new_occ) | rook_attacks(s_sq, new_occ),
-            ),
-            _ => continue,
-        };
-        if old_attacks == new_attacks {
-            continue;
-        }
-
-        // Gained → add
-        let mut gained = (new_attacks & !old_attacks & !changed_sq_bb) & new_occ;
-        while gained != 0 {
-            let target_sq = pop_lsb(&mut gained);
-            let target = new_board[target_sq.index()];
-            if target == Piece::NONE {
-                continue;
-            }
-            dirty.push_threat(
-                threat_feature_pair(
-                    mirrored,
-                    slider_idx,
-                    threat_piece_idx(target),
-                    s_sq.0 as usize,
-                    target_sq.0 as usize,
-                ),
-                true,
-            );
-        }
-
-        // Lost → sub
-        let mut lost = (old_attacks & !new_attacks & !changed_sq_bb) & old_occ;
-        while lost != 0 {
-            let target_sq = pop_lsb(&mut lost);
-            let target = old_board[target_sq.index()];
-            if target == Piece::NONE {
-                continue;
-            }
-            dirty.push_threat(
-                threat_feature_pair(
-                    mirrored,
-                    slider_idx,
-                    threat_piece_idx(target),
-                    s_sq.0 as usize,
-                    target_sq.0 as usize,
-                ),
-                false,
-            );
-        }
-    }
-}
-
 impl Clone for ThreatAccumulator {
     fn clone(&self) -> Self {
         ThreatAccumulator {
@@ -1092,177 +740,8 @@ impl Clone for ThreatAccumulator {
             psqt: self.psqt,
             mirrored: self.mirrored,
             accurate: self.accurate,
+            moved: self.moved,
         }
-    }
-}
-
-// ============================================================
-// Piece change helpers
-// ============================================================
-
-/// Up to four pieces a move takes off the board or puts on it, and how many of the
-/// four are real. Castling is the worst case: two squares vacated, two filled.
-type PieceSet = [(Piece, Square); 4];
-
-/// Fill `removes` and `adds` with what the move took off and put on the board; returns
-/// how many of each. Written where the caller keeps them rather than returned by
-/// value: the copy of a return read the byte-stored entries back with wide loads.
-fn piece_changes(delta: &AccDelta, removes: &mut PieceSet, adds: &mut PieceSet) -> (usize, usize) {
-    let mv = delta.mv;
-    let mt = mv.move_type();
-    let from = mv.from_sq();
-    let to = mv.to_sq();
-    let moved = delta.moved_piece;
-    let captured = delta.captured_piece;
-
-    let mut n_rem = 0;
-    let mut n_add = 0;
-
-    match mt {
-        MT_NORMAL => {
-            removes[n_rem] = (moved, from);
-            n_rem += 1;
-            if captured != Piece::NONE {
-                removes[n_rem] = (captured, to);
-                n_rem += 1;
-            }
-            adds[n_add] = (moved, to);
-            n_add += 1;
-        }
-        MT_PROMOTION => {
-            let pawn = Piece::new(PieceType::Pawn, moved.color());
-            let promo = Piece::new(mv.promo_type(), moved.color());
-            removes[n_rem] = (pawn, from);
-            n_rem += 1;
-            if captured != Piece::NONE {
-                removes[n_rem] = (captured, to);
-                n_rem += 1;
-            }
-            adds[n_add] = (promo, to);
-            n_add += 1;
-        }
-        MT_EN_PASSANT => {
-            let cap_sq = Square((to.0 as i8 - pawn_push(moved.color())) as u8);
-            removes[n_rem] = (moved, from);
-            n_rem += 1;
-            removes[n_rem] = (captured, cap_sq);
-            n_rem += 1;
-            adds[n_add] = (moved, to);
-            n_add += 1;
-        }
-        MT_CASTLING => {
-            let rook = Piece::new(PieceType::Rook, moved.color());
-            let rook_from = to;
-            let king_to = mv.castle_king_to();
-            let rook_to = mv.castle_rook_to();
-
-            if from != king_to {
-                removes[n_rem] = (moved, from);
-                n_rem += 1;
-                adds[n_add] = (moved, king_to);
-                n_add += 1;
-            }
-            if rook_from != rook_to {
-                removes[n_rem] = (rook, rook_from);
-                n_rem += 1;
-                adds[n_add] = (rook, rook_to);
-                n_add += 1;
-            }
-        }
-        _ => {}
-    }
-
-    (n_rem, n_add)
-}
-
-/// Turn the post-move piece bitboards back into the pre-move ones, in place.
-fn undo_move_pieces(pieces: &mut [u64; 12], delta: &AccDelta) {
-    let mv = delta.mv;
-    let mt = mv.move_type();
-    let from = mv.from_sq();
-    let to = mv.to_sq();
-    let moved = delta.moved_piece;
-    let captured = delta.captured_piece;
-
-    match mt {
-        MT_NORMAL => {
-            // Undo: move piece back from to → from
-            pieces[moved.index()] |= 1u64 << from.0;
-            pieces[moved.index()] &= !(1u64 << to.0);
-            if captured != Piece::NONE {
-                pieces[captured.index()] |= 1u64 << to.0;
-            }
-        }
-        MT_PROMOTION => {
-            // Undo: remove promo piece from to, put pawn at from
-            let pawn = Piece::new(PieceType::Pawn, moved.color());
-            let promo = Piece::new(mv.promo_type(), moved.color());
-            pieces[pawn.index()] |= 1u64 << from.0;
-            pieces[promo.index()] &= !(1u64 << to.0);
-            if captured != Piece::NONE {
-                pieces[captured.index()] |= 1u64 << to.0;
-            }
-        }
-        MT_EN_PASSANT => {
-            // Undo: move pawn back, restore captured pawn
-            let cap_sq = Square((to.0 as i8 - pawn_push(moved.color())) as u8);
-            pieces[moved.index()] |= 1u64 << from.0;
-            pieces[moved.index()] &= !(1u64 << to.0);
-            pieces[captured.index()] |= 1u64 << cap_sq.0;
-        }
-        MT_CASTLING => {
-            let rook = Piece::new(PieceType::Rook, moved.color());
-            let king_to = mv.castle_king_to();
-            let rook_from = to;
-            let rook_to = mv.castle_rook_to();
-            if from != king_to {
-                pieces[moved.index()] |= 1u64 << from.0;
-                pieces[moved.index()] &= !(1u64 << king_to.0);
-            }
-            if rook_from != rook_to {
-                pieces[rook.index()] |= 1u64 << rook_from.0;
-                pieces[rook.index()] &= !(1u64 << rook_to.0);
-            }
-        }
-        _ => {}
-    }
-}
-
-/// Turn the post-move mailbox back into the pre-move one, in place.
-fn undo_move_board(board: &mut [Piece; 64], delta: &AccDelta) {
-    let mv = delta.mv;
-    let mt = mv.move_type();
-    let from = mv.from_sq();
-    let to = mv.to_sq();
-    let moved = delta.moved_piece;
-    let captured = delta.captured_piece;
-
-    match mt {
-        MT_NORMAL => {
-            board[from.index()] = moved;
-            board[to.index()] = captured; // NONE if no capture
-        }
-        MT_PROMOTION => {
-            board[from.index()] = Piece::new(PieceType::Pawn, moved.color());
-            board[to.index()] = captured; // NONE if no capture
-        }
-        MT_EN_PASSANT => {
-            let cap_sq = Square((to.0 as i8 - pawn_push(moved.color())) as u8);
-            board[from.index()] = moved;
-            board[to.index()] = Piece::NONE; // EP target was empty before move
-            board[cap_sq.index()] = captured;
-        }
-        MT_CASTLING => {
-            let rook = Piece::new(PieceType::Rook, moved.color());
-            let king_to = mv.castle_king_to();
-            let rook_from = to;
-            let rook_to = mv.castle_rook_to();
-            board[king_to.index()] = Piece::NONE;
-            board[rook_to.index()] = Piece::NONE;
-            board[from.index()] = moved;
-            board[rook_from.index()] = rook;
-        }
-        _ => {}
     }
 }
 
@@ -1275,6 +754,7 @@ mod tests {
     use super::super::L1_SIZE;
     use super::*;
     use crate::position::Position;
+    use crate::types::{MT_CASTLING, MT_EN_PASSANT, Move, PieceType};
 
     /// Interaction-map invariants: slots per attacker are unique, cover 0..types,
     /// and PIECE_TARGET_COUNT = 2 × (non -1 entries).
@@ -1580,6 +1060,33 @@ mod tests {
             net.threat_psqt_for_test(),
             &full_psqt,
             "promo-capture threat psqt"
+        );
+
+        // A reachable structure with 72 active pawn pairs per perspective, more than
+        // the full recompute used to have room for, then a pawn move from it.
+        let mut pos =
+            Position::from_fen("4k3/2pp3p/2pp3p/2pp4/2PP4/2PP3P/2PP3P/4K3 w - - 0 1").unwrap();
+        let mut net = super::super::Network::new();
+        net.refresh(&pos);
+        let mv = Move::new(Square::H3, Square::H4);
+        net.push(mv, &pos);
+        pos.make_move(mv);
+        net.ensure_updated(&pos);
+        net.ensure_threats_updated_for_test(&pos);
+        let (full, full_psqt) = compute_full_threats(&pos);
+        let inc = net.threat_values_for_test();
+        for pov in 0..2 {
+            for j in 0..L1_SIZE {
+                assert_eq!(
+                    inc.0[pov][j], full.0[pov][j],
+                    "crowded pawns pov={pov} idx={j}"
+                );
+            }
+        }
+        assert_eq!(
+            net.threat_psqt_for_test(),
+            &full_psqt,
+            "crowded pawns threat psqt"
         );
 
         let mut pos =

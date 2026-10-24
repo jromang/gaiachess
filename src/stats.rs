@@ -186,8 +186,13 @@ define_stats! {
     fail_high_index: [u64; 64];
     /// Cutoff move category: [tt, good_cap, bad_cap, killer, counter, quiet].
     cutoff_by_cat: [u64; 6];
-    /// Quiet moves skipped by the skip_quiets flag (LMP/FP/history aftermath).
+    /// Generated quiet moves the picker left unyielded once the skip_quiets flag
+    /// (LMP/FP/history aftermath) took effect. `hist/lmp/fp_pruned` count the
+    /// moves that armed the flag, not the moves it skipped.
     quiets_skipped: u64;
+    /// Quiet skips that took effect before the quiets were generated: those
+    /// moves are never counted, only the event.
+    quiet_skips_ungenerated: u64;
 
     /// Qsearch stand-pat beta cutoffs.
     qs_standpat_cutoffs: u64;
@@ -278,10 +283,8 @@ pub fn move_category(
     if m == tt_move {
         return 0;
     }
-    let mt = m.move_type();
-    let is_noisy = mt == MT_PROMOTION
-        || mt == MT_EN_PASSANT
-        || (mt != MT_CASTLING && pos.board[m.to_sq().index()] != Piece::NONE);
+    // The picker's and the search's definition: an under-promotion by a push is quiet.
+    let is_noisy = !crate::movepick::is_quiet(pos, m);
     if is_noisy {
         return if crate::see::see(pos, m, 0) { 1 } else { 2 };
     }
@@ -445,7 +448,11 @@ impl SearchStats {
         let _ = writeln!(out, "{}", prune("lmp_pr", &self.lmp_pruned));
         let _ = writeln!(out, "{}", prune("fp_pr", &self.fp_pruned));
         let _ = writeln!(out, "{}", prune("bnfp_pr", &self.bnfp_pruned));
-        let _ = writeln!(out, "skip_q       {}", self.quiets_skipped);
+        let _ = writeln!(
+            out,
+            "skip_q       {}  (+{} skips before generation)",
+            self.quiets_skipped, self.quiet_skips_ungenerated
+        );
 
         // Singular extensions
         let _ = writeln!(
@@ -599,5 +606,24 @@ mod tests {
         assert!(json.starts_with('{') && json.ends_with('}'));
         assert!(json.contains("\"cutoffs\": 42"));
         assert!(json.contains("\"rfp\": {\"tried\": [0, 0, 0, 0, 0, 0, 0, 0]"));
+    }
+}
+
+#[cfg(all(test, any(feature = "stats", feature = "tree")))]
+mod category_tests {
+    use super::*;
+
+    /// An under-promotion by a push is quiet, as the picker and the search have it;
+    /// a queen promotion and a capturing under-promotion stay noisy.
+    #[test]
+    fn a_push_under_promotion_is_a_quiet_category() {
+        let pos = Position::from_fen("3r4/4P3/8/8/8/8/k7/4K3 w - - 0 1").unwrap();
+        let none = Move::NONE;
+        let knight = Move::new_promotion(Square::E7, Square::E8, PieceType::Knight);
+        assert_eq!(move_category(&pos, knight, none, [none; 2], none), 5);
+        let queen = Move::new_promotion(Square::E7, Square::E8, PieceType::Queen);
+        assert!(matches!(move_category(&pos, queen, none, [none; 2], none), 1 | 2));
+        let takes = Move::new_promotion(Square::E7, Square::D8, PieceType::Knight);
+        assert!(matches!(move_category(&pos, takes, none, [none; 2], none), 1 | 2));
     }
 }

@@ -345,7 +345,7 @@ static void init_indices(void);
 static int probe_wdl(PyrrhicPosition *pos, int *success);
 static int probe_dtz(PyrrhicPosition *pos, int *success);
 int root_probe_wdl(const PyrrhicPosition *pos, bool useRule50, struct TbRootMoves *rm);
-int root_probe_dtz(const PyrrhicPosition *pos, bool hasRepeated, struct TbRootMoves *rm);
+int root_probe_dtz(const PyrrhicPosition *pos, bool hasRepeated, bool rankDtz, struct TbRootMoves *rm);
 static uint16_t probe_root(PyrrhicPosition *pos, int *score, unsigned *results);
 
 static unsigned dtz_to_wdl(int cnt50, int dtz) {
@@ -416,7 +416,7 @@ int tb_probe_root_dtz(
     uint64_t knights,   uint64_t pawns,
     unsigned rule50,    unsigned ep,
     bool turn,          bool hasRepeated,
-    struct TbRootMoves *results) {
+    bool rankDtz,       struct TbRootMoves *results) {
 
     PyrrhicPosition pos = {
         white, black, kings,
@@ -425,7 +425,7 @@ int tb_probe_root_dtz(
         (uint8_t)ep, turn
     };
 
-    return root_probe_dtz(&pos, hasRepeated, results);
+    return root_probe_dtz(&pos, hasRepeated, rankDtz, results);
 }
 
 int tb_probe_root_wdl(
@@ -1895,7 +1895,7 @@ int probe_dtz(PyrrhicPosition *pos, int *success)
 
 // Use the DTZ tables to rank and score all root moves in the list.
 // A return value of 0 means that not all probes were successful.
-int root_probe_dtz(const PyrrhicPosition *pos, bool hasRepeated, struct TbRootMoves *rm)
+int root_probe_dtz(const PyrrhicPosition *pos, bool hasRepeated, bool rankDtz, struct TbRootMoves *rm)
 {
   int v, success;
 
@@ -1936,8 +1936,10 @@ int root_probe_dtz(const PyrrhicPosition *pos, bool hasRepeated, struct TbRootMo
     // Note that moves ranked 900 have dtz + cnt50 == 100, which in rare
     // cases may be insufficient to win as dtz may be one off (see the
     // comments before TB_probe_dtz()).
-    int r =  v > 0 ? (v + cnt50 <= 99 && !hasRepeated ? TB_MAX_DTZ : TB_MAX_DTZ - (v + cnt50))
-           : v < 0 ? (-v * 2 + cnt50 < 100 ? -TB_MAX_DTZ : -TB_MAX_DTZ + (-v + cnt50))
+    // With rankDtz, guaranteed results are ranked by DTZ as well: the shortest
+    // win and the longest loss first, every one still in its certain band.
+    int r =  v > 0 ? (v + cnt50 <= 99 && !hasRepeated && !rankDtz ? TB_MAX_DTZ : TB_MAX_DTZ - (v + cnt50))
+           : v < 0 ? (-v * 2 + cnt50 < 100 ? -TB_MAX_DTZ + (rankDtz ? -v : 0) : -TB_MAX_DTZ + (-v + cnt50))
            : 0;
     m->tbRank = r;
   }

@@ -948,7 +948,7 @@ fn read_directory(blob: &[u8]) -> Option<Vec<Entry>> {
                 0..0
             };
 
-            Some(Entry {
+            let entry = Entry {
                 sig,
                 flags,
                 bits: buf[9],
@@ -956,9 +956,78 @@ fn read_directory(blob: &[u8]) -> Option<Vec<Entry>> {
                 per_stm: u32::from_le_bytes(buf[12..16].try_into().ok()?),
                 total_positions: u32::from_le_bytes(buf[16..20].try_into().ok()?),
                 frames,
-            })
+            };
+            entry.is_well_formed().then_some(entry)
         })
         .collect()
+}
+
+impl Entry {
+    /// Whether the prober can read this table without trusting anything the decoded
+    /// data does not confirm: a signature it can split into the two sides, and, for a
+    /// table with entries, a width that holds every distance and frames to decode.
+    /// The sizes of the decoded sections are checked once they exist, by
+    /// [`check_layout`].
+    fn is_well_formed(&self) -> bool {
+        let sig_ok = self.sig.iter().filter(|&&b| b == b'v').count() == 1
+            && self
+                .sig
+                .iter()
+                .all(|&b| matches!(b, b'K' | b'Q' | b'R' | b'B' | b'N' | b'P' | b'v' | 0));
+        if !sig_ok {
+            return false;
+        }
+        if self.flags & FLAG_SINGLE_VALUE != 0 {
+            return true;
+        }
+        // `unpack_value` reads at most eight bits, and a packed value spans
+        // -max_dtm..=max_dtm: 2·max_dtm + 1 values.
+        (1..=8).contains(&self.bits)
+            && 2 * u32::from(self.max_dtm) < 1u32 << self.bits
+            && !self.frames.is_empty()
+    }
+
+    /// The fewest decoded bytes each of the table's sections must hold for every index
+    /// below `per_stm` to read inside it: one section per side to move when the table
+    /// is split, one for both otherwise. `None` for a table without entries.
+    fn section_bytes(&self) -> Option<u64> {
+        if self.flags & FLAG_SINGLE_VALUE != 0 {
+            return None;
+        }
+        let entries = u64::from(self.per_stm) * u64::from(self.bits);
+        Some(if self.flags & FLAG_SPLIT_STM != 0 {
+            entries.div_ceil(8)
+        } else {
+            (2 * entries).div_ceil(8)
+        })
+    }
+}
+
+/// Whether every table's decoded sections are long enough for its directory entry.
+///
+/// The frames do not record their decoded size, so a directory that disagrees with the
+/// data shows only here: a section too short would let a probe read the next table's
+/// bytes as its own, or past the end of the store on the last one.
+fn check_layout(dir: &[Entry], layout: &Layout) -> Result<(), String> {
+    debug_assert_eq!(dir.len(), layout.offsets.len());
+    for (i, (e, &(wtm, btm))) in dir.iter().zip(&layout.offsets).enumerate() {
+        let end = layout.offsets.get(i + 1).map_or(layout.used, |&(next, _)| next);
+        if wtm > btm || btm > end {
+            return Err(format!("table {i} overlaps the next one"));
+        }
+        let Some(need) = e.section_bytes() else {
+            continue;
+        };
+        let short = if e.flags & FLAG_SPLIT_STM != 0 {
+            ((btm - wtm) as u64) < need || ((end - btm) as u64) < need
+        } else {
+            ((end - wtm) as u64) < need
+        };
+        if short {
+            return Err(format!("table {i} decodes shorter than its directory says"));
+        }
+    }
+    Ok(())
 }
 
 /// How large a store to give the tables, from the directory alone.
@@ -1007,7 +1076,9 @@ fn fill_store(blob: &[u8], dir: &[Entry], store: &mut [u8]) -> Option<Layout> {
         debug_assert!(wtm <= btm && btm <= used && used <= store.len());
         offsets.push((wtm, btm));
     }
-    Some(Layout { offsets, used })
+    let layout = Layout { offsets, used };
+    check_layout(dir, &layout).ok()?;
+    Some(layout)
 }
 
 /// The whole store, decompressed into memory of this process's own.
@@ -1041,6 +1112,7 @@ impl Prober {
         })?;
         let bytes = mapped.bytes();
         let layout = read_header(&bytes[..header], dir.len(), capacity)?;
+        check_layout(dir, &layout)?;
         let store = &bytes[header..header + layout.used];
 
         // The name pins the blob and the image format, not what this build writes
@@ -1163,6 +1235,11 @@ impl Prober {
             &table.non_pawn_groups,
             table.per_stm_size as usize,
         )?;
+        // A directory whose per-side count is below the encoding's would send the
+        // index past the table's section; refused rather than read from the next.
+        if idx >= table.per_stm_size as usize {
+            return None;
+        }
 
         // For FLAG_SPLIT_STM tables, WTM and BTM sections are decompressed
         // separately and byte-aligned independently. We index into each section
@@ -1314,6 +1391,53 @@ mod tests {
         let dir = read_directory(BLOB).unwrap();
         let mut store = vec![0u8; store_capacity(&dir) / 2];
         assert!(fill_store(BLOB, &dir, &mut store).is_none());
+    }
+
+    /// A blob whose directory disagrees with its data is refused, never probed: no
+    /// signature the prober cannot split, no width past a byte, no section shorter
+    /// than its entry says. Forged from the embedded blob, privately and shared.
+    #[cfg(gaiatb_embedded)]
+    #[test]
+    fn a_blob_whose_directory_disagrees_with_its_data_is_refused() {
+        let dir = read_directory(BLOB).unwrap();
+        let entry_at = |i: usize| HEADER_SIZE + i * ENTRY_SIZE;
+        let with_tables = |dir: &[Entry]| -> Vec<usize> {
+            (0..dir.len())
+                .filter(|&i| dir[i].flags & FLAG_SINGLE_VALUE == 0)
+                .collect()
+        };
+        let tables = with_tables(&dir);
+        let (first, last) = (tables[0], *tables.last().unwrap());
+
+        // A signature without its "v": the sides cannot be told apart.
+        let mut no_v = BLOB.to_vec();
+        let at = entry_at(first);
+        let v = no_v[at..at + SIG_LEN].iter().position(|&b| b == b'v').unwrap();
+        no_v[at + v] = b'K';
+        assert!(read_directory(&no_v).is_none(), "a signature without v");
+
+        // A width the unpacking cannot read.
+        let mut wide = BLOB.to_vec();
+        wide[entry_at(first) + 9] = 9;
+        assert!(read_directory(&wide).is_none(), "nine bits per entry");
+
+        // A per-side count larger than the last table's decoded data: the directory
+        // reads, the store does not.
+        let mut long = BLOB.to_vec();
+        let at = entry_at(last) + 12;
+        let per_stm = u32::from_le_bytes(long[at..at + 4].try_into().unwrap());
+        long[at..at + 4].copy_from_slice(&(per_stm * 2).to_le_bytes());
+        let long_dir = read_directory(&long).expect("the directory itself is well formed");
+        assert!(Prober::private(&long, &long_dir).is_none(), "private copy");
+        #[cfg(target_os = "linux")]
+        {
+            let name = format!("gaiatb-test-forged-{}", std::process::id());
+            assert!(Prober::shared(&long, &long_dir, &name).is_err(), "shared image");
+        }
+
+        // The genuine blob passes the same checks.
+        let (_, layout) = private_store(BLOB, &dir).unwrap();
+        assert_eq!(check_layout(&dir, &layout), Ok(()));
     }
 
     #[test]
