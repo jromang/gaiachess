@@ -46,6 +46,8 @@ echo "== page =="
 cp web/index.html web/host.js web/gl.js web/worker.mjs web/favicon16.png web/favicon32.png "$OUT/"
 # gl.js is miniquad's, under MIT, which asks that its notice travel with every copy.
 cp web/LICENSE-miniquad-MIT "$OUT/"
+# The page's own licence, and those of the crates compiled into its two modules.
+cp LICENSE THIRD-PARTY-LICENSES.txt "$OUT/"
 # The stop bench, for tools/web/stop-test.mjs. A kilobyte, and the only way to see
 # whether a search can be cut short — but not part of a release zip.
 cp web/stoptest.html "$OUT/"

@@ -124,6 +124,7 @@ use crate::search;
 use crate::timeman::{INITIAL_TIME_REDUCTION, SearchLimits, TIME_ADJUST_UNSET, TimeManager};
 use crate::tt::TT;
 use crate::types::*;
+use crate::workers::Workers;
 
 /// Number of sentinel entries before ply 0 in the search stack.
 /// Allows safe access to `stack[ply - N]` for continuation history lookups.
@@ -187,22 +188,23 @@ impl CurrLineSlot {
 #[cfg(not(target_arch = "wasm32"))]
 struct CurrLineReporter {
     stop: Option<mpsc::Sender<()>>,
-    handle: Option<std::thread::JoinHandle<()>>,
+    /// The pool's reporting thread, running the reporter until it is dropped.
+    worker: Arc<Workers>,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 impl CurrLineReporter {
-    fn start(threads: &[LargeBox<ThreadData>]) -> Option<Self> {
-        if threads.first().is_none_or(|td| !td.report_curr_line) {
+    /// Reports on the pool's own reporting thread, created with the pool: none is
+    /// created per search. Without it (the system refused it) there is no report.
+    fn start(threads: &[LargeBox<ThreadData>], worker: &Arc<Workers>) -> Option<Self> {
+        if threads.first().is_none_or(|td| !td.report_curr_line) || worker.is_empty() {
             return None;
         }
 
         let slots: Vec<_> = threads.iter().map(|td| Arc::clone(&td.curr_line)).collect();
         let chess960 = threads[0].pos.chess960;
         let (stop, stopped) = mpsc::channel();
-        let handle = std::thread::Builder::new()
-            .name("uci-currline".into())
-            .spawn(move || {
+        worker.launch(0, move || {
                 let mut generations = vec![0; slots.len()];
                 loop {
                     match stopped.recv_timeout(std::time::Duration::from_secs(1)) {
@@ -241,11 +243,10 @@ impl CurrLineReporter {
                     }
                     crate::out::lines(&lines);
                 }
-            })
-            .expect("failed to spawn UCI currline reporter");
+        });
         Some(Self {
             stop: Some(stop),
-            handle: Some(handle),
+            worker: Arc::clone(worker),
         })
     }
 }
@@ -254,9 +255,7 @@ impl CurrLineReporter {
 impl Drop for CurrLineReporter {
     fn drop(&mut self) {
         self.stop.take();
-        if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
-        }
+        self.worker.join(0);
     }
 }
 
@@ -302,6 +301,11 @@ pub struct RootMove {
     pub tb_rank: i32,
     /// TB score for UCI display (graduated, not hardcoded ±20000).
     pub tb_score: i32,
+    /// Rank of this move with every certain win ranked by DTZ as well (0 = unranked):
+    /// the soonest zeroing move ranks highest. Set at the root of a won table position,
+    /// to choose the move played when the search proves no mate.
+    #[cfg_attr(not(feature = "syzygy"), allow(dead_code))]
+    pub dtz_rank: i32,
     /// Cumulative nodes spent searching this move (for node fraction TM).
     pub nodes_spent: u64,
     /// `pv` as it stood when the current iteration began, and its length (0 while
@@ -336,6 +340,7 @@ impl RootMove {
             sel_depth: 0,
             tb_rank: 0,
             tb_score: 0,
+            dtz_rank: 0,
             nodes_spent: 0,
             refutation,
             refutation_len: 1,
@@ -353,6 +358,9 @@ pub struct TbConfig {
     /// the root, or a loss/draw). >0 = WDL-only win: probe below TB_LARGEST so a
     /// 7-piece WDL-only root does not WDL-hit every node.
     pub cardinality: u32,
+    /// The root has been ranked for this search, by this thread or by the pool for
+    /// every thread at once: `search` does not rank it again.
+    pub ranked: bool,
 }
 
 // ============================================================
@@ -587,6 +595,10 @@ pub struct ThreadData {
     /// Local cache of ponder state. Avoids atomic load every 512 nodes.
     /// Set in `prepare_search()`, cleared on `ponderhit` detection.
     pub pondering: bool,
+    /// A ponder search has already spent what the move is worth: it goes on, since
+    /// nothing can be played before the hit, and stops the moment the hit comes.
+    /// Main thread only; cleared again by a root fail-low.
+    pub stop_on_ponderhit: bool,
     /// `go mate N`: stop iterative deepening once a mate in at most N moves is found.
     pub mate_limit: Option<i32>,
     /// Root moves with per-move scoring for Multi-PV.
@@ -678,6 +690,12 @@ fn pool_must_hold(ponder_requested: bool, infinite: bool) -> bool {
         && ((ponder_requested && PONDER.load(Ordering::Relaxed)) || infinite)
 }
 
+/// [`split_node_limit`] for the fuzz targets under `fuzz/`.
+#[cfg(fuzzing)]
+pub fn fuzz_split_node_limit(limits: &SearchLimits, threads: usize) -> Option<SearchLimits> {
+    split_node_limit(limits, threads)
+}
+
 /// Divides a fixed node budget into one share per thread; `None` for every other
 /// kind of limit.
 ///
@@ -715,8 +733,8 @@ impl ThreadData {
     /// Create a new thread with the given id. History tables are zeroed,
     /// position is startpos (will be overwritten in `prepare_search`).
     pub fn new(id: usize) -> Self {
-        let sentinel = Box::new([[0i16; Square::NUM]; Piece::NUM]);
-        let sentinel_ptr = &*sentinel as *const PieceToTable as *mut PieceToTable;
+        let mut sentinel = Box::new([[0i16; Square::NUM]; Piece::NUM]);
+        let sentinel_ptr: *mut PieceToTable = &raw mut *sentinel;
         let mut stack = [StackEntry::default(); MAX_PLY + SS_OFFSET + 1];
         for entry in &mut stack {
             entry.conthist_ptr = sentinel_ptr;
@@ -759,6 +777,7 @@ impl ThreadData {
             root_move: Move::NONE,
             root_move_number: 0,
             pondering: false,
+            stop_on_ponderhit: false,
             mate_limit: None,
             root_moves: Vec::new(),
             multi_pv: 1,
@@ -885,7 +904,7 @@ impl ThreadData {
             // line, the main thread says where it is. One clock read per 512 nodes,
             // which the deadline test below already pays.
             if self.id == 0 && !self.silent {
-                let now = self.tm.total_elapsed_ms();
+                let now = self.tm.elapsed_ms();
                 if heartbeat_due(
                     now,
                     LAST_INFO_MS.load(Ordering::Relaxed),
@@ -908,7 +927,6 @@ impl ThreadData {
             // Detect ponderhit transition: PONDER was cleared by stdin reader
             if self.pondering && !PONDER.load(Ordering::Relaxed) {
                 self.pondering = false;
-                self.tm.restart();
                 // A depth-limited ponder may already have searched far beyond its
                 // requested depth. Do not finish another large iteration after the hit.
                 if self.root_depth > self.tm.max_depth() {
@@ -916,12 +934,18 @@ impl ThreadData {
                 }
             }
 
-            // Skip the time limit while pondering (search indefinitely).
+            // Skip the time limit while pondering (search indefinitely). The clock
+            // has run since `go`, the ponder included, so a ponder that outlasted the
+            // deadline, or whose last iteration already spent what the move is worth,
+            // answers at the hit.
             // The deadline cannot fire before depth one is in hand: a move has to be
             // played, and the alternative is handing back whatever the first legal
             // move happened to be. The node budget (above) has no such guard, so a
             // fixed-node search returns the same tree as ever.
-            if !self.pondering && self.completed_depth >= 1 && self.tm.should_stop_hard() {
+            if !self.pondering
+                && self.completed_depth >= 1
+                && (self.stop_on_ponderhit || self.tm.should_stop_hard())
+            {
                 self.stop_on_own_limit();
             }
             // Per-thread deadline (datagen): stop this thread without touching global STOP
@@ -1038,6 +1062,7 @@ impl ThreadData {
         self.best_score = -SCORE_INFINITE;
         self.stopped = false;
         self.pondering = PONDER.load(Ordering::Relaxed);
+        self.stop_on_ponderhit = false;
         self.mate_limit = limits.mate;
         self.killers.clear();
         // The first iteration has no running average yet, so the optimism block at the
@@ -1056,6 +1081,7 @@ impl ThreadData {
                 // Default: probe in-tree at max_pieces cardinality.
                 // Set to 0 by root probing when DTZ is available.
                 cardinality: crate::tb::max_pieces(),
+                ranked: false,
             };
         }
 
@@ -1105,7 +1131,7 @@ impl ThreadData {
         }
 
         // Reset search stack
-        let sentinel_ptr = &*self.sentinel_conthist as *const PieceToTable as *mut PieceToTable;
+        let sentinel_ptr = &raw mut *self.sentinel_conthist;
         for entry in &mut self.stack {
             entry.played_move = Move::NONE;
             entry.moved_piece = Piece::NONE;
@@ -1160,36 +1186,24 @@ impl ThreadData {
 // ThreadPool
 // ============================================================
 
-/// Builds `thread_node.len()` threads, each by a thread of its own — pinned to its node
-/// when `bound` — so that its tables are first written, and placed, where it will run.
-fn build_threads(
-    numa: &NumaConfig,
-    thread_node: &[usize],
-    bound: bool,
-) -> Vec<LargeBox<ThreadData>> {
-    let n = thread_node.len();
-    if n == 1 && !bound || cfg!(target_arch = "wasm32") {
+/// Stack of a search worker: PGO inlining enlarges the search frames. Only reserved.
+const SEARCH_STACK: usize = 32 * 1024 * 1024;
+
+/// Builds `n` threads' data, each on the worker that will search it — pinned to its
+/// node when the pool is bound — so that its tables are first written, and placed,
+/// where it will run. Without workers (one unpinned thread), on the caller.
+fn build_threads(workers: &Workers, n: usize) -> Vec<LargeBox<ThreadData>> {
+    if workers.is_empty() {
         return (0..n).map(|i| LargeBox::new(ThreadData::new(i))).collect();
     }
-    std::thread::scope(|s| {
-        let handles: Vec<_> = (0..n)
-            .map(|i| {
-                std::thread::Builder::new()
-                    .stack_size(32 * 1024 * 1024)
-                    .spawn_scoped(s, move || {
-                        if bound {
-                            numa::bind_current_thread(numa, thread_node[i]);
-                        }
-                        LargeBox::new(ThreadData::new(i))
-                    })
-                    .expect("failed to spawn a thread-building thread")
-            })
-            .collect();
-        handles
-            .into_iter()
-            .map(|h| h.join().expect("building a search thread panicked"))
-            .collect()
-    })
+    debug_assert_eq!(workers.len(), n, "one worker per thread");
+    let mut built: Vec<Option<LargeBox<ThreadData>>> = (0..n).map(|_| None).collect();
+    workers.scope(|s| {
+        for (i, slot) in built.iter_mut().enumerate() {
+            s.run(i, move || *slot = Some(LargeBox::new(ThreadData::new(i))));
+        }
+    });
+    built.into_iter().map(|td| td.expect("every worker built its thread")).collect()
 }
 
 /// Pool of search threads with shared transposition table.
@@ -1197,7 +1211,8 @@ fn build_threads(
 /// On a machine with several memory nodes the threads are pinned and spread over the
 /// nodes when that pays (see [`crate::numa`]): each thread's own tables are allocated
 /// and first written by the thread itself, each node gets its own correction table,
-/// and every shared table is cleared in parallel so that each node holds its share.
+/// and the transposition table is cleared in parallel so that each node holds its
+/// share (not on Windows large pages, see [`TT`]).
 pub struct ThreadPool {
     pub shared: SharedState,
     pub threads: Vec<LargeBox<ThreadData>>,
@@ -1214,6 +1229,13 @@ pub struct ThreadPool {
     /// holds it, so the election is skipped: a helper that finished N + 1 before the
     /// main thread finished N would otherwise answer beyond the limit.
     depth_limited: bool,
+    /// The threads that run the searches, table builds and clears: one per search
+    /// thread, created and pinned when the pool is laid out, none for a single
+    /// unpinned thread (it runs on the caller). Every `go` reuses them.
+    workers: Workers,
+    /// The thread that prints `currline`, created once with the pool.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    reporter: Arc<Workers>,
 }
 
 impl ThreadPool {
@@ -1228,6 +1250,8 @@ impl ThreadPool {
             numa: NumaConfig::single(1),
             bound: false,
             depth_limited: false,
+            workers: Workers::none(),
+            reporter: Arc::new(Workers::spawn(1, 1024 * 1024, "uci-currline")),
         };
         pool.rebuild(num_threads);
         pool
@@ -1235,7 +1259,15 @@ impl ThreadPool {
 
     /// Change the number of search threads. Every thread starts afresh and the
     /// transposition table is reallocated, so that its pages follow the threads.
+    ///
+    /// The count already in service changes nothing: a match runner sends every option
+    /// again before each game, and the `ucinewgame` behind them clears what a rebuild
+    /// would have. A pool that got fewer threads than it asked for is rebuilt, which
+    /// asks again.
     pub fn resize_threads(&mut self, n: usize) {
+        if n.clamp(1, MAX_THREADS) == self.threads.len() {
+            return;
+        }
         self.rebuild(n);
     }
 
@@ -1246,8 +1278,13 @@ impl ThreadPool {
         self.rebuild(n);
     }
 
-    /// Resize the TT (must not be called during search).
+    /// Resize the TT (must not be called during search). The size already in service
+    /// changes nothing, for the reason given on [`Self::resize_threads`].
     pub fn resize_hash(&mut self, mb: usize) {
+        debug_assert!(mb >= 1, "a table below 1 MB: {mb}");
+        if mb == self.shared.tt.size_mb() {
+            return;
+        }
         self.reallocate_tt(mb);
         self.parallel_clear(true, false);
     }
@@ -1288,23 +1325,48 @@ impl ThreadPool {
 
     /// Lay the pool out again for `n` threads under the current policy.
     fn rebuild(&mut self, n: usize) {
-        let n = n.clamp(1, MAX_THREADS);
+        let mut n = n.clamp(1, MAX_THREADS);
+        // Release everything before allocating its replacement.
+        self.threads.clear();
+        self.shared.corr.clear();
+        self.workers = Workers::none();
+
         let numa = self.numa_policy.config();
-        let bound = self.numa_policy.binds(&numa, n);
-        let thread_node = if bound {
-            numa.distribute(n)
-        } else {
-            vec![0; n]
+        // The workers are created here, once for every search to come. A system that
+        // refuses some gets a pool of the threads it gave, rather than an engine that
+        // dies at the first `go`.
+        let (bound, thread_node) = loop {
+            let bound = self.numa_policy.binds(&numa, n);
+            let thread_node = if bound {
+                numa.distribute(n)
+            } else {
+                vec![0; n]
+            };
+            let wanted = if n == 1 && !bound { 0 } else { n };
+            let workers = Workers::spawn(wanted, SEARCH_STACK, "search");
+            if workers.len() == wanted || cfg!(target_arch = "wasm32") {
+                self.workers = workers;
+                break (bound, thread_node);
+            }
+            crate::out!(
+                "info string only {} of {n} search threads could be created",
+                workers.len().max(1)
+            );
+            n = workers.len().max(1);
         };
+        if bound {
+            self.workers.scope(|s| {
+                for (i, &node) in thread_node.iter().enumerate() {
+                    let numa = &numa;
+                    s.run(i, move || numa::bind_current_thread(numa, node));
+                }
+            });
+        }
         let nodes = if bound { numa.node_count() } else { 1 };
         let mut per_node = vec![0usize; nodes];
         for &node in &thread_node {
             per_node[node] += 1;
         }
-
-        // Release everything before allocating its replacement.
-        self.threads.clear();
-        self.shared.corr.clear();
 
         // A correction table per node, sized for that node's threads and allocated on
         // it (Windows commits large pages at allocation).
@@ -1319,7 +1381,7 @@ impl ThreadPool {
             })
             .collect();
 
-        self.threads = build_threads(&numa, &thread_node, bound);
+        self.threads = build_threads(&self.workers, n);
         // The thread elected last time may not exist any more.
         self.last_best_idx = 0;
         for (i, td) in self.threads.iter_mut().enumerate() {
@@ -1368,7 +1430,9 @@ impl ThreadPool {
     /// Clears in parallel, every thread on its own node: its own histories and its
     /// share of its node's correction table (`histories`), and one contiguous slice of
     /// the transposition table (`tt`) — the threads sorted by node, so that each node
-    /// receives one region. Writing a fresh page is what places it.
+    /// receives one region. Writing a fresh page is what places it, except for Windows
+    /// large pages, placed when committed: a table on those stays where it was
+    /// allocated.
     fn parallel_clear(&mut self, tt: bool, histories: bool) {
         let n = self.threads.len();
         let mut order: Vec<usize> = (0..n).collect();
@@ -1388,12 +1452,10 @@ impl ThreadPool {
         let ThreadPool {
             shared,
             threads,
-            numa,
-            bound,
+            workers,
             ..
         } = self;
         let shared = &*shared;
-        let (numa, bound) = (&*numa, *bound);
         let job = |i: usize, td: &mut ThreadData| {
             if histories {
                 td.clear_histories();
@@ -1406,23 +1468,17 @@ impl ThreadPool {
             }
         };
 
-        if n == 1 && !bound || cfg!(target_arch = "wasm32") {
+        // Each thread clears on its own worker, already pinned to its node.
+        if workers.is_empty() {
             for (i, td) in threads.iter_mut().enumerate() {
                 job(i, td);
             }
         } else {
-            std::thread::scope(|s| {
+            debug_assert_eq!(workers.len(), n, "one worker per thread");
+            workers.scope(|s| {
                 for (i, td) in threads.iter_mut().enumerate() {
                     let job = &job;
-                    std::thread::Builder::new()
-                        .stack_size(1024 * 1024)
-                        .spawn_scoped(s, move || {
-                            if bound {
-                                numa::bind_current_thread(numa, td.numa_node);
-                            }
-                            job(i, td);
-                        })
-                        .expect("failed to spawn a clearing thread");
+                    s.run(i, move || job(i, td));
                 }
             });
         }
@@ -1438,7 +1494,7 @@ impl ThreadPool {
 
     /// Launch parallel search and return the best move + optional ponder move.
     ///
-    /// Uses `std::thread::scope` for scoped lifetime management:
+    /// The pool's persistent workers run the search, each thread on its own worker:
     /// helper threads (id > 0) search with infinite limits until `stop`,
     /// main thread (id 0) searches with real time limits.
     pub fn start_search(&mut self, pos: &Position, limits: SearchLimits) -> (Move, Option<Move>) {
@@ -1504,6 +1560,22 @@ impl ThreadPool {
             td.nnue.use_params(replica);
             td.prepare_search_filtered(pos, &limits, search_moves);
         }
+        // The root is ranked in the tables once, by the main thread, and every helper
+        // takes the same ranking: they would each probe the same moves for the same
+        // answer. Their root moves were generated alike, so the copy is what each
+        // would have computed.
+        #[cfg(feature = "syzygy")]
+        {
+            let (main, helpers) = self.threads[..searching].split_first_mut().unwrap();
+            search::rank_tb_root(main);
+            for td in helpers {
+                debug_assert_eq!(td.root_moves.len(), main.root_moves.len());
+                debug_assert!(main.root_moves.iter().all(|m| td.root_moves.iter().any(|r| r.mv == m.mv)));
+                td.tb_config = main.tb_config;
+                td.root_moves.clone_from(&main.root_moves);
+                td.best_move = main.best_move;
+            }
+        }
         let report_curr_line = crate::uci::show_curr_line() && !self.threads[0].silent;
         let report_refutations = crate::uci::show_refutations() && !self.threads[0].silent;
         for td in &mut self.threads {
@@ -1542,42 +1614,41 @@ impl ThreadPool {
         self.shared.cpu_load.reset();
 
         #[cfg(not(target_arch = "wasm32"))]
-        let _curr_line_reporter = CurrLineReporter::start(&self.threads[..searching]);
+        let _curr_line_reporter = CurrLineReporter::start(&self.threads[..searching], &self.reporter);
 
         if lone {
             // Single-thread fast path: no spawning overhead
             search::search(&mut self.threads[0], &self.shared);
             self.threads[0].thread_count = pool_size;
             self.last_best_idx = 0;
+            #[cfg(feature = "syzygy")]
+            self.play_shortest_conversion();
             let best = self.threads[0].best_move;
             let ponder = self.extract_ponder_move(0);
             return (best, ponder);
         }
 
-        // Multi-thread: scope ensures all threads join before we return
+        // Multi-thread: each thread searches on its worker, created and pinned when the
+        // pool was laid out; the scope returns once every one of them has finished.
         let infinite = limits.infinite;
         let ponder_requested = PONDER.load(Ordering::Relaxed);
         let bound = self.bound;
-        let numa = &self.numa;
-        std::thread::scope(|s| {
-            let (main_td, helpers) = self.threads.split_first_mut().unwrap();
+        debug_assert_eq!(self.workers.len(), self.threads.len(), "a worker per search thread");
+        let ThreadPool {
+            threads,
+            shared,
+            workers,
+            ..
+        } = self;
+        let shared = &*shared;
+        workers.scope(|s| {
+            let (main_td, helpers) = threads.split_first_mut().unwrap();
             let main_td: &mut ThreadData = main_td;
-            let main_node = main_td.numa_node;
-            let shared = &self.shared;
 
-            // Spawn helper threads with 32 MB stack (PGO inlining enlarges frames).
             // Pinned threads read the network copy of their own node (set in `prepare`).
-            for td in helpers.iter_mut() {
+            for (i, td) in helpers.iter_mut().enumerate() {
                 let td: &mut ThreadData = td;
-                std::thread::Builder::new()
-                    .stack_size(32 * 1024 * 1024)
-                    .spawn_scoped(s, move || {
-                        if bound {
-                            numa::bind_current_thread(numa, td.numa_node);
-                        }
-                        search::search(td, shared);
-                    })
-                    .expect("failed to spawn search thread");
+                s.run(i + 1, move || search::search(td, shared));
             }
 
             // Main thread runs search (blocks until time/depth limit).
@@ -1601,16 +1672,9 @@ impl ThreadPool {
                 }
             };
             if bound {
-                // Pinned, the main search gets a thread of its own too: pinning the
+                // Pinned, the main search runs on its own worker too: pinning the
                 // caller would leave the UCI thread confined to one node.
-                let node = main_node;
-                std::thread::Builder::new()
-                    .stack_size(32 * 1024 * 1024)
-                    .spawn_scoped(s, move || {
-                        numa::bind_current_thread(numa, node);
-                        main_job();
-                    })
-                    .expect("failed to spawn the main search thread");
+                s.run(0, main_job);
             } else {
                 main_job();
             }
@@ -1626,10 +1690,72 @@ impl ThreadPool {
         self.inherit_time_state(best_idx);
         #[cfg(feature = "syzygy")]
         self.extend_elected_tb_pv();
+        #[cfg(feature = "syzygy")]
+        self.play_shortest_conversion();
 
         let best = self.threads[best_idx].best_move;
         let ponder = self.extract_ponder_move(best_idx);
         (best, ponder)
+    }
+
+    /// In a won table position where the search proved no mate, plays the winning move
+    /// that reaches its next zeroing move soonest.
+    ///
+    /// The search ranks every certain win alike and looks for a mate among them; it
+    /// often finds one, and a mate it proves is played. Without one, the move it picks
+    /// rests on the evaluation of positions the tables have already settled, and the
+    /// conversion drags: on won five-piece endings against perfect defence, about 12 %
+    /// more moves at 100k nodes a move, 6 % at 400k. The soonest zeroing move then goes
+    /// to the front of the elected thread's root moves, with the report of the line it
+    /// replaces and its own line walked through the tables, so that the last report and
+    /// the ponder move agree with the move played.
+    ///
+    /// One line only: with several, the analysis keeps the order of the search, and a
+    /// weakened level keeps its own choice.
+    #[cfg(feature = "syzygy")]
+    fn play_shortest_conversion(&mut self) {
+        let best_idx = self.last_best_idx;
+        if best_idx >= self.threads.len() || crate::skill::level() < crate::skill::FULL_STRENGTH {
+            return;
+        }
+        let has_clock = self.threads[0].tm.has_clock();
+        let td: &mut ThreadData = &mut self.threads[best_idx];
+        if !td.tb_config.root_in_tb || td.multi_pv > 1 || td.root_moves.is_empty() {
+            return;
+        }
+        let front = &td.root_moves[0];
+        if front.depth == 0 || is_mate_score(front.score) || !is_win(front.tb_score) {
+            return;
+        }
+        // The soonest among the moves the search could choose from; on equal DTZ, the
+        // one the search put first.
+        let group = front.tb_rank;
+        let mut pick = 0;
+        for (i, rm) in td.root_moves.iter().enumerate() {
+            if rm.tb_rank == group && rm.dtz_rank > td.root_moves[pick].dtz_rank {
+                pick = i;
+            }
+        }
+        if pick == 0 {
+            return;
+        }
+        debug_assert!(td.root_moves[pick].dtz_rank > 0, "a winning move without a DTZ rank");
+        // The line keeps its report: the score, depth and state of the search it
+        // stands for, a fail-high still unsettled included.
+        let (score, depth, sel_depth) = (front.score, front.depth, front.sel_depth);
+        let (in_progress, lower_bound) = (front.in_progress, front.lower_bound);
+        td.root_moves[..=pick].rotate_right(1);
+        let rm = &mut td.root_moves[0];
+        rm.score = score;
+        rm.depth = depth;
+        rm.sel_depth = sel_depth;
+        rm.in_progress = in_progress;
+        rm.lower_bound = lower_bound;
+        rm.pv[0] = rm.mv;
+        rm.pv_len = 1;
+        search::syzygy_extend_pv(&mut td.pos, rm, has_clock, 1);
+        debug_assert!(rm.pv_len > 0 && rm.pv[0] == rm.mv, "the extension kept the root move");
+        td.best_move = rm.mv;
     }
 
     /// Walks the tables to mate on the line of an elected helper, as the main thread
@@ -1711,7 +1837,7 @@ impl ThreadPool {
                 search::print_multi_pv_info(td, &self.shared, 1);
                 return;
             }
-            let elapsed = td.tm.total_elapsed_ms().max(1);
+            let elapsed = td.tm.elapsed_ms().max(1);
             let cpuload = self
                 .shared
                 .cpu_load()
@@ -1884,6 +2010,7 @@ mod tests {
     const MIDGAME: &str = "r1bq1rk1/pp2ppbp/2np2p1/2n5/P3PP2/N1P2N2/1PB3PP/R1B1QRK1 b - - 0 1";
 
     #[test]
+    #[cfg(not(target_arch = "wasm32"))]
     fn current_line_snapshot_is_complete_and_clearable() {
         let slot = CurrLineSlot::new();
         let line = [
@@ -2374,6 +2501,85 @@ mod pool_tests {
         pool
     }
 
+    /// The OS threads of the pool's workers.
+    fn worker_threads(pool: &ThreadPool) -> Vec<std::thread::ThreadId> {
+        (0..pool.workers.len()).map(|i| pool.workers.thread_id(i)).collect()
+    }
+
+    /// Searches, and the `ucinewgame` clear between them, run on the threads created
+    /// when the pool was laid out: none is created per `go`. Each search thread runs
+    /// on its own worker.
+    #[test]
+    fn every_go_reuses_the_threads_of_the_pool() {
+        let _guard = crate::skill::lock_level();
+        PONDER.store(false, Ordering::Relaxed);
+        let mut pool = silent_pool(3);
+        assert_eq!(pool.workers.len(), 3, "a worker per search thread");
+        let before = worker_threads(&pool);
+        let pos = Position::from_fen(STARTPOS).unwrap();
+        for round in 0..3 {
+            STOP.store(false, Ordering::Relaxed);
+            let (best, _) = pool.start_search(&pos, SearchLimits::depth(5));
+            assert!(best.is_ok(), "round {round}");
+            pool.clear();
+        }
+        assert_eq!(worker_threads(&pool), before, "the workers were replaced");
+        // A new thread count lays the pool out again, with workers to match.
+        pool.resize_threads(2);
+        assert_eq!(pool.workers.len(), 2);
+        // One unpinned thread searches on the caller: no worker at all.
+        pool.resize_threads(1);
+        assert!(pool.workers.is_empty() || pool.bound);
+    }
+
+    /// A match runner sends `Threads` and `Hash` again before every game: at the values
+    /// in service they lay nothing out again, so the workers, the threads and the
+    /// table's entries all survive. A new value still does.
+    #[test]
+    fn threads_and_hash_sent_again_at_their_value_change_nothing() {
+        let mut pool = silent_pool(2);
+        let hash = pool.shared.tt.size_mb();
+        let key = 0x1234_5678_9abc_def0;
+        let tt = &pool.shared.tt;
+        tt.store(key, 5, 100, 150, crate::tt::Bound::Exact, Move::NONE, 0, false);
+        assert!(tt.probe(key, 0, 0).is_some());
+        let workers = worker_threads(&pool);
+        let first: *const ThreadData = &*pool.threads[0];
+
+        pool.resize_threads(2);
+        pool.resize_hash(hash);
+        assert_eq!(worker_threads(&pool), workers, "the workers were replaced");
+        assert!(std::ptr::eq(&*pool.threads[0], first), "the threads were rebuilt");
+        assert!(pool.shared.tt.probe(key, 0, 0).is_some(), "the table was emptied");
+
+        pool.resize_hash(hash + 1);
+        assert_eq!(pool.shared.tt.size_mb(), hash + 1);
+        assert!(pool.shared.tt.probe(key, 0, 0).is_none(), "a new table kept an entry");
+        pool.resize_threads(1);
+        assert_eq!(pool.threads.len(), 1);
+    }
+
+    /// A system that refuses a thread when the pool is laid out gets a pool of the
+    /// threads it gave, which still searches: a refused creation used to abort the
+    /// engine at the next `go`, in the middle of a game.
+    #[test]
+    fn a_refused_thread_shrinks_the_pool_instead_of_aborting() {
+        let _guard = crate::skill::lock_level();
+        PONDER.store(false, Ordering::Relaxed);
+        crate::workers::FAIL_SPAWN_AT.set(2);
+        let mut pool = silent_pool(4);
+        crate::workers::FAIL_SPAWN_AT.set(usize::MAX);
+        assert_eq!(pool.threads.len(), 2, "the pool keeps the two threads it got");
+        assert_eq!(pool.workers.len(), 2);
+        for td in &mut pool.threads {
+            td.silent = true;
+        }
+        STOP.store(false, Ordering::Relaxed);
+        let pos = Position::from_fen(STARTPOS).unwrap();
+        let (best, _) = pool.start_search(&pos, SearchLimits::depth(5));
+        assert!(best.is_ok());
+    }
+
     /// `go infinite depth 4` on several threads: the main thread is done long before
     /// the `stop`, and the pool must still wait for it.
     #[test]
@@ -2415,6 +2621,36 @@ mod pool_tests {
         STOP.store(false, Ordering::Relaxed);
         assert!(best.is_ok());
         assert!(waited >= Duration::from_millis(250), "bestmove after {waited:?}, before ponderhit");
+    }
+
+    /// The clock runs from `go`, the ponder included: a ponder that has outlasted the
+    /// move's ceiling answers the moment the hit comes, rather than starting the budget
+    /// over on an iteration begun on the opponent's time.
+    #[test]
+    fn a_ponder_past_its_ceiling_answers_at_the_hit() {
+        let _guard = crate::skill::lock_level();
+        STOP.store(false, Ordering::Relaxed);
+        PONDER.store(true, Ordering::Relaxed);
+        let pos = Position::from_fen(STARTPOS).unwrap();
+        let mut pool = silent_pool(1);
+        // 4+0.1 on the first move: an optimum of 92 ms and a ceiling of 470.
+        let hit = std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_millis(700));
+            PONDER.store(false, Ordering::Relaxed);
+            Instant::now()
+        });
+        let (best, _) = pool.start_search(&pos, SearchLimits::clock(4000, 100, None));
+        let answered = Instant::now();
+        let hit_at = hit.join().unwrap();
+        PONDER.store(false, Ordering::Relaxed);
+        STOP.store(false, Ordering::Relaxed);
+        assert!(best.is_ok());
+        assert!(answered >= hit_at, "bestmove before ponderhit");
+        let late = answered - hit_at;
+        assert!(
+            late < Duration::from_millis(200),
+            "bestmove {late:?} after ponderhit"
+        );
     }
 
     /// `go depth N` on several threads answers at depth N: the main thread, the only

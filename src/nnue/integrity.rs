@@ -1,15 +1,17 @@
-//! Network file integrity: an optional 16-byte footer appended to the
-//! payload (`NNUE_FILE_SIZE` bytes).
+//! Network file integrity: a 16-byte footer appended to the payload
+//! (`NNUE_FILE_SIZE` bytes), without which a file is refused.
 //!
 //! Layout, little-endian, at the very end of the file:
-//! `[arch_hash: u32][content_hash: u64][magic: u32 = "GN1\0"]`
+//! `[arch_hash: u32][content_hash: u64][magic: u32 = "GN2\0"]`
 //!
 //! - `arch_hash` is an FNV-1a digest of the canonical architecture tuple
-//!   (dimensions, quantization, scale, bucket layouts, baked file
-//!   permutation). The trainer computes it from its own constants when it
-//!   exports a network; this module computes it from the engine's. A
-//!   trainer/engine drift makes the two values diverge and the load fails
-//!   loudly — the silent-wrong-weights class of accident this exists for.
+//!   (dimensions, quantization shifts, bucket and stack layouts, baked file
+//!   permutation). The output scale is not part of it: the network carries its
+//!   own in its metadata (`NNUEParams::meta`), checked here at load. The trainer
+//!   computes it from its own constants when it exports a network; this module
+//!   computes it from the engine's. A trainer/engine drift makes the two values
+//!   diverge and the load fails loudly — the silent-wrong-weights class of
+//!   accident this exists for.
 //! - `content_hash` is an FNV-1a 64 digest of the payload bytes, catching
 //!   corruption and truncation.
 //!
@@ -17,23 +19,25 @@
 //! `repermute_ft` rearranges the feature transformer per SIMD tier at load,
 //! so memory is not portable across machines.
 //!
-//! A file without the footer is a legacy network (published before the footer
-//! existed, HuggingFace repo is append-only): accepted, size-checked only.
-//! Old engine binaries load footered files unchanged — the loader has always
-//! tolerated up to 63 trailing padding bytes.
+//! A file without the footer used to be accepted on its size alone, for the
+//! networks published before the footer existed. Every published network of this
+//! architecture carries one, and a size is all a file of noise needs to pass: its
+//! weights then overflow the accumulator sums. The trainer writes the footer with
+//! every export.
 
 use super::features::KING_BUCKETS;
 use super::network::{FILE_PERM, NNUE_FILE_SIZE};
 use super::{
-    FT_QUANT, FT_SIZE, INPUT_BUCKETS, L1_QUANT, L1_SIZE, L2_SIZE, L3_SIZE, NETWORK_SCALE,
-    OUTPUT_BUCKET_SCHEME, OUTPUT_BUCKETS, PAWN_PAIR_SIZE, PSQT_QUANT, THREAT_INPUT_SIZE,
+    A1_SIZE, FT_QUANT, FT_SHIFT, GATE_SHIFT, KING_BUCKET_COUNT, L1_OUT, L1_SHIFT, L1_SIZE,
+    L1_SQR_SHIFT, L2_OUT, L2_SHIFT, L3_IN, PAWN_PAIR_SIZE, PSQ_PER_BLOCK, PSQ_SIZE, QUEEN_STATES,
+    SKIP_NEG, SKIP_POS, STACK_SCHEME, STACKS, THREAT_INPUT_SIZE,
 };
 
 /// Size of the integrity footer appended to the payload.
 pub const FOOTER_SIZE: usize = 16;
 
 /// Footer magic, last 4 bytes of a footered file.
-pub const MAGIC: u32 = u32::from_le_bytes(*b"GN1\0");
+pub const MAGIC: u32 = u32::from_le_bytes(*b"GN2\0");
 
 const FNV32_OFFSET: u32 = 0x811c_9dc5;
 const FNV32_PRIME: u32 = 0x0100_0193;
@@ -64,38 +68,47 @@ pub fn fnv1a64(data: &[u8]) -> u64 {
 
 /// FNV-1a digest of the canonical architecture tuple, computed at compile
 /// time from the engine's own constants. The trainer computes the same tuple
-/// from ITS constants (tools/trainer5); the golden tests on both sides pin
+/// from ITS constants (tools/trainer8); the golden tests on both sides pin
 /// the same literal, so a legitimate architecture change is a conscious
 /// two-sided update while an accidental drift fails `cargo test` on the
 /// drifting side.
 ///
-/// Tuple, in order: FT_SIZE, THREAT_INPUT_SIZE, PAWN_PAIR_SIZE, L1_SIZE,
-/// L2_SIZE, L3_SIZE, INPUT_BUCKETS, OUTPUT_BUCKETS, FT_QUANT, L1_QUANT,
-/// NETWORK_SCALE, PSQT_QUANT, the 64 KING_BUCKETS entries, the 6
-/// OUTPUT_BUCKET_SCHEME entries, the 8 FILE_PERM entries. Each value hashed
-/// as a little-endian u32.
+/// Tuple, in order: PSQ_SIZE, THREAT_INPUT_SIZE, PAWN_PAIR_SIZE, L1_SIZE,
+/// L1_OUT, A1_SIZE, L2_OUT, L3_IN, STACKS, KING_BUCKET_COUNT, QUEEN_STATES,
+/// PSQ_PER_BLOCK, FT_QUANT, FT_SHIFT, L1_SHIFT, L1_SQR_SHIFT, L2_SHIFT,
+/// GATE_SHIFT, SKIP_POS, SKIP_NEG, the 64 KING_BUCKETS entries, the 3
+/// STACK_SCHEME entries, the 8 FILE_PERM entries. Each value hashed as a
+/// little-endian u32.
 pub const ARCH_HASH: u32 = {
     let mut h = FNV32_OFFSET;
-    h = h32(h, FT_SIZE as u32);
+    h = h32(h, PSQ_SIZE as u32);
     h = h32(h, THREAT_INPUT_SIZE as u32);
     h = h32(h, PAWN_PAIR_SIZE as u32);
     h = h32(h, L1_SIZE as u32);
-    h = h32(h, L2_SIZE as u32);
-    h = h32(h, L3_SIZE as u32);
-    h = h32(h, INPUT_BUCKETS as u32);
-    h = h32(h, OUTPUT_BUCKETS as u32);
+    h = h32(h, L1_OUT as u32);
+    h = h32(h, A1_SIZE as u32);
+    h = h32(h, L2_OUT as u32);
+    h = h32(h, L3_IN as u32);
+    h = h32(h, STACKS as u32);
+    h = h32(h, KING_BUCKET_COUNT as u32);
+    h = h32(h, QUEEN_STATES as u32);
+    h = h32(h, PSQ_PER_BLOCK as u32);
     h = h32(h, FT_QUANT as u32);
-    h = h32(h, L1_QUANT as u32);
-    h = h32(h, NETWORK_SCALE as u32);
-    h = h32(h, PSQT_QUANT as u32);
+    h = h32(h, FT_SHIFT as u32);
+    h = h32(h, L1_SHIFT as u32);
+    h = h32(h, L1_SQR_SHIFT as u32);
+    h = h32(h, L2_SHIFT as u32);
+    h = h32(h, GATE_SHIFT as u32);
+    h = h32(h, SKIP_POS as u32);
+    h = h32(h, SKIP_NEG as u32);
     let mut i = 0;
     while i < KING_BUCKETS.len() {
         h = h32(h, KING_BUCKETS[i] as u32);
         i += 1;
     }
     let mut i = 0;
-    while i < OUTPUT_BUCKET_SCHEME.len() {
-        h = h32(h, OUTPUT_BUCKET_SCHEME[i] as u32);
+    while i < STACK_SCHEME.len() {
+        h = h32(h, STACK_SCHEME[i] as u32);
         i += 1;
     }
     let mut i = 0;
@@ -106,82 +119,68 @@ pub const ARCH_HASH: u32 = {
     h
 };
 
-/// Where a network file came from, as far as integrity can tell.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Provenance {
-    /// Footer present, both hashes check out.
-    Verified,
-    /// No footer: a network published before the footer existed.
-    /// Size-checked only — the caller should say so where a human looks.
-    Legacy,
-}
-
-/// Validate a network file image. On success the payload to install is always
-/// `data[..NNUE_FILE_SIZE]`.
-pub fn verify(data: &[u8]) -> Result<Provenance, String> {
-    if data.len() == NNUE_FILE_SIZE + FOOTER_SIZE {
-        let tail = &data[NNUE_FILE_SIZE..];
-        let magic = u32::from_le_bytes(tail[12..16].try_into().unwrap());
-        if magic == MAGIC {
-            let arch = u32::from_le_bytes(tail[0..4].try_into().unwrap());
-            if arch != ARCH_HASH {
-                return Err(format!(
-                    "wrong architecture: engine expects {ARCH_HASH:#010x}, network declares {arch:#010x}"
-                ));
-            }
-            let content = u64::from_le_bytes(tail[4..12].try_into().unwrap());
-            let actual = fnv1a64(&data[..NNUE_FILE_SIZE]);
-            if content != actual {
-                return Err(format!(
-                    "corrupted payload: footer declares {content:#018x}, file hashes to {actual:#018x}"
-                ));
-            }
-            return Ok(Provenance::Verified);
+/// Validate a network file image: the payload, then a footer whose two digests
+/// check out. On success the payload to install is always `data[..NNUE_FILE_SIZE]`.
+pub fn verify(data: &[u8]) -> Result<(), String> {
+    let expected = NNUE_FILE_SIZE + FOOTER_SIZE;
+    if data.len() != expected
+        || u32::from_le_bytes(data[expected - 4..].try_into().unwrap()) != MAGIC
+    {
+        // The payload's size, give or take the padding a trainer used to leave.
+        if (NNUE_FILE_SIZE..NNUE_FILE_SIZE + 64).contains(&data.len()) {
+            return Err(String::from(
+                "no integrity footer: not a network, or one exported before the footer existed",
+            ));
         }
-        // Right length for a footer but no magic: fall through to the legacy
-        // tolerance below (16 bytes of Bullet padding are indistinguishable
-        // from garbage, and always were).
-    }
-
-    // Legacy path: exact payload size, plus up to 63 bytes of Bullet
-    // alignment padding. `wrapping_sub` makes any undersized file fail too.
-    let excess = data.len().wrapping_sub(NNUE_FILE_SIZE);
-    if excess > 63 {
         return Err(format!(
-            "File size {} != expected {NNUE_FILE_SIZE} bytes (got {} extra, max 63 padding)",
-            data.len(),
-            if data.len() < NNUE_FILE_SIZE {
-                -((NNUE_FILE_SIZE - data.len()) as isize)
-            } else {
-                excess as isize
-            },
+            "File size {} != expected {expected} bytes",
+            data.len()
         ));
     }
-    Ok(Provenance::Legacy)
+    let tail = &data[NNUE_FILE_SIZE..];
+    let arch = u32::from_le_bytes(tail[0..4].try_into().unwrap());
+    if arch != ARCH_HASH {
+        return Err(format!(
+            "wrong architecture: engine expects {ARCH_HASH:#010x}, network declares {arch:#010x}"
+        ));
+    }
+    let content = u64::from_le_bytes(tail[4..12].try_into().unwrap());
+    let actual = fnv1a64(&data[..NNUE_FILE_SIZE]);
+    if content != actual {
+        return Err(format!(
+            "corrupted payload: footer declares {content:#018x}, file hashes to {actual:#018x}"
+        ));
+    }
+    super::network::file_scale(data)?;
+    Ok(())
 }
 
 /// The identity of a network's weights, for callers that need to name them.
 ///
-/// A footered file already carries the digest, so it is read rather than
-/// recomputed; a legacy file is hashed here (~40 ms once, at load). Either way
-/// the value is a function of the FILE bytes, so two processes agree on it
-/// whatever SIMD tier they resolved — which is what makes it usable as the
-/// name of a shared image.
+/// The file carries the digest, so it is read rather than recomputed. The value
+/// is a function of the FILE bytes, so two processes agree on it whatever SIMD
+/// tier they resolved — which is what makes it usable as the name of a shared
+/// image.
 ///
-/// Only meaningful on data that [`verify`] has accepted.
+/// Only for data that [`verify`] has accepted.
 pub fn content_hash(data: &[u8]) -> u64 {
-    if data.len() == NNUE_FILE_SIZE + FOOTER_SIZE {
-        let tail = &data[NNUE_FILE_SIZE..];
-        let magic = u32::from_le_bytes(tail[12..16].try_into().unwrap());
-        if magic == MAGIC {
-            return u64::from_le_bytes(tail[4..12].try_into().unwrap());
-        }
+    let tail = &data[data.len().saturating_sub(FOOTER_SIZE)..];
+    declared_hash(data.len(), tail).expect("a verified network declares its digest")
+}
+
+/// The digest a footered file declares, from the file's length and its last
+/// [`FOOTER_SIZE`] bytes alone; `None` for a file without one, which [`verify`]
+/// refuses. Lets a caller name a network before reading it whole.
+pub fn declared_hash(len: usize, tail: &[u8]) -> Option<u64> {
+    if len != NNUE_FILE_SIZE + FOOTER_SIZE || tail.len() != FOOTER_SIZE {
+        return None;
     }
-    fnv1a64(&data[..NNUE_FILE_SIZE])
+    let magic = u32::from_le_bytes(tail[12..16].try_into().unwrap());
+    (magic == MAGIC).then(|| u64::from_le_bytes(tail[4..12].try_into().unwrap()))
 }
 
 /// Build the 16-byte footer for a payload (test helper; the trainer has its
-/// own mirror implementation in tools/trainer5).
+/// own mirror implementation in tools/trainer8).
 pub fn footer(payload: &[u8]) -> [u8; FOOTER_SIZE] {
     debug_assert!(payload.len() == NNUE_FILE_SIZE);
     let mut f = [0u8; FOOTER_SIZE];
@@ -195,27 +194,46 @@ pub fn footer(payload: &[u8]) -> [u8; FOOTER_SIZE] {
 mod tests {
     use super::*;
 
-    /// Pins the architecture digest. tools/trainer5 pins the SAME literal
+    /// Pins the architecture digest. tools/trainer8 pins the SAME literal
     /// from its own constants: change one side's architecture and its golden
     /// test fails before any network is ever exported or loaded. A
     /// legitimate architecture change updates both literals consciously.
     #[test]
     fn the_architecture_digest_is_pinned_on_both_sides() {
-        assert_eq!(ARCH_HASH, 0xcc84_659e, "update tools/trainer6 in lockstep");
+        assert_eq!(ARCH_HASH, 0x9562_1179, "update tools/trainer8 in lockstep");
+    }
+
+    /// A payload of `NNUE_FILE_SIZE` patterned bytes with a believable output scale.
+    fn patterned(mul: usize, add: usize) -> Vec<u8> {
+        let mut data = vec![0u8; NNUE_FILE_SIZE];
+        for (i, b) in data.iter_mut().enumerate() {
+            *b = (i * mul + add) as u8;
+        }
+        let at = NNUE_FILE_SIZE - 64;
+        data[at..at + 4].copy_from_slice(&287i32.to_le_bytes());
+        data
+    }
+
+    #[test]
+    fn a_network_without_a_believable_scale_is_refused() {
+        let mut data = patterned(31, 7);
+        let at = NNUE_FILE_SIZE - 64;
+        data[at..at + 4].copy_from_slice(&0i32.to_le_bytes());
+        let mut footered = data.clone();
+        footered.extend_from_slice(&footer(&data));
+        let err = verify(&footered).unwrap_err();
+        assert!(err.contains("output scale"), "{err}");
     }
 
     #[test]
     fn a_footered_file_verifies_and_every_lie_is_caught() {
         // Small stand-in payload is not possible: verify() is anchored to
         // NNUE_FILE_SIZE. Build the real-size buffer once.
-        let mut data = vec![0u8; NNUE_FILE_SIZE];
-        for (i, b) in data.iter_mut().enumerate() {
-            *b = (i * 31 + 7) as u8;
-        }
+        let data = patterned(31, 7);
         let f = footer(&data);
         let mut footered = data.clone();
         footered.extend_from_slice(&f);
-        assert_eq!(verify(&footered), Ok(Provenance::Verified));
+        assert_eq!(verify(&footered), Ok(()));
 
         // Corrupt one payload byte: content hash catches it.
         let mut corrupt = footered.clone();
@@ -229,41 +247,33 @@ mod tests {
         let err = verify(&wrong_arch).unwrap_err();
         assert!(err.contains("wrong architecture"), "{err}");
 
-        // No footer at all: legacy, accepted.
-        assert_eq!(verify(&data), Ok(Provenance::Legacy));
-        // Legacy tolerance: up to 63 padding bytes, but not 64.
-        let mut padded = data.clone();
-        padded.extend_from_slice(&[0u8; 63]);
-        assert_eq!(verify(&padded), Ok(Provenance::Legacy));
-        padded.push(0);
-        assert!(verify(&padded).is_err());
-        // Undersized: rejected.
-        assert!(verify(&data[..NNUE_FILE_SIZE - 1]).is_err());
+        // No footer: refused, and said so, padded or not; the 16 bytes of a footer
+        // without its magic too.
+        for pad in [0, 16, 63] {
+            let mut bare = data.clone();
+            bare.resize(NNUE_FILE_SIZE + pad, 0);
+            let err = verify(&bare).unwrap_err();
+            assert!(
+                err.contains("no integrity footer"),
+                "{pad} bytes past the payload: {err}"
+            );
+        }
+        // Any other size: refused on its size.
+        let mut long = footered.clone();
+        long.resize(NNUE_FILE_SIZE + 64, 0);
+        for wrong in [&data[..NNUE_FILE_SIZE - 1], &long[..], &data[..100]] {
+            let err = verify(wrong).unwrap_err();
+            assert!(err.contains("File size"), "{} bytes: {err}", wrong.len());
+        }
     }
 
-    /// Two processes must agree on a network's name whether or not the file
-    /// they were handed carries a footer, so both paths land on the same
-    /// digest of the same payload.
+    /// The name read from the footer is the digest of the payload, which every
+    /// process that reads the file computes alike.
     #[test]
-    fn the_content_hash_is_the_same_footered_or_not() {
-        let mut data = vec![0u8; NNUE_FILE_SIZE];
-        for (i, b) in data.iter_mut().enumerate() {
-            *b = (i * 17 + 3) as u8;
-        }
+    fn the_content_hash_is_the_payload_digest() {
+        let data = patterned(17, 3);
         let mut footered = data.clone();
         footered.extend_from_slice(&footer(&data));
-
-        let bare = content_hash(&data);
-        assert_eq!(bare, fnv1a64(&data));
-        assert_eq!(
-            content_hash(&footered),
-            bare,
-            "footer must carry the payload digest"
-        );
-
-        // Legacy padding is not payload: it must not move the name.
-        let mut padded = data.clone();
-        padded.extend_from_slice(&[0xabu8; 63]);
-        assert_eq!(content_hash(&padded), bare);
+        assert_eq!(content_hash(&footered), fnv1a64(&data));
     }
 }

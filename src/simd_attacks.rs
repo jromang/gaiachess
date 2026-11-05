@@ -48,6 +48,10 @@ struct AvxTableData {
     rook_mask_ns: [[i64; 2]; 64],
     // Rook E/W: precomputed rank attack table (6-bit inner occupancy × 8 files)
     rook_attacks_ew: [u8; 512],
+    // Hyperbola quintessence lines through each square, the square itself left out:
+    // [file, diagonal, anti-diagonal, unused] — one byte per rank on each, which is
+    // what lets a byte swap stand in for the bit reversal
+    hq_lines: [[i64; 4]; 64],
 }
 
 static AVX_TABLES: AvxTableData = make_tables();
@@ -82,6 +86,7 @@ const fn make_tables() -> AvxTableData {
         bishop_mask: [[0i64; 4]; 64],
         rook_mask_ns: [[0i64; 2]; 64],
         rook_attacks_ew: [0u8; 512],
+        hq_lines: [[0i64; 4]; 64],
     };
     // "Left" = positive direction rays (towards higher bits for that direction)
     // CFish ordering: [East, North, NE, NW] for left, [West, South, SW, SE] for right
@@ -119,6 +124,13 @@ const fn make_tables() -> AvxTableData {
         data.rook_mask_ns[sq as usize] = [
             ray_mask(sq, DIR_NORTH) as i64,
             ray_mask(flipped_sq, DIR_NORTH) as i64,
+        ];
+
+        data.hq_lines[sq as usize] = [
+            (ray_mask(sq, DIR_NORTH) | ray_mask(sq, DIR_SOUTH)) as i64,
+            (ray_mask(sq, DIR_NORTH_EAST) | ray_mask(sq, DIR_SOUTH_WEST)) as i64,
+            (ray_mask(sq, DIR_NORTH_WEST) | ray_mask(sq, DIR_SOUTH_EAST)) as i64,
+            0,
         ];
         sq += 1;
     }
@@ -162,6 +174,38 @@ const fn make_tables() -> AvxTableData {
 #[inline(always)]
 fn tables() -> &'static AvxTableData {
     &AVX_TABLES
+}
+
+/// Rank attacks of a rook on `sq`: the 6 inner bits of the rank pick the entry.
+#[inline(always)]
+fn rank_attacks(sq: Square, occupied: u64) -> u64 {
+    let r8 = sq.rank() as usize * 8;
+    let occ_rank = ((occupied >> r8) & 0x7E) as usize;
+    (tables().rook_attacks_ew[occ_rank * 4 + sq.file() as usize] as u64) << r8
+}
+
+/// Bishop and rook attacks of `sq` together, by hyperbola quintessence: on a file or
+/// a diagonal every square sits in its own byte, so swapping the bytes reverses the
+/// line and one subtraction from each end finds the first blocker both ways. The
+/// rank, all in one byte, comes from the lookup. Scalar form of `avx2::both_attacks`,
+/// for the tests of every architecture.
+#[cfg(test)]
+fn both_attacks_portable(sq: Square, occupied: u64) -> (u64, u64) {
+    let line = |mask: i64| {
+        let mask = mask as u64;
+        let o = occupied & mask;
+        let fwd = o.wrapping_sub(sq.bb());
+        let rev = o
+            .swap_bytes()
+            .wrapping_sub(sq.bb().swap_bytes())
+            .swap_bytes();
+        (fwd ^ rev) & mask
+    };
+    let [file, diag, anti, _] = tables().hq_lines[sq.index()];
+    (
+        line(diag) | line(anti),
+        line(file) | rank_attacks(sq, occupied),
+    )
 }
 
 // ============================================================
@@ -230,6 +274,38 @@ mod avx2 {
         ns | (ew << r8)
     }
 
+    /// Bishop and rook attacks together (`both_attacks_portable`, one line per lane):
+    /// file, diagonal and anti-diagonal in one register, the rank from the lookup.
+    #[inline(always)]
+    pub fn both_attacks(sq: Square, occupied: u64) -> (u64, u64) {
+        unsafe {
+            let t = super::tables();
+            let mask = _mm256_loadu_si256(t.hq_lines[sq.index()].as_ptr() as *const __m256i);
+            // Reverses the bytes of each 64-bit lane
+            let bswap = _mm256_set_epi8(
+                8, 9, 10, 11, 12, 13, 14, 15, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+                0, 1, 2, 3, 4, 5, 6, 7,
+            );
+            let bit = sq.bb() as i64;
+            let o = _mm256_and_si256(mask, _mm256_set1_epi64x(occupied as i64));
+            let fwd = _mm256_sub_epi64(o, _mm256_set1_epi64x(bit));
+            let rev = _mm256_shuffle_epi8(
+                _mm256_sub_epi64(
+                    _mm256_shuffle_epi8(o, bswap),
+                    _mm256_set1_epi64x(bit.swap_bytes()),
+                ),
+                bswap,
+            );
+            let lines = _mm256_and_si256(_mm256_xor_si256(fwd, rev), mask);
+            let low = _mm256_castsi256_si128(lines);
+            let file = _mm_cvtsi128_si64(low) as u64;
+            let bishop = (_mm_extract_epi64::<1>(low)
+                | _mm_cvtsi128_si64(_mm256_extracti128_si256::<1>(lines)))
+                as u64;
+            (bishop, file | super::rank_attacks(sq, occupied))
+        }
+    }
+
     /// Queen attacks: 4 positive rays (BLSMSK) + 4 negative rays (PP-fill or lzcnt)
     #[inline(always)]
     pub fn queen_attacks(sq: Square, occupied: u64) -> u64 {
@@ -247,30 +323,29 @@ mod avx2 {
             // Right/negative rays
             let slide4;
 
-            #[cfg(all(target_feature = "avx512cd", target_feature = "avx512vl"))]
-            {
-                let rmasked = _mm256_and_si256(occupied4, rmask);
-                let lzcnt = _mm256_lzcnt_epi64(rmasked);
-                let rslide = _mm256_srav_epi64(_mm256_set1_epi64x(i64::MIN), lzcnt);
-                slide4 = _mm256_ternarylogic_epi64(left, rslide, rmask, 0xf8);
-            }
+            cfg_select! {
+                all(target_feature = "avx512cd", target_feature = "avx512vl") => {
+                    let rmasked = _mm256_and_si256(occupied4, rmask);
+                    let lzcnt = _mm256_lzcnt_epi64(rmasked);
+                    let rslide = _mm256_srav_epi64(_mm256_set1_epi64x(i64::MIN), lzcnt);
+                    slide4 = _mm256_ternarylogic_epi64(left, rslide, rmask, 0xf8);
+                }
+                _ => {
+                    let shifts_1 = _mm256_set_epi64x(7, 9, 8, 1);
+                    let shifts_2 = _mm256_set_epi64x(14, 18, 16, 2);
+                    let shifts_4 = _mm256_set_epi64x(28, 36, 32, 4);
 
-            #[cfg(not(all(target_feature = "avx512cd", target_feature = "avx512vl")))]
-            {
-                let shifts_1 = _mm256_set_epi64x(7, 9, 8, 1);
-                let shifts_2 = _mm256_set_epi64x(14, 18, 16, 2);
-                let shifts_4 = _mm256_set_epi64x(28, 36, 32, 4);
-
-                let mut rslide = _mm256_and_si256(occupied4, rmask);
-                rslide = _mm256_or_si256(
-                    _mm256_srlv_epi64(rslide, shifts_2),
-                    _mm256_srlv_epi64(rslide, shifts_1),
-                );
-                rslide = _mm256_or_si256(
-                    _mm256_srlv_epi64(rslide, shifts_4),
-                    _mm256_or_si256(rslide, _mm256_srlv_epi64(rslide, shifts_2)),
-                );
-                slide4 = _mm256_or_si256(left, _mm256_andnot_si256(rslide, rmask));
+                    let mut rslide = _mm256_and_si256(occupied4, rmask);
+                    rslide = _mm256_or_si256(
+                        _mm256_srlv_epi64(rslide, shifts_2),
+                        _mm256_srlv_epi64(rslide, shifts_1),
+                    );
+                    rslide = _mm256_or_si256(
+                        _mm256_srlv_epi64(rslide, shifts_4),
+                        _mm256_or_si256(rslide, _mm256_srlv_epi64(rslide, shifts_2)),
+                    );
+                    slide4 = _mm256_or_si256(left, _mm256_andnot_si256(rslide, rmask));
+                }
             }
 
             let slide2 = _mm_or_si128(
@@ -361,41 +436,37 @@ mod avx512 {
     #[inline(always)]
     fn fold_512(attacks: __m512i) -> u64 {
         unsafe {
-            #[cfg(all(
-                target_feature = "avx512bw",
-                target_feature = "avx512vbmi",
-                target_feature = "gfni"
-            ))]
-            {
-                let attacks = _mm512_gf2p8affine_epi64_epi8(
-                    _mm512_set1_epi64(0x8040201008040201u64 as i64),
-                    _mm512_permutexvar_epi8(
-                        _mm512_set_epi8(
-                            7, 15, 23, 31, 39, 47, 55, 63, 6, 14, 22, 30, 38, 46, 54, 62, 5, 13,
-                            21, 29, 37, 45, 53, 61, 4, 12, 20, 28, 36, 44, 52, 60, 3, 11, 19, 27,
-                            35, 43, 51, 59, 2, 10, 18, 26, 34, 42, 50, 58, 1, 9, 17, 25, 33, 41,
-                            49, 57, 0, 8, 16, 24, 32, 40, 48, 56,
+            cfg_select! {
+                all(
+                    target_feature = "avx512bw",
+                    target_feature = "avx512vbmi",
+                    target_feature = "gfni"
+                ) => {
+                    let attacks = _mm512_gf2p8affine_epi64_epi8(
+                        _mm512_set1_epi64(0x8040201008040201u64 as i64),
+                        _mm512_permutexvar_epi8(
+                            _mm512_set_epi8(
+                                7, 15, 23, 31, 39, 47, 55, 63, 6, 14, 22, 30, 38, 46, 54, 62, 5, 13,
+                                21, 29, 37, 45, 53, 61, 4, 12, 20, 28, 36, 44, 52, 60, 3, 11, 19,
+                                27, 35, 43, 51, 59, 2, 10, 18, 26, 34, 42, 50, 58, 1, 9, 17, 25, 33,
+                                41, 49, 57, 0, 8, 16, 24, 32, 40, 48, 56,
+                            ),
+                            attacks,
                         ),
-                        attacks,
-                    ),
-                    0,
-                );
-                _mm512_test_epi8_mask(attacks, attacks)
-            }
-
-            #[cfg(not(all(
-                target_feature = "avx512bw",
-                target_feature = "avx512vbmi",
-                target_feature = "gfni"
-            )))]
-            {
-                let lo = _mm512_castsi512_si256(attacks);
-                let hi = _mm512_extracti64x4_epi64::<1>(attacks);
-                let combined = _mm256_or_si256(lo, hi);
-                let lo128 = _mm256_castsi256_si128(combined);
-                let hi128 = _mm256_extracti128_si256::<1>(combined);
-                let combined128 = _mm_or_si128(lo128, hi128);
-                (_mm_extract_epi64::<0>(combined128) | _mm_extract_epi64::<1>(combined128)) as u64
+                        0,
+                    );
+                    _mm512_test_epi8_mask(attacks, attacks)
+                }
+                _ => {
+                    let lo = _mm512_castsi512_si256(attacks);
+                    let hi = _mm512_extracti64x4_epi64::<1>(attacks);
+                    let combined = _mm256_or_si256(lo, hi);
+                    let lo128 = _mm256_castsi256_si128(combined);
+                    let hi128 = _mm256_extracti128_si256::<1>(combined);
+                    let combined128 = _mm_or_si128(lo128, hi128);
+                    (_mm_extract_epi64::<0>(combined128) | _mm_extract_epi64::<1>(combined128))
+                        as u64
+                }
             }
         }
     }
@@ -426,6 +497,13 @@ pub fn queen_attacks(sq: Square, occupied: u64) -> u64 {
     avx2::queen_attacks(sq, occupied)
 }
 
+/// Bishop and rook attacks of one square in one pass (dual hyperbola quintessence).
+#[cfg(target_feature = "avx2")]
+#[inline(always)]
+pub fn both_attacks(sq: Square, occupied: u64) -> (u64, u64) {
+    avx2::both_attacks(sq, occupied)
+}
+
 /// Whether the AVX-512 Kogge-Stone setwise fill runs — decided once at startup
 /// by `cpu::init` (AVX-512F detected), read as a plain load. Defaults to false
 /// so binaries that skipped init (unit tests) take the loop, which returns
@@ -450,25 +528,26 @@ pub fn slider_attacks_setwise(bishops: u64, rooks: u64, queens: u64, occupied: u
     if USE_SETWISE512.load(std::sync::atomic::Ordering::Relaxed) {
         return unsafe { avx512::slider_attacks_setwise(bishops, rooks, queens, occupied) };
     }
-    #[cfg(all(target_feature = "avx512f", not(gaia_dist)))]
-    return unsafe { avx512::slider_attacks_setwise(bishops, rooks, queens, occupied) };
-
-    #[cfg(not(all(target_feature = "avx512f", not(gaia_dist))))]
-    {
-        let mut attacks = 0u64;
-        let bq = bishops | queens;
-        let rq = rooks | queens;
-        let mut bb = bq;
-        while bb != 0 {
-            let sq = pop_lsb(&mut bb);
-            attacks |= crate::bitboard::bishop_attacks(sq, occupied);
+    cfg_select! {
+        all(target_feature = "avx512f", not(gaia_dist)) => {
+            unsafe { avx512::slider_attacks_setwise(bishops, rooks, queens, occupied) }
         }
-        bb = rq;
-        while bb != 0 {
-            let sq = pop_lsb(&mut bb);
-            attacks |= crate::bitboard::rook_attacks(sq, occupied);
+        _ => {
+            let mut attacks = 0u64;
+            let bq = bishops | queens;
+            let rq = rooks | queens;
+            let mut bb = bq;
+            while bb != 0 {
+                let sq = pop_lsb(&mut bb);
+                attacks |= crate::bitboard::bishop_attacks(sq, occupied);
+            }
+            bb = rq;
+            while bb != 0 {
+                let sq = pop_lsb(&mut bb);
+                attacks |= crate::bitboard::rook_attacks(sq, occupied);
+            }
+            attacks
         }
-        attacks
     }
 }
 
@@ -498,6 +577,50 @@ mod tests {
         assert!(east_mask & Square::F4.bb() != 0);
         assert!(east_mask & Square::H4.bb() != 0);
         assert!(east_mask & Square::E4.bb() == 0); // excludes the square itself
+    }
+
+    fn spread_occupancies() -> Vec<u64> {
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        let mut occs = vec![0, u64::MAX, 0x00FF00FF00FF00FF, 0x8142241818244281];
+        for _ in 0..400 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            // Dense, sparse and in between: and-ing draws thins the board out.
+            let sparse = state & state.rotate_left(17) & state.rotate_left(31);
+            occs.push(state);
+            occs.push(sparse);
+            occs.push(state & state.rotate_left(29));
+        }
+        occs
+    }
+
+    /// The hyperbola quintessence of `both_attacks` answers what the ray walker
+    /// answers, on every square — checked on any architecture through its scalar form.
+    #[test]
+    fn both_attacks_by_hyperbola_match_the_ray_walker() {
+        for sq in 0..64u8 {
+            let sq = Square(sq);
+            for occ in spread_occupancies() {
+                let want = (reference_bishop(sq, occ), reference_rook(sq, occ));
+                assert_eq!(both_attacks_portable(sq, occ), want, "{sq} occ {occ:#018x}");
+            }
+        }
+    }
+
+    #[cfg(target_feature = "avx2")]
+    #[test]
+    fn both_attacks_avx2_matches_its_scalar_form() {
+        for sq in 0..64u8 {
+            let sq = Square(sq);
+            for occ in spread_occupancies() {
+                assert_eq!(
+                    both_attacks(sq, occ),
+                    both_attacks_portable(sq, occ),
+                    "{sq} occ {occ:#018x}"
+                );
+            }
+        }
     }
 
     #[test]

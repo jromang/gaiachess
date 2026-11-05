@@ -1,37 +1,40 @@
 //! NNUE evaluation: efficiently updatable neural network.
 //!
-//! Architecture GaiaNet-T2:
+//! Architecture GaiaNet-T7:
 //!   ```text
 //!   Position
 //!     |
-//!     +-- HalfKA PST (12 king buckets x 768 = 9,216 features, i16 weights)
-//!     |     -> [PST Accumulator i16[1024] x 2 perspectives, incremental + Finny cache]
+//!     +-- K32Q2 piece-square block (32 king buckets x opponent queen x 704 = 45,056, i8)
+//!     +-- Pawn pairs (4,560, i8, 3-file window) + pairwise threats (59,808, i8)
+//!     |     -> [Accumulator i16[1024] x 2 perspectives: all three summed, updated in one
+//!     |         pass per move; Finny cache for the piece squares, pawn-pair cache]
 //!     |
-//!     +-- Pawn pairs (4,560 features, i8, 3-file window) + pairwise threats (59,808, i8)
-//!     |     -> [ThreatAccumulator i16[1024] x 2, incremental + dirty updates]
-//!     |
-//!     +----> PST + aux -> activate_ft -> within-side pairwise -> u8[1024]
-//!              -> L1 sparse (1024->16, dpbusd) -> CReLU+squared -> f32[32]
-//!              -> L2 dense (32->32, FMA) -> squared -> f32[32]
-//!              -> L3 dense (concat(l2[32], l1[32]) -> 1) x 8 output buckets
-//!              -> + PSQT head (i32 per feature per bucket, stm - ntm) -> centipawns
+//!     +----> activate_ft -> within-side pairwise -> u8[1024]
+//!              -> L1 sparse (1024->32, dpbusd) -> [x² >> 21, x >> 7] clipped -> u8[64]
+//!              -> L2 dense (64->64, dpbusd) -> gate g[32], value v[32]
+//!              -> h = (g·g·v) >> 14, signed
+//!              -> L3 (concat(u8[64], h[32]) -> 1) + skip (l1[30] - l1[31])
+//!              x 32 layer stacks, integer from end to end -> centipawns
 //!   ```
 //!
 //! Submodules:
-//!   - `features`: HalfKA PST indexing (12 king buckets, horizontal mirroring)
+//!   - `features`: K32Q2 indexing (32 king buckets, opponent queen, horizontal mirroring)
 //!   - `threats`: pairwise threat features (59,808), incremental dirty updates
 //!   - `move_threats`: the threat changes of a move, recorded when it is played
 //!   - `pawn_pairs`: 3-file pawn-pawn relations (4,560)
-//!   - `accumulator`: PST accumulator (Finny cache), incremental push/pop
-//!   - `network`: NNUEParams struct (~85 MB), weight loading (direct memcpy)
-//!   - `forward`: forward pass (activate_ft, NNZ, L1/L2/L3 with skip connection)
+//!   - `accumulator`: the accumulator, piece-square changes of a move, Finny cache
+//!   - `network`: NNUEParams struct (~114 MB), weight loading
+//!   - `forward`: forward pass helpers (NNZ, reference evaluation for the tests)
 //!   - `simd`: SIMD primitives (AVX-512 > AVX2 > NEON > scalar)
 //!
-//! Dual perspective (STM + NSTM). SIMD-accelerated (AVX2/AVX-512) with scalar fallback.
+//! Dual perspective (STM + NSTM). SIMD-accelerated with a scalar fallback; every tier
+//! computes the same integers, so the evaluation is identical on all of them.
 
 pub mod accumulator;
 pub mod features;
 pub(crate) mod forward;
+pub mod ftperm;
+pub mod ftperm_order;
 pub mod integrity;
 pub(crate) mod kernels;
 pub(crate) mod move_threats;
@@ -55,20 +58,27 @@ use crate::position::Position;
 use crate::types::*;
 
 use accumulator::{AccDelta, Accumulator, FinnyTable};
-use threats::ThreatAccumulator;
+use threats::PawnPairCache;
 
 // ============================================================
 // Architecture constants
 // ============================================================
 
-/// Number of king position buckets (see features::KING_BUCKETS).
-pub const INPUT_BUCKETS: usize = 12;
+/// King buckets: one per square of files a-d (see features::KING_BUCKETS).
+pub const KING_BUCKET_COUNT: usize = 32;
 
-/// Features per bucket: 2 colors × 6 piece types × 64 squares.
-pub const INPUTS_PER_BUCKET: usize = 768;
+/// States of the opponent's queen: absent, present.
+pub const QUEEN_STATES: usize = 2;
 
-/// Total PST feature transformer input size.
-pub const FT_SIZE: usize = INPUT_BUCKETS * INPUTS_PER_BUCKET;
+/// Piece-square blocks: a king bucket and the opponent queen's state.
+pub const PSQ_BLOCKS: usize = KING_BUCKET_COUNT * QUEEN_STATES;
+
+/// Features per block: 10 planes of pawn to queen (both sides) and one plane for
+/// both kings, 64 squares each.
+pub const PSQ_PER_BLOCK: usize = 11 * 64;
+
+/// Total piece-square feature transformer input size.
+pub const PSQ_SIZE: usize = PSQ_BLOCKS * PSQ_PER_BLOCK;
 
 /// 3-file pawn-pair features: C(96, 2) = 4,560.
 /// 48 pawn squares × 2 colours, unordered pairs, i8 weights.
@@ -88,77 +98,126 @@ pub const THREAT_INPUT_SIZE: usize = PAWN_PAIR_SIZE + THREAT_FEATURE_COUNT;
 /// Feature transformer output / L1 input size (per perspective).
 pub const L1_SIZE: usize = 1024;
 
+const _: () = assert!(PSQ_SIZE == 45_056);
 const _: () = assert!(PAWN_PAIR_SIZE == 4_560);
 const _: () = assert!(THREAT_FEATURE_COUNT == 59_808);
 const _: () = assert!(THREAT_INPUT_SIZE == 64_368);
 const _: () = assert!(L1_SIZE % 64 == 0, "packus permutation groups are 64 wide");
 
-/// L1 output (before pairing): matmul output size per bucket.
-pub const L2_SIZE: usize = 16;
+/// L1 outputs (the sparse layer's width) per layer stack.
+pub const L1_OUT: usize = 32;
 
-/// L2 output / L3 skip input size.
-pub const L3_SIZE: usize = 32;
+/// L1 activations: `[x², x]` of every L1 output, u8.
+pub const A1_SIZE: usize = 2 * L1_OUT;
 
-/// Number of output buckets (material-based).
-pub const OUTPUT_BUCKETS: usize = 8;
+/// L2 outputs per stack: the gates, then the values they multiply.
+pub const L2_OUT: usize = 64;
 
-/// Feature transformer quantization factor (CReLU clamp max).
+/// Gated L2 outputs: `h = g² · v`.
+pub const GATED: usize = L2_OUT / 2;
+
+/// L3 inputs: the L1 activations, then the gated L2 outputs.
+pub const L3_IN: usize = A1_SIZE + GATED;
+
+/// Number of layer stacks: piece count buckets × queens on the board.
+pub const STACKS: usize = 32;
+
+/// The output of L1 that the skip connection reads positively, then negatively.
+pub const SKIP_POS: usize = L1_OUT - 2;
+pub const SKIP_NEG: usize = L1_OUT - 1;
+
+/// Feature transformer activation clamp (the FT's unit is 256: one is just above).
 pub const FT_QUANT: i16 = 255;
 
-/// L1 weight quantization factor.
-pub const L1_QUANT: i32 = 64;
-
-/// Right-shift for pairwise product: `(a * b) >> FT_SHIFT`.
+/// Right-shift for pairwise product: `(a * b) >> FT_SHIFT`, which lands on the hidden
+/// unit 128 exactly (256 × 256 / 512).
 pub const FT_SHIFT: i32 = 9;
 
-/// L1 dequantization multiplier: converts i32 dpbusd accumulator to f32.
-/// `(1 << FT_SHIFT) / (FT_QUANT * FT_QUANT * L1_QUANT)`
-pub const L1_NORMALISATION: f32 =
-    (1 << FT_SHIFT) as f32 / (FT_QUANT as f32 * FT_QUANT as f32 * L1_QUANT as f32);
+/// Hidden activations are u8 with one = 128, clipped to 127.
+pub const HIDDEN_MAX: i32 = 127;
 
-/// Final output scaling to centipawns.
-/// Network output calibration constant (287 centipawns per unit).
+/// L1 output: weights ×128 on inputs of unit 128, so one = 2^14. Shifts to unit 128.
+pub const L1_SHIFT: i32 = 7;
+/// `x² >> L1_SQR_SHIFT` is the square in unit 128: 2 × 14 − 7.
+pub const L1_SQR_SHIFT: i32 = 21;
+/// `|x|` at and above which the square saturates (16384² >> 21 = 128 > 127): clamping
+/// there first keeps the square within i32 and changes no output.
+pub const L1_SQR_CLAMP: i32 = 1 << 14;
+/// L2 output: weights ×64 on inputs of unit 128, so one = 2^13. Shifts to unit 128.
+pub const L2_SHIFT: i32 = 6;
+/// `g · g · v >> GATE_SHIFT` is the product in unit 128: 3 × 7 − 7.
+pub const GATE_SHIFT: i32 = 14;
+/// The network output and the skip: weights ×128 on inputs of unit 128.
+pub const OUTPUT_ONE: i64 = 1 << 14;
+
+/// Default output scale (centipawns per network unit), written in every T7 file's
+/// metadata and read from there; the trainer's `eval_scale`.
 pub const NETWORK_SCALE: i32 = 287;
 
-/// PSQT head quantization factor: weights stored as `round(w × 16384)` in i32.
-/// Power of two so the dequantization divide is exact in f32.
-pub const PSQT_QUANT: i32 = 16384;
-
 // ============================================================
-// Output bucket scheme
+// Layer stack selection
 // ============================================================
 
-/// Output bucket scheme: material-value weighted.
-/// `[knight, bishop, rook, queen weight, divisor, max bucket]` —
-/// `bucket = min(max, (3N + 4B + 8R + 18Q) / 12)`, pawns and kings excluded,
-/// so pawn moves and pawn trades never change the bucket.
-/// Hashed into ARCH_HASH in this order; the trainer mirrors the same scheme
-/// from its own constants (an accidental drift fails the golden tests).
-pub const OUTPUT_BUCKET_SCHEME: [usize; 6] = [3, 4, 8, 18, 12, OUTPUT_BUCKETS - 1];
+/// The layer stack of a position: its piece count (kings and pawns included) in eight
+/// bands, then whether the side to move and its opponent each have a queen.
+/// `((pieces − 1) / 4) × 4 + 2 · [queen of the side to move] + [queen of the other]`.
+pub const STACK_SCHEME: [usize; 3] = [4, 2, 1];
 
 // ============================================================
 // Network struct
 // ============================================================
 
-/// Per-thread NNUE state: PST accumulator stack + threat accumulator stack.
+/// Per-thread NNUE state: the accumulator stack and the caches that refresh it.
 ///
-/// Threats are updated incrementally when possible (diff-based),
-/// falling back to full recompute when king mirroring changes.
+/// Updated incrementally when possible (the moves since the nearest accurate ancestor,
+/// one pass each), refreshed from the caches when a king moves or the opponent's queen
+/// appears or disappears: the piece-square block of that perspective changes.
 pub struct Network {
     /// Current ply index in the accumulator stack.
     index: usize,
-    /// PST accumulator stack: one per ply (pre-allocated).
+    /// Accumulator stack: one per ply (pre-allocated).
     accumulators: Box<[Accumulator]>,
-    /// Finny table: PST accumulator refresh cache per (perspective, mirrored, bucket).
+    /// Finny table: the bias plus the piece-square part per (perspective, king square,
+    /// opponent queen).
     cache: FinnyTable,
-    /// Threat accumulator stack: one per ply (pre-allocated).
-    threat_acc: Box<[ThreatAccumulator]>,
+    /// Pawn-pair sums per (perspective, mirrored), the start of every full threat recompute.
+    pawn_cache: PawnPairCache,
+    /// The changed threat features of the update in progress, kept off the stack.
+    threat_dirty: Box<threats::DirtyPair>,
     /// The copy of the network this state evaluates with: the replica of its thread's
     /// node when the search is pinned, `None` for the shared copy. Set once per search
     /// by [`Network::use_params`], so no node ever pays for finding it — a thread-local
     /// read is a function call on some targets, and the kernels need the weights
     /// several times per node.
     params: Option<&'static network::NNUEParams>,
+}
+
+/// How one perspective of the current ply gets up to date.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Plan {
+    /// Already accurate.
+    Done,
+    /// The moves since this accurate ancestor, applied one pass each.
+    Chain(usize),
+    /// The move into this ply changed the side's piece-square block (its king moved
+    /// within the same half, or the opponent's queen appeared or disappeared), from an
+    /// accurate parent: the parent with its piece-square part swapped for the new
+    /// block's, plus the move's threats.
+    BlockSwap,
+    /// From the caches: the piece-square part, the pawn pairs, every threat.
+    Full,
+}
+
+/// Whether the move recorded in `delta` changes the piece-square block of
+/// `perspective`: its king lands on another square or half, or the presence of the
+/// opponent's queen flips. Nothing of the piece-square part carries over.
+#[inline]
+fn block_changes(delta: &AccDelta, perspective: Color) -> bool {
+    delta.queen_flip[perspective.index()]
+        || (delta.moved_piece.piece_type() == PieceType::King
+            && delta.moved_piece.color() == perspective
+            // Castling encodes `to` as the rook origin: ask where the king lands.
+            && features::needs_refresh(delta.mv.from_sq(), delta.mv.lands_on(), perspective))
 }
 
 impl Network {
@@ -168,15 +227,12 @@ impl Network {
             .map(|_| Accumulator::new())
             .collect::<Vec<_>>()
             .into_boxed_slice();
-        let threat_acc = (0..MAX_PLY + 1)
-            .map(|_| ThreatAccumulator::new())
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
         Network {
             index: 0,
             accumulators,
             cache: FinnyTable::new(),
-            threat_acc,
+            pawn_cache: PawnPairCache::new(),
+            threat_dirty: Box::new(threats::DirtyPair::new()),
             params: None,
         }
     }
@@ -196,22 +252,20 @@ impl Network {
         }
     }
 
-    /// Initialize the root PST accumulator and threat accumulator from the current position.
+    /// Initialize the root accumulator from the current position.
     /// Must be called before the first search.
     pub fn refresh(&mut self, pos: &Position) {
         self.index = 0;
-        let params = self.params();
-        self.accumulators[0].refresh_with_cache(params, pos, Color::White, &mut self.cache);
-        self.accumulators[0].refresh_with_cache(params, pos, Color::Black, &mut self.cache);
-        debug_assert!(
-            self.accumulators[0].accurate == [true; 2],
-            "NNUE refresh: PST accumulator not accurate after refresh"
-        );
-        // Full threat compute at root (no parent available)
-        self.threat_acc[0].update_full(params, pos);
+        for pov in 0..2 {
+            self.refresh_full(pos, pov);
+        }
+        #[cfg(feature = "stats")]
+        threats::tally::add(threats::tally::FULL_ROOT, 1);
+        #[cfg(debug_assertions)]
+        self.debug_check(pos);
     }
 
-    /// Push a new ply onto the accumulator stacks, and record the attacks the move
+    /// Push a new ply onto the accumulator stack, and record the attacks the move
     /// creates and destroys.
     ///
     /// Must be called BEFORE `Position::make_move()` so we can read the
@@ -234,26 +288,28 @@ impl Network {
 
         let from = mv.from_sq();
         let to = mv.to_sq();
-
-        self.accumulators[self.index].accurate = [false; 2];
-        self.accumulators[self.index].delta = AccDelta {
-            mv,
-            moved_piece: pos.piece_on(from),
-            captured_piece: if mv.move_type() == MT_EN_PASSANT {
-                Piece::new(PieceType::Pawn, !pos.side_to_move)
-            } else if mv.move_type() == MT_CASTLING {
-                Piece::NONE
-            } else {
-                pos.piece_on(to)
-            },
-            old_occ: pos.occupied(),
+        let moved_piece = pos.piece_on(from);
+        let captured_piece = if mv.move_type() == MT_EN_PASSANT {
+            Piece::new(PieceType::Pawn, !pos.side_to_move)
+        } else if mv.move_type() == MT_CASTLING {
+            Piece::NONE
+        } else {
+            pos.piece_on(to)
         };
-        let threat_acc = &mut self.threat_acc[self.index];
-        threat_acc.accurate = [false; 2];
-        move_threats::record(pos, &self.accumulators[self.index].delta, &mut threat_acc.moved);
+
+        let acc = &mut self.accumulators[self.index];
+        acc.accurate = [false; 2];
+        acc.delta = AccDelta {
+            mv,
+            moved_piece,
+            captured_piece,
+            old_occ: pos.occupied(),
+            queen_flip: queen_flips(pos, mv, moved_piece, captured_piece),
+        };
+        move_threats::record(pos, &acc.delta, &mut acc.moved);
     }
 
-    /// Push a null move onto the PST accumulator stack (lazy — no clone).
+    /// Push a null move onto the accumulator stack (lazy — no clone).
     ///
     /// CORRECTNESS: `accurate` MUST be set to `[false; 2]` here. See the
     /// stale accumulator bug documentation in MEMORY.md.
@@ -262,7 +318,6 @@ impl Network {
         debug_assert!(self.index < self.accumulators.len());
         self.accumulators[self.index].accurate = [false; 2];
         self.accumulators[self.index].delta = AccDelta::default();
-        self.threat_acc[self.index].accurate = [false; 2];
     }
 
     /// Pop one ply from the accumulator stack (after unmake_move).
@@ -272,43 +327,6 @@ impl Network {
         self.index -= 1;
     }
 
-    /// Lazily update the PST accumulator from the nearest accurate ancestor.
-    pub fn ensure_updated(&mut self, pos: &Position) {
-        debug_assert!(
-            self.index < self.accumulators.len(),
-            "NNUE ensure_updated: index {} >= len {}",
-            self.index,
-            self.accumulators.len()
-        );
-
-        let params = self.params();
-        for &perspective in &[Color::White, Color::Black] {
-            let pov = perspective.index();
-            if self.accumulators[self.index].accurate[pov] {
-                continue;
-            }
-
-            match accumulator::find_update_source(&self.accumulators, self.index, perspective) {
-                Some(source) => {
-                    for ply in (source + 1)..=self.index {
-                        let (left, right) = self.accumulators.split_at_mut(ply);
-                        let prev = &left[ply - 1];
-                        let current = &mut right[0];
-                        current.update_from(params, prev, pos, perspective);
-                    }
-                }
-                None => {
-                    self.accumulators[self.index].refresh_with_cache(
-                        params,
-                        pos,
-                        perspective,
-                        &mut self.cache,
-                    );
-                }
-            }
-        }
-    }
-
     pub fn evaluate(&mut self, pos: &Position) -> i32 {
         debug_assert!(pos.checkers == 0, "NNUE evaluate: called while in check");
 
@@ -316,124 +334,314 @@ impl Network {
         self.forward(pos)
     }
 
-    /// Bring both the PST and threat accumulators up-to-date without evaluating.
-    ///
-    /// Called at nodes that reuse a TT eval and never reach `evaluate`: their
-    /// children can then take the incremental update paths instead of paying a
-    /// full threat recompute each.
-    pub fn ensure_all_updated(&mut self, pos: &Position) {
-        self.ensure_updated(pos);
-        self.ensure_threats_updated(pos);
+    /// How perspective `pov` of the current ply gets up to date: walk back to the
+    /// nearest accurate ancestor, unless a move on the way changes the side's
+    /// piece-square block, or the chain grows past `THREAT_CHAIN_MAX` plies.
+    fn plan(&self, pov: usize) -> Plan {
+        let idx = self.index;
+        let accs = &self.accumulators;
+        if accs[idx].accurate[pov] {
+            return Plan::Done;
+        }
+        if idx == 0 {
+            return Plan::Full;
+        }
+        let perspective = if pov == 0 { Color::White } else { Color::Black };
+        let mut k = idx;
+        loop {
+            debug_assert!(k > 0);
+            let delta = &accs[k].delta;
+            if block_changes(delta, perspective) {
+                let from = delta.mv.from_sq();
+                let same_half = (from.file() >= 4) == (delta.mv.lands_on().file() >= 4)
+                    || delta.moved_piece.piece_type() != PieceType::King
+                    || delta.moved_piece.color() != perspective;
+                return if k == idx
+                    && accs[idx - 1].accurate[pov]
+                    && same_half
+                    && delta.mv.move_type() != MT_CASTLING
+                {
+                    Plan::BlockSwap
+                } else {
+                    Plan::Full
+                };
+            }
+            k -= 1;
+            if accs[k].accurate[pov] {
+                return Plan::Chain(k);
+            }
+            if k == 0 || idx - k >= threats::THREAT_CHAIN_MAX {
+                return Plan::Full;
+            }
+        }
     }
 
-    /// Bring the threat accumulator up-to-date from the nearest ancestor whose threats
-    /// are known, applying the moves recorded in between, or recompute it when none
-    /// is close.
+    /// Bring both perspectives of the current ply up to date without evaluating.
     ///
-    /// A ply without a static eval (in check, lazy eval) leaves its threats unknown,
-    /// and every child of it used to pay a full recompute. Applying two or three
-    /// recorded moves costs a fraction of that, and the plies applied become known for
-    /// the siblings that follow. Past `THREAT_CHAIN_MAX` plies the recompute is cheaper.
-    fn ensure_threats_updated(&mut self, pos: &Position) {
-        let idx = self.index;
-        let params = self.params();
-        if self.threat_acc[idx].accurate == [true; 2] {
+    /// Called at nodes that reuse a TT eval and never reach `evaluate`: their
+    /// children can then take the incremental paths instead of a refresh each.
+    pub fn ensure_all_updated(&mut self, pos: &Position) {
+        let plans = [self.plan(0), self.plan(1)];
+        if plans == [Plan::Done; 2] {
             return;
         }
 
-        let mut source = None;
-        for k in 1..=threats::THREAT_CHAIN_MAX.min(idx) {
-            if self.threat_acc[idx - k].accurate == [true; 2] {
-                source = Some(idx - k);
-                break;
+        // The incremental chains, ply by ply from the lowest source: a ply's threat
+        // record is decoded once for both perspectives.
+        let first = plans
+            .iter()
+            .filter_map(|p| match p {
+                Plan::Chain(s) => Some(*s),
+                _ => None,
+            })
+            .min();
+        if let Some(first) = first {
+            let mirrored = [
+                pos.king_sq(Color::White).file() >= 4,
+                pos.king_sq(Color::Black).file() >= 4,
+            ];
+            for ply in (first + 1)..=self.index {
+                let active = [0, 1].map(|pov| matches!(plans[pov], Plan::Chain(s) if s < ply));
+                self.step(ply, active, mirrored, pos);
             }
         }
-        let Some(source) = source else {
-            self.threat_acc[idx].update_full(params, pos);
-            return;
-        };
 
-        let mut replayed = true;
-        for ply in (source + 1)..=idx {
-            let (left, right) = self.threat_acc.split_at_mut(ply);
-            let parent = &left[ply - 1];
-            let current = &mut right[0];
-            if self.accumulators[ply].delta.mv == Move::NONE {
-                current.copy_from(parent);
-                continue;
+        for pov in 0..2 {
+            match plans[pov] {
+                Plan::BlockSwap => self.block_swap(pos, pov),
+                Plan::Full => self.refresh_full(pos, pov),
+                Plan::Done | Plan::Chain(_) => {}
             }
-            if !current.apply_moved(params, parent) {
-                // A king crossed the centre at this ply: nothing before it carries over.
-                replayed = false;
-                break;
-            }
-        }
-        if !replayed {
-            self.threat_acc[idx].update_full(params, pos);
         }
 
         #[cfg(debug_assertions)]
-        {
-            let (full, full_psqt) = threats::compute_full_threats_with(params, pos);
-            let acc = &self.threat_acc[idx];
+        self.debug_check(pos);
+    }
+
+    /// Apply the move into `ply` to the perspectives in `active`, from the accurate
+    /// accumulator of the ply before: its piece-square, threat and pawn-pair rows in
+    /// one pass.
+    fn step(&mut self, ply: usize, active: [bool; 2], mirrored: [bool; 2], pos: &Position) {
+        let params = self.params();
+        let (left, right) = self.accumulators.split_at_mut(ply);
+        let prev = &left[ply - 1];
+        let cur = &mut right[0];
+
+        // Null move: no feature changed, the parent's sums carry over.
+        if cur.delta.mv == Move::NONE {
             for pov in 0..2 {
-                debug_assert!(
-                    acc.values.0[pov][..] == full.0[pov][..],
-                    "threat chain mismatch against the full recompute: pov={pov}"
+                if active[pov] {
+                    debug_assert!(prev.accurate[pov]);
+                    cur.values.0[pov] = prev.values.0[pov];
+                    cur.accurate[pov] = true;
+                }
+            }
+            #[cfg(feature = "stats")]
+            threats::tally::add(threats::tally::PST_NULL_COPIES, 1);
+            return;
+        }
+
+        threats::collect_moved(&cur.moved, mirrored, active, &mut self.threat_dirty);
+        for pov in 0..2 {
+            if !active[pov] {
+                continue;
+            }
+            debug_assert!(prev.accurate[pov], "NNUE step: stale parent at ply {ply}");
+            let perspective = if pov == 0 { Color::White } else { Color::Black };
+            let psq = cur.psq_changes(pos, perspective);
+            let (adds, subs) = self.threat_dirty.pov(pov);
+            unsafe {
+                kernels::dispatch::combined_batch(
+                    prev.values.0[pov].as_ptr(),
+                    cur.values.0[pov].as_mut_ptr(),
+                    params.ft_psq_weights.0.as_ptr(),
+                    psq.adds(),
+                    psq.subs(),
+                    params.ft_threat_weights.0.as_ptr(),
+                    adds,
+                    subs,
                 );
-                debug_assert_eq!(
-                    acc.psqt[pov], full_psqt[pov],
-                    "threat chain PSQT mismatch against the full recompute: pov={pov}"
+            }
+            cur.accurate[pov] = true;
+            #[cfg(feature = "stats")]
+            threats::tally::add(threats::tally::APPLIED, 1);
+        }
+    }
+
+    /// The move into the current ply changed the piece-square block of `pov` (its king
+    /// moved within the same half, or the opponent's queen appeared or disappeared).
+    /// The threats and pawn pairs carry over from the parent: its sums, minus the
+    /// piece-square part of the old block, plus that of the new one (both brought by
+    /// the Finny table to the position they stand for), plus the move's threat rows.
+    fn block_swap(&mut self, pos: &Position, pov: usize) {
+        let params = self.params();
+        let idx = self.index;
+        let perspective = if pov == 0 { Color::White } else { Color::Black };
+        let delta = self.accumulators[idx].delta;
+        debug_assert!(delta.mv.move_type() != MT_CASTLING);
+        debug_assert!(delta.mv.move_type() != MT_EN_PASSANT, "an en passant capture changes no block");
+
+        // The parent's board: the moved piece back on its square (a pawn, if it was a
+        // promotion), the captured piece too.
+        let (from, to) = (delta.mv.from_sq(), delta.mv.to_sq());
+        let mut pieces = pos.pieces;
+        let mut board = pos.board;
+        let now = board[to.index()];
+        debug_assert!(now != Piece::NONE);
+        pieces[now.index()] ^= 1u64 << to.0;
+        pieces[delta.moved_piece.index()] |= 1u64 << from.0;
+        board[from.index()] = delta.moved_piece;
+        board[to.index()] = delta.captured_piece;
+        if delta.captured_piece != Piece::NONE {
+            pieces[delta.captured_piece.index()] |= 1u64 << to.0;
+        }
+        let old_king = if delta.moved_piece == Piece::new(PieceType::King, perspective) {
+            from
+        } else {
+            pos.king_sq(perspective)
+        };
+
+        let new_key =
+            self.cache.bring_to(params, &pos.pieces, &pos.board, pos.king_sq(perspective), perspective);
+        let old_key = self.cache.bring_to(params, &pieces, &board, old_king, perspective);
+        debug_assert!(new_key != old_key, "NNUE block swap: the block did not change");
+
+        let mirrored = [
+            pos.king_sq(Color::White).file() >= 4,
+            pos.king_sq(Color::Black).file() >= 4,
+        ];
+        let mut active = [false; 2];
+        active[pov] = true;
+        let (left, right) = self.accumulators.split_at_mut(idx);
+        let prev = &left[idx - 1];
+        let cur = &mut right[0];
+        threats::collect_moved(&cur.moved, mirrored, active, &mut self.threat_dirty);
+
+        let new = self.cache.entry(new_key);
+        let old = self.cache.entry(old_key);
+        let out = &mut cur.values.0[pov];
+        for i in 0..L1_SIZE {
+            out[i] = prev.values.0[pov][i]
+                .wrapping_sub(old.values.0[i])
+                .wrapping_add(new.values.0[i]);
+        }
+        let (adds, subs) = self.threat_dirty.pov(pov);
+        let p = out.as_mut_ptr();
+        unsafe {
+            kernels::dispatch::threat_batch(p, p, params.ft_threat_weights.0.as_ptr(), adds, subs)
+        };
+        cur.accurate[pov] = true;
+        #[cfg(feature = "stats")]
+        threats::tally::add(threats::tally::FULL_KING, 1);
+    }
+
+    /// Recompute perspective `pov` of the current ply from the caches: the Finny
+    /// entry for its king and the opponent queen, the pawn pairs of its half, every
+    /// active threat.
+    fn refresh_full(&mut self, pos: &Position, pov: usize) {
+        let params = self.params();
+        let perspective = if pov == 0 { Color::White } else { Color::Black };
+        let key = self.cache.bring_to(
+            params,
+            &pos.pieces,
+            &pos.board,
+            pos.king_sq(perspective),
+            perspective,
+        );
+        let entry = self.cache.entry(key);
+        let cur = &mut self.accumulators[self.index];
+        cur.values.0[pov] = entry.values.0;
+        threats::add_full(params, pos, pov, &mut self.pawn_cache, &mut cur.values.0[pov]);
+        cur.accurate[pov] = true;
+        #[cfg(feature = "stats")]
+        threats::tally::add(threats::tally::FULL_CHAIN, 1);
+    }
+
+    /// Debug builds: the current accumulator is the sum from scratch.
+    #[cfg(debug_assertions)]
+    fn debug_check(&self, pos: &Position) {
+        let values = reference_sums(self.params(), pos);
+        let acc = &self.accumulators[self.index];
+        for pov in 0..2 {
+            debug_assert!(
+                acc.values.0[pov][..] == values.0[pov][..],
+                "NNUE accumulator differs from the sum from scratch: pov={pov}"
+            );
+        }
+    }
+
+    /// Test helper: the current accumulator, both perspectives up to date, is the
+    /// sum from scratch.
+    #[cfg(test)]
+    pub(crate) fn assert_matches_reference(&self, pos: &Position, label: &str) {
+        let values = reference_sums(self.params(), pos);
+        let acc = &self.accumulators[self.index];
+        assert_eq!(acc.accurate, [true; 2], "{label}: not up to date");
+        for pov in 0..2 {
+            for i in 0..L1_SIZE {
+                assert_eq!(
+                    acc.values.0[pov][i], values.0[pov][i],
+                    "{label}: pov={pov} mismatch at {i}"
                 );
             }
         }
     }
 
-    /// Test helper: expose ensure_threats_updated (used by threats.rs tests).
-    #[cfg(test)]
-    pub(crate) fn ensure_threats_updated_for_test(&mut self, pos: &Position) {
-        self.ensure_threats_updated(pos);
-    }
-
-    /// Test helper: current ply's threat accumulator values.
-    #[cfg(test)]
-    pub(crate) fn threat_values_for_test(&self) -> &network::Aligned<[[i16; L1_SIZE]; 2]> {
-        &self.threat_acc[self.index].values
-    }
-
-    /// Test helper: current ply's threat accumulator PSQT head sums.
-    #[cfg(test)]
-    pub(crate) fn threat_psqt_for_test(&self) -> &[[i32; OUTPUT_BUCKETS]; 2] {
-        &self.threat_acc[self.index].psqt
-    }
-
-    /// Test helper: current ply's PST accumulator PSQT head sums.
-    #[cfg(test)]
-    pub(crate) fn pst_psqt_for_test(&self) -> [[i32; OUTPUT_BUCKETS]; 2] {
-        self.accumulators[self.index].psqt
-    }
-
-    /// Forward pass through the dense layers (SIMD-accelerated),
-    /// plus the additive PSQT head (`stm − ntm`, selected bucket).
+    /// Forward pass through the integer layers (SIMD-accelerated), scaled to
+    /// centipawns by the network's own output scale.
     fn forward(&self, pos: &Position) -> i32 {
         let stm = pos.side_to_move;
         let acc = &self.accumulators[self.index];
-        let threat_acc = &self.threat_acc[self.index];
-        let bucket = output_bucket(pos);
-
-        // Use threat accumulator (incrementally updated or full recomputed)
-        let threats = &threat_acc.values;
-        let l3_out =
-            unsafe { kernels::dispatch::forward_dense(self.params(), acc, threats, stm, bucket) };
-
-        let stm_i = stm.index();
-        let ntm_i = (!stm).index();
-        let psqt_raw = (acc.psqt[stm_i][bucket] + threat_acc.psqt[stm_i][bucket])
-            - (acc.psqt[ntm_i][bucket] + threat_acc.psqt[ntm_i][bucket]);
-        let psqt = psqt_raw as f32 / PSQT_QUANT as f32;
-
-        ((l3_out + psqt) * NETWORK_SCALE as f32) as i32
+        let params = self.params();
+        let out = unsafe { kernels::dispatch::forward_dense(params, &acc.values, stm, stack(pos)) };
+        to_centipawns(out, params.output_scale())
     }
+}
+
+/// The network's output in centipawns: `out × scale / 2^14`, truncated toward zero.
+#[inline]
+pub fn to_centipawns(out: i32, scale: i32) -> i32 {
+    debug_assert!(scale > 0);
+    ((out as i64 * scale as i64) / OUTPUT_ONE) as i32
+}
+
+/// For each perspective, whether the move flips the presence of the queen of the
+/// perspective's opponent: it captures that side's last queen, or it promotes the
+/// first queen of a side that had none. Read on the board before the move.
+fn queen_flips(pos: &Position, mv: Move, moved: Piece, captured: Piece) -> [bool; 2] {
+    let mut flips = [false; 2];
+    if captured != Piece::NONE && captured.piece_type() == PieceType::Queen {
+        let side = captured.color();
+        if pos.pieces[captured.index()].count_ones() == 1 {
+            // `side` is the opponent of the other perspective.
+            flips[(!side).index()] = true;
+        }
+    }
+    if mv.move_type() == MT_PROMOTION && mv.promo_type() == PieceType::Queen {
+        let side = moved.color();
+        if pos.pieces[Piece::new(PieceType::Queen, side).index()] == 0 {
+            flips[(!side).index()] = true;
+        }
+    }
+    flips
+}
+
+/// The accumulator of `pos` from scratch, element-wise and without the caches: the
+/// bias and piece-square rows of every piece, plus every pawn pair and threat. One
+/// side of every incremental-vs-refresh comparison.
+#[cfg(any(test, debug_assertions))]
+fn reference_sums(params: &network::NNUEParams, pos: &Position) -> network::Aligned<[[i16; L1_SIZE]; 2]> {
+    let mut values = threats::compute_full_threats_with(params, pos);
+    let mut psq = Accumulator::new();
+    for perspective in [Color::White, Color::Black] {
+        psq.refresh_with_params(params, pos, perspective);
+    }
+    for pov in 0..2 {
+        for i in 0..L1_SIZE {
+            values.0[pov][i] = values.0[pov][i].wrapping_add(psq.values.0[pov][i]);
+        }
+    }
+    values
 }
 
 impl Clone for Network {
@@ -442,41 +650,31 @@ impl Clone for Network {
             index: self.index,
             accumulators: self.accumulators.clone(),
             cache: self.cache.clone(),
-            threat_acc: self.threat_acc.clone(),
+            pawn_cache: self.pawn_cache.clone(),
+            // Scratch: empty at the start of every update, nothing to carry over.
+            threat_dirty: Box::new(threats::DirtyPair::new()),
             params: self.params,
         }
     }
 }
 
 // ============================================================
-// Output bucket selection
+// Layer stack selection
 // ============================================================
 
-/// Select the output bucket from the material value on the board
-/// (see `OUTPUT_BUCKET_SCHEME`).
-pub fn output_bucket(pos: &Position) -> usize {
-    let [wn, wb, wr, wq, div, max] = OUTPUT_BUCKET_SCHEME;
-    let knights = (pos.pieces[Piece::WHITE_KNIGHT.index()]
-        | pos.pieces[Piece::BLACK_KNIGHT.index()])
-    .count_ones() as usize;
-    let bishops = (pos.pieces[Piece::WHITE_BISHOP.index()]
-        | pos.pieces[Piece::BLACK_BISHOP.index()])
-    .count_ones() as usize;
-    let rooks = (pos.pieces[Piece::WHITE_ROOK.index()] | pos.pieces[Piece::BLACK_ROOK.index()])
-        .count_ones() as usize;
-    let queens = (pos.pieces[Piece::WHITE_QUEEN.index()] | pos.pieces[Piece::BLACK_QUEEN.index()])
-        .count_ones() as usize;
-    let value = wn * knights + wb * bishops + wr * rooks + wq * queens;
-    let bucket = (value / div).min(max);
-    debug_assert!(
-        bucket < OUTPUT_BUCKETS,
-        "output_bucket: bucket {} >= OUTPUT_BUCKETS {}",
-        bucket,
-        OUTPUT_BUCKETS
-    );
-    bucket
+/// Select the layer stack (see `STACK_SCHEME`).
+pub fn stack(pos: &Position) -> usize {
+    let [band_width, own_queen, their_queen] = STACK_SCHEME;
+    let stm = pos.side_to_move;
+    let pieces = pos.occupied().count_ones() as usize;
+    debug_assert!((2..=32).contains(&pieces), "stack: {pieces} pieces");
+    let band = (pieces - 1) / band_width;
+    let ours = pos.pieces[Piece::new(PieceType::Queen, stm).index()] != 0;
+    let theirs = pos.pieces[Piece::new(PieceType::Queen, !stm).index()] != 0;
+    let s = band * 4 + own_queen * ours as usize + their_queen * theirs as usize;
+    debug_assert!(s < STACKS, "stack {s} >= STACKS {STACKS}");
+    s
 }
-
 // ============================================================
 // Tests
 // ============================================================
@@ -493,31 +691,55 @@ mod tests {
         assert!(!net.accumulators.is_empty());
     }
 
-    /// Pins the material-value bucket scheme on known positions; the trainer
-    /// pins the SAME expectations on its side (tools/trainer6/src/outputs.rs).
+    /// Pins the layer-stack scheme on known positions; the trainer pins the SAME
+    /// expectations on its side (tools/trainer8/src/outputs.rs).
     #[test]
-    fn the_output_bucket_follows_material_value_not_piece_count() {
+    fn the_stack_follows_piece_count_and_queens() {
         let cases = [
-            // startpos: (3*4 + 4*4 + 8*4 + 18*2) / 12 = 96/12 = 8 → capped at 7
-            (
-                "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
-                7,
-            ),
-            // bare kings (pawns and kings are worth 0)
+            // startpos: 32 pieces → band 7, both queens → 7*4 + 3
+            ("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1", 31),
+            // bare kings: band 0, no queen
             ("4k3/8/8/8/8/8/8/4K3 w - - 0 1", 0),
-            // king + 8 pawns each: still bucket 0
-            ("4k3/pppppppp/8/8/8/8/PPPPPPPP/4K3 w - - 0 1", 0),
-            // KRvK: 8/12 = 0
-            ("4k3/8/8/8/8/8/8/R3K3 w - - 0 1", 0),
-            // KQvKQ: 36/12 = 3
+            // white queen, black to move: the queen is the opponent's
+            ("4k3/8/8/8/8/8/8/3QK3 b - - 0 1", 1),
+            ("4k3/8/8/8/8/8/8/3QK3 w - - 0 1", 2),
+            // KQvKQ: 4 pieces → band 0, both queens
             ("3qk3/8/8/8/8/8/8/3QK3 w - - 0 1", 3),
-            // KRRvKRR: 32/12 = 2
-            ("r3k2r/8/8/8/8/8/8/R3K2R w - - 0 1", 2),
+            // 18 pieces → band 4
+            ("r3k2r/pppppppp/8/8/8/8/PPPPPPPP/4K3 w - - 0 1", 16),
         ];
         for (fen, want) in cases {
             let pos = Position::from_fen(fen).unwrap();
-            assert_eq!(output_bucket(&pos), want, "{fen}");
+            assert_eq!(stack(&pos), want, "{fen}");
         }
+    }
+
+    /// The presence of the opponent's queen is part of the piece-square block: a move
+    /// that takes the last queen, or promotes the first one, flips it for the other
+    /// side, and only then.
+    #[test]
+    fn queen_flips_are_recorded_for_the_other_side_only() {
+        // White takes Black's only queen: Black's queen disappears for White.
+        let pos = Position::from_fen("3qk3/8/8/8/8/8/8/3QK3 w - - 0 1").unwrap();
+        let mv = Move::new(Square::D1, Square::D8);
+        let flips = queen_flips(&pos, mv, pos.piece_on(Square::D1), pos.piece_on(Square::D8));
+        assert_eq!(flips, [true, false]);
+
+        // Black has two queens: taking one flips nothing.
+        let pos = Position::from_fen("3qk2q/8/8/8/8/8/8/3QK3 w - - 0 1").unwrap();
+        let flips = queen_flips(&pos, mv, pos.piece_on(Square::D1), pos.piece_on(Square::D8));
+        assert_eq!(flips, [false, false]);
+
+        // White promotes its first queen: White's queen appears for Black.
+        let pos = Position::from_fen("7k/4P3/8/8/8/8/8/4K3 w - - 0 1").unwrap();
+        let mv = Move::new_promotion(Square::E7, Square::E8, PieceType::Queen);
+        let flips = queen_flips(&pos, mv, pos.piece_on(Square::E7), Piece::NONE);
+        assert_eq!(flips, [false, true]);
+
+        // An underpromotion flips nothing.
+        let mv = Move::new_promotion(Square::E7, Square::E8, PieceType::Rook);
+        let flips = queen_flips(&pos, mv, pos.piece_on(Square::E7), Piece::NONE);
+        assert_eq!(flips, [false, false]);
     }
 
     #[test]
@@ -575,47 +797,49 @@ mod tests {
 
         // Evaluate with incremental update
         let _score = net.evaluate(&pos);
-        let incremental_white = net.accumulators[net.index].values.0[0];
-        let incremental_black = net.accumulators[net.index].values.0[1];
-
-        // Refresh from scratch
-        let mut acc_refresh = Accumulator::new();
-        acc_refresh.refresh(&pos, Color::White);
-        acc_refresh.refresh(&pos, Color::Black);
-
-        // Compare
-        for i in 0..L1_SIZE {
-            assert_eq!(
-                incremental_white[i], acc_refresh.values.0[0][i],
-                "White perspective mismatch at index {i}: incremental={}, refresh={}",
-                incremental_white[i], acc_refresh.values.0[0][i]
-            );
-            assert_eq!(
-                incremental_black[i], acc_refresh.values.0[1][i],
-                "Black perspective mismatch at index {i}: incremental={}, refresh={}",
-                incremental_black[i], acc_refresh.values.0[1][i]
-            );
-        }
+        net.assert_matches_reference(&pos, "test_refresh_vs_incremental");
     }
 
+    /// Whether an ancestor accumulator survives a king move is decided by where the
+    /// king lands. Castling records the rook's origin as its `to`, so reading that
+    /// square asks about a square the king never occupies: here it would compare
+    /// g1 against h1 and refresh, though the king does not move at all.
     #[test]
-    fn test_output_bucket() {
-        let pos =
-            Position::from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1").unwrap();
-        let bucket = output_bucket(&pos);
-        assert_eq!(bucket, 7, "startpos has 32 pieces → bucket 7");
+    fn a_king_that_stays_put_castling_keeps_its_ancestor() {
+        let delta = AccDelta {
+            // FRC O-O with the king already on g1: only the rook travels, h1 → f1.
+            mv: Move::new_with_type(Square::G1, Square::H1, MT_CASTLING),
+            moved_piece: Piece::WHITE_KING,
+            captured_piece: Piece::NONE,
+            old_occ: 0,
+            queen_flip: [false; 2],
+        };
+        assert!(!block_changes(&delta, Color::White));
 
-        let pos2 = Position::from_fen("4k3/8/8/8/8/8/8/4K3 w - - 0 1").unwrap();
-        let bucket2 = output_bucket(&pos2);
-        assert_eq!(bucket2, 0, "2 kings → bucket 0");
+        // And a king that does cross the mirror still forces the refresh.
+        let crossing = AccDelta {
+            mv: Move::new(Square::E1, Square::D1),
+            ..delta
+        };
+        assert!(block_changes(&crossing, Color::White));
+
+        // A queen flip changes the block of the side that sees it, and only that one.
+        let flip = AccDelta {
+            mv: Move::new(Square::D1, Square::D8),
+            moved_piece: Piece::WHITE_QUEEN,
+            captured_piece: Piece::BLACK_QUEEN,
+            queen_flip: [true, false],
+            ..delta
+        };
+        assert!(block_changes(&flip, Color::White));
+        assert!(!block_changes(&flip, Color::Black));
     }
 
     #[test]
     fn test_ft_activation_symmetry() {
         // With zeroed weights, activation should produce all zeros
-        let pst_acc = Accumulator::new();
-        let combined = network::Aligned([[0i16; L1_SIZE]; 2]);
-        let out = forward::activate_ft(&pst_acc, &combined, Color::White);
+        let acc = network::Aligned([[0i16; L1_SIZE]; 2]);
+        let out = forward::activate_ft(&acc, Color::White);
         for i in 0..L1_SIZE {
             assert_eq!(out.0[i], 0);
         }
@@ -636,28 +860,9 @@ mod tests {
         pos.make_move(mv);
 
         // Trigger lazy incremental update (directly, not via evaluate which asserts !in_check)
-        net.ensure_updated(&pos);
+        net.ensure_all_updated(&pos);
 
-        let inc_w = net.accumulators[net.index].values.0[0];
-        let inc_b = net.accumulators[net.index].values.0[1];
-
-        // Fresh refresh
-        let mut acc_ref = Accumulator::new();
-        acc_ref.refresh(&pos, Color::White);
-        acc_ref.refresh(&pos, Color::Black);
-
-        for i in 0..L1_SIZE {
-            assert_eq!(
-                inc_w[i], acc_ref.values.0[0][i],
-                "{label}: White mismatch at {i}: inc={}, ref={}",
-                inc_w[i], acc_ref.values.0[0][i]
-            );
-            assert_eq!(
-                inc_b[i], acc_ref.values.0[1][i],
-                "{label}: Black mismatch at {i}: inc={}, ref={}",
-                inc_b[i], acc_ref.values.0[1][i]
-            );
-        }
+        net.assert_matches_reference(&pos, label);
     }
 
     #[test]
@@ -771,7 +976,7 @@ mod tests {
     #[test]
     fn test_incremental_null_move() {
         // Lazy push_null: index advances but values are NOT cloned.
-        // ensure_updated copies from parent on demand.
+        // ensure_all_updated copies from parent on demand.
         let mut pos =
             Position::from_fen("rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq - 0 1")
                 .unwrap();
@@ -788,24 +993,7 @@ mod tests {
         // Evaluate triggers lazy copy from parent
         let _score = net.evaluate(&pos);
 
-        let acc_w = net.accumulators[net.index].values.0[0];
-        let acc_b = net.accumulators[net.index].values.0[1];
-
-        // Refresh from scratch on the null-move position
-        let mut acc_ref = Accumulator::new();
-        acc_ref.refresh(&pos, Color::White);
-        acc_ref.refresh(&pos, Color::Black);
-
-        for i in 0..L1_SIZE {
-            assert_eq!(
-                acc_w[i], acc_ref.values.0[0][i],
-                "Null move: White mismatch at {i}"
-            );
-            assert_eq!(
-                acc_b[i], acc_ref.values.0[1][i],
-                "Null move: Black mismatch at {i}"
-            );
-        }
+        net.assert_matches_reference(&pos, "test_incremental_null_move");
 
         pos.unmake_null_move();
         net.pop();
@@ -833,19 +1021,9 @@ mod tests {
         assert_eq!(net.index, 2);
 
         // Trigger lazy update (copies parent at 1, then applies delta at 2)
-        net.ensure_updated(&pos);
+        net.ensure_all_updated(&pos);
 
-        let inc_w = net.accumulators[net.index].values.0[0];
-        let inc_b = net.accumulators[net.index].values.0[1];
-
-        let mut acc_ref = Accumulator::new();
-        acc_ref.refresh(&pos, Color::White);
-        acc_ref.refresh(&pos, Color::Black);
-
-        for i in 0..L1_SIZE {
-            assert_eq!(inc_w[i], acc_ref.values.0[0][i], "Child white at {i}");
-            assert_eq!(inc_b[i], acc_ref.values.0[1][i], "Child black at {i}");
-        }
+        net.assert_matches_reference(&pos, "test_null_move_child_push");
 
         pos.unmake_move(mv);
         net.pop();
@@ -876,27 +1054,7 @@ mod tests {
 
             let _score = net.evaluate(&pos);
 
-            let inc_w = net.accumulators[net.index].values.0[0];
-            let inc_b = net.accumulators[net.index].values.0[1];
-
-            let mut acc_ref = Accumulator::new();
-            acc_ref.refresh(&pos, Color::White);
-            acc_ref.refresh(&pos, Color::Black);
-
-            for j in 0..L1_SIZE {
-                assert_eq!(
-                    inc_w[j],
-                    acc_ref.values.0[0][j],
-                    "Move {}: White mismatch at {j}",
-                    i + 1
-                );
-                assert_eq!(
-                    inc_b[j],
-                    acc_ref.values.0[1][j],
-                    "Move {}: Black mismatch at {j}",
-                    i + 1
-                );
-            }
+            net.assert_matches_reference(&pos, &format!("move {}", i + 1));
         }
     }
 
@@ -915,22 +1073,6 @@ mod tests {
 
         let _score = net.evaluate(&pos);
 
-        let inc_w = net.accumulators[net.index].values.0[0];
-        let inc_b = net.accumulators[net.index].values.0[1];
-
-        let mut acc_ref = Accumulator::new();
-        acc_ref.refresh(&pos, Color::White);
-        acc_ref.refresh(&pos, Color::Black);
-
-        for i in 0..L1_SIZE {
-            assert_eq!(
-                inc_w[i], acc_ref.values.0[0][i],
-                "King move refresh: White at {i}"
-            );
-            assert_eq!(
-                inc_b[i], acc_ref.values.0[1][i],
-                "King move refresh: Black at {i}"
-            );
-        }
+        net.assert_matches_reference(&pos, "test_incremental_king_move_triggers_refresh");
     }
 }

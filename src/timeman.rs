@@ -18,6 +18,12 @@
 //! the opening is the cheapest part of it to play and the least likely to be
 //! decided there, so a fixed fraction of the clock per move would spend the
 //! most where it buys the least.
+//!
+//! Both are counted from `go`, a ponder search's included: the time spent
+//! pondering before a `ponderhit` counts as spent, so a hit after a long ponder
+//! answers at once. A move is then cheaper on the real clock than its budget
+//! says, and a host that allows pondering gets a quarter more `optimum` on every
+//! move to make up for it.
 
 use crate::time::Instant;
 
@@ -49,6 +55,9 @@ pub struct SearchLimits {
     pub movestogo: Option<u64>,
     /// `go mate N` — stop once a mate in at most N moves is found.
     pub mate: Option<i32>,
+    /// The host lets the engine ponder (UCI option `Ponder`), on this move and the
+    /// others. Not `go ponder`, which says this search is one.
+    pub ponder_allowed: bool,
 }
 
 impl Default for SearchLimits {
@@ -64,6 +73,7 @@ impl Default for SearchLimits {
             inc: 0,
             movestogo: None,
             mate: None,
+            ponder_allowed: false,
         }
     }
 }
@@ -127,6 +137,9 @@ const CENTI_MTG_OPEN: i64 = 5051;
 const CENTI_MTG_MAX: i64 = 5000;
 /// Below one second of clock the horizon shrinks with it, at this rate per ms.
 const CENTI_MTG_PER_MS: f64 = 5.051;
+/// Longest clock or increment taken at face value (ms), about 35 years. No game
+/// has one, and below it the horizon arithmetic cannot overflow an i64.
+const CLOCK_CAP_MS: u64 = 1 << 40;
 
 /// Per-game budget tilt, `MUL * log10(time_left) - SUB`. Computed once per game:
 /// a long game may afford a larger share of its clock per move than a short one.
@@ -163,6 +176,9 @@ const MTG_MAX_MUL: f64 = 0.11;
 /// taken off it afterwards (ms).
 const HARD_CLOCK_FRAC: f64 = 0.825179;
 const HARD_MARGIN_MS: i64 = 10;
+
+/// With pondering allowed, `optimum` grows by `1 / PONDER_BONUS_DIV` of itself.
+const PONDER_BONUS_DIV: u64 = 4;
 
 /// Hard node ceiling = soft budget x this factor, for the limits that derive
 /// one from the other (`go softnodes`, `UseSoftNodes`, datagen).
@@ -242,8 +258,11 @@ fn clock_bounds(
         "move overhead {overhead} must not be negative"
     );
 
-    let t = time as i64;
-    debug_assert!(t >= 0, "clock {t} must not be negative");
+    // `winc` and `movestogo` reach here as the host wrote them, and so does a
+    // clock up to i64::MAX: capped, `inc * (centi_mtg - 100)` and the sum below
+    // stay in range instead of wrapping into a negative budget.
+    let t = time.min(CLOCK_CAP_MS) as i64;
+    let inc = inc.min(CLOCK_CAP_MS) as i64;
 
     // No clock at all: no budget. Taken before the scaling below, whose
     // logarithms are only defined on a clock that has something left.
@@ -255,7 +274,7 @@ fn clock_bounds(
     // literally it would divide by zero below.
     let mtg = movestogo.filter(|&m| m > 0);
     let mut centi_mtg = match mtg {
-        Some(m) => ((m as i64).saturating_mul(100)).min(CENTI_MTG_MAX),
+        Some(m) => m.saturating_mul(100).min(CENTI_MTG_MAX as u64) as i64,
         None => CENTI_MTG_OPEN,
     };
     // Under a second, shrink the horizon with the clock: pretending fifty moves
@@ -267,8 +286,7 @@ fn clock_bounds(
 
     // What the clock is really worth over the horizon: every move to come pays
     // the overhead twice over, and every one but this move earns an increment.
-    let time_left =
-        (t + (inc as i64 * (centi_mtg - 100) - overhead * (200 + centi_mtg)) / 100).max(1);
+    let time_left = (t + (inc * (centi_mtg - 100) - overhead * (200 + centi_mtg)) / 100).max(1);
 
     let (opt_scale, max_scale) = if mtg.is_none() {
         if *time_adjust < 0.0 {
@@ -304,7 +322,6 @@ fn clock_bounds(
 
 /// Manages time for a single search.
 pub struct TimeManager {
-    total_start: Instant,
     start: Instant,
     /// A clock was given, so the per-iteration rescaling applies. False for
     /// `movetime`, `depth`, `nodes` and `infinite`, whose budgets are literal.
@@ -359,7 +376,13 @@ impl TimeManager {
                     crate::tune::MOVE_OVERHEAD() as i64,
                     time_adjust,
                 );
-                optimum = opt;
+                // Added after the ceiling was taken from the optimum: the ceiling
+                // stays where the clock put it.
+                optimum = if limits.ponder_allowed {
+                    opt + opt / PONDER_BONUS_DIV
+                } else {
+                    opt
+                };
                 maximum = max;
             }
             if let Some(ms) = limits.movetime {
@@ -375,10 +398,8 @@ impl TimeManager {
             soft_nodes = u64::MAX;
         }
 
-        let now = Instant::now();
         TimeManager {
-            total_start: now,
-            start: now,
+            start: Instant::now(),
             has_clock,
             optimum,
             maximum,
@@ -397,16 +418,10 @@ impl TimeManager {
         TimeManager::new(&SearchLimits::infinite(), 0, &mut unused)
     }
 
-    /// Elapsed time in milliseconds since search started.
+    /// Elapsed time in milliseconds since `go`, pondering included.
     #[inline]
     pub fn elapsed_ms(&self) -> u64 {
         self.start.elapsed().as_millis() as u64
-    }
-
-    /// Elapsed wall time since `go`, including time spent pondering before restart.
-    #[inline]
-    pub fn total_elapsed_ms(&self) -> u64 {
-        self.total_start.elapsed().as_millis() as u64
     }
 
     /// Maximum depth to search.
@@ -469,12 +484,6 @@ impl TimeManager {
     pub fn set_soft_limit(&mut self, ms: u64) {
         self.soft_limit = ms.min(self.maximum);
     }
-
-    /// Restart the timer (called on `ponderhit` to begin real time allocation).
-    #[inline]
-    pub fn restart(&mut self) {
-        self.start = Instant::now();
-    }
 }
 
 #[cfg(test)]
@@ -534,6 +543,35 @@ mod tests {
                 "clock {time} inc {inc} mtg {mtg:?} ply {ply} overhead {overhead}"
             );
         }
+    }
+
+    /// `winc 18446744073709551615` or `movestogo` at u64::MAX used to wrap into a
+    /// negative i64 (and overflow outright with checks on): beyond any real clock
+    /// they now count as the ceiling, and the budget is the ceiling's.
+    #[test]
+    fn absurd_clocks_count_as_the_ceiling() {
+        let bounds = |time, inc, mtg| {
+            let mut adjust = TIME_ADJUST_UNSET;
+            clock_bounds(time, inc, mtg, 40, 40, &mut adjust)
+        };
+        assert_eq!(
+            bounds(60000, 600, Some(u64::MAX)),
+            bounds(60000, 600, Some(50))
+        );
+        assert_eq!(
+            bounds(60000, u64::MAX, None),
+            bounds(60000, CLOCK_CAP_MS, None)
+        );
+        let huge = i64::MAX as u64;
+        assert_eq!(
+            bounds(huge, huge, None),
+            bounds(CLOCK_CAP_MS, CLOCK_CAP_MS, None)
+        );
+        let (opt, max) = bounds(u64::MAX, u64::MAX, Some(u64::MAX));
+        assert!(
+            opt > 0 && max > 0,
+            "an endless clock grants a budget: {opt} / {max}"
+        );
     }
 
     /// Ten milliseconds of overhead are worth a tenth of a blitz budget, because
@@ -617,6 +655,43 @@ mod tests {
         let mut tm = tm;
         tm.set_soft_limit(u64::MAX);
         assert_eq!(tm.soft_limit, 100);
+    }
+
+    /// A host that allows pondering buys every move a quarter more expected time,
+    /// and the same ceiling: the bonus comes after the ceiling was taken from it.
+    #[test]
+    fn pondering_allowed_raises_the_optimum_by_a_quarter_and_not_the_ceiling() {
+        let limits = SearchLimits::clock(60000, 600, None);
+        let plain = TimeManager::new(&limits, 40, &mut TIME_ADJUST_UNSET.clone());
+        let pondering = TimeManager::new(
+            &SearchLimits {
+                ponder_allowed: true,
+                ..limits
+            },
+            40,
+            &mut TIME_ADJUST_UNSET.clone(),
+        );
+        assert!(
+            plain.optimum_ms() > 3000,
+            "sanity: {} ms at 60+0.6",
+            plain.optimum_ms()
+        );
+        assert_eq!(
+            pondering.optimum_ms(),
+            plain.optimum_ms() + plain.optimum_ms() / 4
+        );
+        assert_eq!(pondering.maximum, plain.maximum);
+
+        // No clock, nothing to add to: a literal budget stays literal.
+        let fixed = TimeManager::new(
+            &SearchLimits {
+                ponder_allowed: true,
+                ..SearchLimits::movetime(500)
+            },
+            0,
+            &mut TIME_ADJUST_UNSET.clone(),
+        );
+        assert_eq!((fixed.optimum_ms(), fixed.maximum), (500, 500));
     }
 
     #[test]

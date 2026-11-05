@@ -18,6 +18,8 @@ pub const I32_LANES: usize = size_of::<int32x4_t>() / size_of::<i32>();
 pub const F32_LANES: usize = size_of::<float32x4_t>() / size_of::<f32>();
 /// Emulated widening multiply: one chain. Dot-prod overrides this to 3.
 pub const DPBUSD_CHAINS: usize = 1;
+/// `mul_add_f32` is one fused instruction (one rounding).
+pub const MUL_ADD_FUSED: bool = true;
 
 // ============================================================
 // i16 operations (accumulator, FT activation)
@@ -53,23 +55,14 @@ pub unsafe fn min_i16(a: int16x8_t, b: int16x8_t) -> int16x8_t {
     vminq_s16(a, b)
 }
 
+/// The pairwise FT product `(left * right) >> 9` (`FT_SHIFT`), for `left` in
+/// `0..=FT_QUANT`, in one multiply: `vqdmulh` doubles the product before taking its
+/// high half, so `left << 6` lands where `left << 7` does on x86, with the same
+/// rounding (down). Its one saturating case, both operands at -32768, cannot occur:
+/// `left << 6` is at most 16320.
 #[inline(always)]
-pub unsafe fn shift_left_i16<const SHIFT: i32>(a: int16x8_t) -> int16x8_t {
-    vshlq_n_s16::<SHIFT>(a)
-}
-
-/// Multiply high: (a * b) >> 16 for each i16 lane.
-///
-/// NEON has no direct `mulhi_i16`. Widening multiply on each half, shift right
-/// by 16, then narrow and recombine. `vmull_high_s16` reads the top half
-/// without a separate extract.
-#[inline(always)]
-pub unsafe fn mul_high_i16(a: int16x8_t, b: int16x8_t) -> int16x8_t {
-    let lo = vmull_s16(vget_low_s16(a), vget_low_s16(b));
-    let hi = vmull_high_s16(a, b);
-    let lo_hi = vshrn_n_s32::<16>(lo);
-    let hi_hi = vshrn_n_s32::<16>(hi);
-    vcombine_s16(lo_hi, hi_hi)
+pub unsafe fn ft_product(left: int16x8_t, right: int16x8_t) -> int16x8_t {
+    vqdmulhq_s16(vshlq_n_s16::<6>(left), right)
 }
 
 /// Pack two i16 vectors → one vector of u8 (unsigned saturation).
@@ -90,12 +83,23 @@ pub unsafe fn permute(a: int8x16_t) -> int8x16_t {
     a
 }
 
-/// Load I16_LANES (8) i8 values from `ptr` and sign-extend to i16.
-///
-/// Used for threat accumulator: i8 weights → i16 additions.
+/// Two registers of i16 from 16 bytes of each of two i8 rows, summed lane by
+/// lane by the widening adds (`saddl`, `saddl2`). Linear order: no lane crossing.
 #[inline(always)]
-pub unsafe fn load_i8_as_i16(ptr: *const i8) -> int16x8_t {
-    vmovl_s8(vld1_s8(ptr))
+pub unsafe fn widen_i8_pair(a: *const i8, b: *const i8) -> [int16x8_t; 2] {
+    let wa = vld1q_s8(a);
+    let wb = vld1q_s8(b);
+    [
+        vaddl_s8(vget_low_s8(wa), vget_low_s8(wb)),
+        vaddl_high_s8(wa, wb),
+    ]
+}
+
+/// One i8 row alone, widened into two registers.
+#[inline(always)]
+pub unsafe fn widen_i8(a: *const i8) -> [int16x8_t; 2] {
+    let w = vld1q_s8(a);
+    [vmovl_s8(vget_low_s8(w)), vmovl_high_s8(w)]
 }
 
 /// Multiply pairs of adjacent i16 and accumulate into i32.
@@ -335,4 +339,36 @@ mod tests {
             assert_eq!(nnz_bitmask(to_i32x4([1, 1, 1, 1])), 0b1111);
         }
     }
+}
+
+// ============================================================
+// i32 operations (integer dense layers)
+// ============================================================
+
+/// Arithmetic right shift of every i32 lane: a floor division by `2^n`
+/// (a left shift by `-n`, which NEON takes as a signed right shift).
+#[inline(always)]
+pub unsafe fn srai_i32(a: int32x4_t, n: i32) -> int32x4_t {
+    vshlq_s32(a, vdupq_n_s32(-n))
+}
+
+/// Clamp every i32 lane to `[lo, hi]`.
+#[inline(always)]
+pub unsafe fn clamp_i32(x: int32x4_t, lo: int32x4_t, hi: int32x4_t) -> int32x4_t {
+    vminq_s32(vmaxq_s32(x, lo), hi)
+}
+
+/// Low 32 bits of each lane's product.
+#[inline(always)]
+pub unsafe fn mullo_i32(a: int32x4_t, b: int32x4_t) -> int32x4_t {
+    vmulq_s32(a, b)
+}
+
+/// Four registers of i32 in `0..=255` narrowed to sixteen u8, in order, held as
+/// the i32 register the byte dot products take.
+#[inline(always)]
+pub unsafe fn narrow_u8(a: int32x4_t, b: int32x4_t, c: int32x4_t, d: int32x4_t) -> int32x4_t {
+    let ab = vcombine_s16(vqmovn_s32(a), vqmovn_s32(b));
+    let cd = vcombine_s16(vqmovn_s32(c), vqmovn_s32(d));
+    vreinterpretq_s32_u8(vcombine_u8(vqmovun_s16(ab), vqmovun_s16(cd)))
 }

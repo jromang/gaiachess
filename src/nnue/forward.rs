@@ -1,19 +1,19 @@
 //! NNUE forward pass: NNZ extraction + per-stage entry points.
 //!
 //! Pipeline per evaluation:
-//!   1. `threats::compute_full_threats(pos)` — pawn pairs + pairwise threats,
-//!      loaded as i8 weight rows → i16 buffer[L1][2 perspectives]
-//!   2. `activate_ft(pst_acc, threats)` — element-wise PST + aux,
-//!      within-side pairwise product (i16 → u8[L1])
-//!   3. `find_nnz` — extract non-zero 4-byte group indices for sparse L1
-//!   4. `propagate_l1` — sparse u8 × i8 → i32, dequant, CReLU+squared → f32[32]
-//!   5. `propagate_l2` — dense f32 FMA + squared → f32[32]
-//!   6. `propagate_l3` — concat(l2[32], l1[32]) × l3_weights → scalar (with L1 skip)
+//!   1. `activate_ft(acc)` — the accumulator (piece squares, pawn pairs and threats
+//!      summed), within-side pairwise product (i16 → u8[L1])
+//!   2. `find_nnz` — extract non-zero 4-byte group indices for sparse L1
+//!   3. `propagate_l1` — sparse u8 × i8 → i32[32], plus the bias
+//!   4. `activate_l1` — `[x² >> 21, x >> 7]` clipped → u8[64]
+//!   5. `propagate_l2` — dense u8 × i8 → gate and value, `h = g² · v >> 14` → i32[32]
+//!   6. `propagate_l3` — u8[64] and h[32] × l3 weights + bias, plus the skip
+//!      `l1[30] − l1[31]` → the output, unit 2^14
 //!
-//! The register-width stages (2, 4-6) live in `nnue::kernels`, monomorphized per
-//! SIMD backend; this module keeps `find_nnz` — whose three implementations are
-//! different *algorithms*, not the same loop at different widths — plus thin
-//! wrappers over the current kernel instance for tests and callers.
+//! The register-width stages live in `nnue::kernels`, monomorphized per SIMD
+//! backend; this module keeps `find_nnz` — whose three implementations are
+//! different *algorithms*, not the same loop at different widths — the plain
+//! reference every tier is held against, and thin wrappers for the tests.
 
 #![allow(unsafe_op_in_unsafe_fn)]
 
@@ -21,11 +21,7 @@ use super::L1_SIZE;
 use super::network::Aligned;
 
 #[cfg(test)]
-use super::accumulator::Accumulator;
-#[cfg(test)]
 use super::kernels::k;
-#[cfg(test)]
-use super::{L2_SIZE, L3_SIZE};
 #[cfg(test)]
 use crate::types::Color;
 
@@ -75,10 +71,41 @@ const NNZ_PAD: usize = 32;
 /// Total NNZ array size including padding.
 pub const NNZ_SIZE: usize = L1_SIZE / 4 + NNZ_PAD;
 
+// Non-zero 4-byte groups fed to the sparse L1, tallied per thread (feature `stats`):
+// `(forward passes, groups)`. The kernels have no `ThreadData` to write to, so the
+// search drains this into its statistics after each evaluation.
+#[cfg(feature = "stats")]
+thread_local! {
+    static NNZ_TALLY: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+/// Count one forward pass and the non-zero groups its L1 had to read.
+#[cfg(feature = "stats")]
+#[inline]
+pub fn tally_nnz(count: usize) {
+    debug_assert!(
+        count <= L1_SIZE / 4,
+        "nnz tally: {count} groups of {}",
+        L1_SIZE / 4
+    );
+    NNZ_TALLY.with(|t| {
+        let (passes, groups) = t.get();
+        t.set((passes + 1, groups + count as u64));
+    });
+}
+
+/// What this thread has tallied since the last call, reset to zero.
+#[cfg(feature = "stats")]
+pub fn take_nnz_tally() -> (u64, u64) {
+    NNZ_TALLY.with(|t| t.replace((0, 0)))
+}
+
 /// Extract indices of non-zero 4-byte groups from the FT output.
 ///
-/// Returns (indices, count). Each index identifies a group of 4 input neurons
-/// that has at least one non-zero byte.
+/// Writes the indexes to `out` and returns their count. Each index identifies a
+/// group of 4 input neurons that has at least one non-zero byte. `out` must have
+/// room for `NNZ_SIZE` indexes: the slots past the count may be written too
+/// (`NNZ_PAD`), and need not be initialised.
 ///
 /// AVX-512VBMI2: uses `maskz_compress_epi16` (no lookup table), 32 groups/iter.
 /// AVX2: uses NNZ_TABLE + SSE `storeu_si128`.
@@ -89,8 +116,8 @@ pub const NNZ_SIZE: usize = L1_SIZE / 4 + NNZ_PAD;
 /// table inside `forward_dense` instead (hence dead on some of them).
 #[allow(dead_code)]
 #[cfg(all(target_feature = "avx512bw", target_feature = "avx512vbmi2"))]
-pub fn find_nnz(ft_out: &Aligned<[u8; L1_SIZE]>) -> ([u16; NNZ_SIZE], usize) {
-    unsafe { find_nnz_compress512(ft_out) }
+pub unsafe fn find_nnz(ft_out: &Aligned<[u8; L1_SIZE]>, out: *mut u16) -> usize {
+    unsafe { find_nnz_compress512(ft_out, out) }
 }
 
 #[allow(dead_code)]
@@ -98,14 +125,14 @@ pub fn find_nnz(ft_out: &Aligned<[u8; L1_SIZE]>) -> ([u16; NNZ_SIZE], usize) {
     target_feature = "avx2",
     not(all(target_feature = "avx512bw", target_feature = "avx512vbmi2"))
 ))]
-pub fn find_nnz(ft_out: &Aligned<[u8; L1_SIZE]>) -> ([u16; NNZ_SIZE], usize) {
-    unsafe { find_nnz_avx2(ft_out) }
+pub unsafe fn find_nnz(ft_out: &Aligned<[u8; L1_SIZE]>, out: *mut u16) -> usize {
+    unsafe { find_nnz_avx2(ft_out, out) }
 }
 
 #[allow(dead_code)]
 #[cfg(not(target_feature = "avx2"))]
-pub fn find_nnz(ft_out: &Aligned<[u8; L1_SIZE]>) -> ([u16; NNZ_SIZE], usize) {
-    unsafe { super::kernels::k::find_nnz_generic(ft_out) }
+pub unsafe fn find_nnz(ft_out: &Aligned<[u8; L1_SIZE]>, out: *mut u16) -> usize {
+    unsafe { super::kernels::k::find_nnz_generic(ft_out, out) }
 }
 
 /// AVX-512 form: `maskz_compress_epi16` builds the index list without a table.
@@ -121,11 +148,10 @@ pub fn find_nnz(ft_out: &Aligned<[u8; L1_SIZE]>) -> ([u16; NNZ_SIZE], usize) {
     )),
     target_feature(enable = "avx512f,avx512bw,avx512vbmi2")
 )]
-pub unsafe fn find_nnz_compress512(ft_out: &Aligned<[u8; L1_SIZE]>) -> ([u16; NNZ_SIZE], usize) {
+pub unsafe fn find_nnz_compress512(ft_out: &Aligned<[u8; L1_SIZE]>, indexes: *mut u16) -> usize {
     use crate::nnue::simd::avx512 as simd;
     use std::arch::x86_64::*;
 
-    let mut indexes = [0u16; NNZ_SIZE];
     let mut count = 0;
 
     // Process 32 i32 groups per iteration (2 × 16-lane nnz_bitmask = 32-bit mask).
@@ -145,24 +171,23 @@ pub unsafe fn find_nnz_compress512(ft_out: &Aligned<[u8; L1_SIZE]>) -> ([u16; NN
         let mask: u32 = (mask1 as u32) << 16 | mask0 as u32;
 
         let compressed = _mm512_maskz_compress_epi16(mask, base);
-        _mm512_storeu_si512(indexes.as_mut_ptr().add(count).cast(), compressed);
+        _mm512_storeu_si512(indexes.add(count).cast(), compressed);
         count += mask.count_ones() as usize;
 
         base = _mm512_add_epi16(base, increment);
     }
 
-    (indexes, count)
+    count
 }
 
 /// AVX2 form: NNZ_TABLE + SSE store.
 #[cfg(target_arch = "x86_64")]
 #[allow(dead_code)] // selected per build target (and, later, per detected CPU)
 #[cfg_attr(not(target_feature = "avx2"), target_feature(enable = "avx2"))]
-pub unsafe fn find_nnz_avx2(ft_out: &Aligned<[u8; L1_SIZE]>) -> ([u16; NNZ_SIZE], usize) {
+pub unsafe fn find_nnz_avx2(ft_out: &Aligned<[u8; L1_SIZE]>, indexes: *mut u16) -> usize {
     use crate::nnue::simd::avx2 as simd;
     use std::arch::x86_64::*;
 
-    let mut indexes = [0u16; NNZ_SIZE];
     let mut count = 0;
 
     let increment = _mm_set1_epi16(8);
@@ -182,7 +207,7 @@ pub unsafe fn find_nnz_avx2(ft_out: &Aligned<[u8; L1_SIZE]>) -> ([u16; NNZ_SIZE]
             // Load 8 × u16 from table, add base offset, store via SSE
             let entry_vec = _mm_load_si128(entry.indexes.as_ptr().cast());
             _mm_storeu_si128(
-                indexes.as_mut_ptr().add(count).cast(),
+                indexes.add(count).cast(),
                 _mm_add_epi16(base, entry_vec),
             );
 
@@ -193,7 +218,7 @@ pub unsafe fn find_nnz_avx2(ft_out: &Aligned<[u8; L1_SIZE]>) -> ([u16; NNZ_SIZE]
         }
     }
 
-    (indexes, count)
+    count
 }
 
 // ============================================================
@@ -203,41 +228,60 @@ pub unsafe fn find_nnz_avx2(ft_out: &Aligned<[u8; L1_SIZE]>) -> ([u16; NNZ_SIZE]
 
 /// Within-side pairwise FT activation. See `kernels` for the loop itself.
 #[cfg(test)]
-pub fn activate_ft(
-    pst_acc: &Accumulator,
-    combined: &Aligned<[[i16; L1_SIZE]; 2]>,
-    stm: Color,
-) -> Aligned<[u8; L1_SIZE]> {
-    unsafe { k::activate_ft(pst_acc, combined, stm) }
+pub fn activate_ft(acc: &Aligned<[[i16; L1_SIZE]; 2]>, stm: Color) -> Aligned<[u8; L1_SIZE]> {
+    unsafe { k::activate_ft(acc, stm) }
 }
 
-/// L1 sparse inference: process only non-zero input groups.
+// ============================================================
+// Reference dense layers
+// ============================================================
+
+/// The dense layers spelled out one value at a time from the whole FT output, no
+/// sparsity, no vectors: the arithmetic every tier must reproduce to the bit, and the
+/// one the trainer's integer evaluator mirrors. Unit 2^14, skip included.
 #[cfg(test)]
-pub fn propagate_l1(
+pub(crate) fn dense_reference(
+    params: &super::network::NNUEParams,
     ft_out: &Aligned<[u8; L1_SIZE]>,
-    nnz: &[u16],
-    bucket: usize,
-) -> Aligned<[f32; 2 * L2_SIZE]> {
-    unsafe { k::propagate_l1(super::network::params(), ft_out, nnz, bucket) }
-}
-
-/// L2 dense layer: f32 matmul + bias → squared activation.
-#[cfg(test)]
-pub fn propagate_l2(
-    l1_out: &Aligned<[f32; 2 * L2_SIZE]>,
-    bucket: usize,
-) -> Aligned<[f32; L3_SIZE]> {
-    unsafe { k::propagate_l2(super::network::params(), l1_out, bucket) }
-}
-
-/// L3 output layer: `dot(concat(l2_out, l1_out), l3_weights) + bias` → scalar.
-#[cfg(test)]
-pub fn propagate_l3(
-    l2_out: &Aligned<[f32; L3_SIZE]>,
-    l1_out: &Aligned<[f32; 2 * L2_SIZE]>,
-    bucket: usize,
-) -> f32 {
-    unsafe { k::propagate_l3(super::network::params(), l2_out, l1_out, bucket) }
+    stack: usize,
+) -> i32 {
+    use super::{
+        A1_SIZE, GATE_SHIFT, GATED, HIDDEN_MAX, L1_OUT, L1_SHIFT, L1_SQR_SHIFT, L2_OUT,
+        L2_SHIFT, SKIP_NEG, SKIP_POS,
+    };
+    let mut l1 = [0i32; L1_OUT];
+    for (o, out) in l1.iter_mut().enumerate() {
+        let mut sum = params.l1_biases.0[stack][o];
+        for i in 0..L1_SIZE {
+            sum += ft_out.0[i] as i32 * params.l1_weights.0[stack][i / 4][o * 4 + i % 4] as i32;
+        }
+        *out = sum;
+    }
+    let mut a1 = [0i32; A1_SIZE];
+    for o in 0..L1_OUT {
+        let x = l1[o] as i64;
+        a1[o] = ((x * x) >> L1_SQR_SHIFT).min(HIDDEN_MAX as i64) as i32;
+        a1[L1_OUT + o] = (l1[o] >> L1_SHIFT).clamp(0, HIDDEN_MAX);
+    }
+    let mut l2 = [0i32; L2_OUT];
+    for (o, out) in l2.iter_mut().enumerate() {
+        let mut sum = params.l2_biases.0[stack][o];
+        for (i, &a) in a1.iter().enumerate() {
+            sum += a * params.l2_weights.0[stack][i / 4][o * 4 + i % 4] as i32;
+        }
+        *out = sum;
+    }
+    let mut out = params.l3_biases.0[stack];
+    for (i, &a) in a1.iter().enumerate() {
+        out += a * params.l3_weights_a.0[stack][i] as i32;
+    }
+    for j in 0..GATED {
+        let g = (l2[j] >> L2_SHIFT).clamp(0, HIDDEN_MAX);
+        let v = (l2[GATED + j] >> L2_SHIFT).clamp(-HIDDEN_MAX, HIDDEN_MAX);
+        let h = (g * g * v) >> GATE_SHIFT;
+        out += h * params.l3_weights_h.0[stack][j];
+    }
+    out + l1[SKIP_POS] - l1[SKIP_NEG]
 }
 
 // ============================================================
@@ -247,10 +291,21 @@ pub fn propagate_l3(
 #[cfg(test)]
 mod tests {
     use super::super::accumulator::Accumulator;
-    use super::super::network;
     use super::super::threats;
-    use super::super::{FT_QUANT, FT_SHIFT, L1_NORMALISATION, L1_SIZE};
+    use super::super::{FT_QUANT, FT_SHIFT, L1_SIZE};
     use super::*;
+    /// The single accumulator the kernels read: the two test inputs summed as the
+    /// engine sums its features, wrapping.
+    fn fused(pst: &Accumulator, comb: &Aligned<[[i16; L1_SIZE]; 2]>) -> Aligned<[[i16; L1_SIZE]; 2]> {
+        let mut out = Aligned([[0i16; L1_SIZE]; 2]);
+        for pov in 0..2 {
+            for i in 0..L1_SIZE {
+                out.0[pov][i] = pst.values.0[pov][i].wrapping_add(comb.0[pov][i]);
+            }
+        }
+        out
+    }
+
 
     /// Reference scalar activate_ft (natural order, asymmetric clamp).
     fn activate_ft_reference(
@@ -274,37 +329,11 @@ mod tests {
         output
     }
 
-    /// Reference scalar L1 propagation with CReLU+squared output.
-    fn propagate_l1_reference(ft_out: &[u8; L1_SIZE], bucket: usize) -> [f32; 2 * L2_SIZE] {
-        let mut pre_act = [0i32; L2_SIZE];
-        let weights = &network::params().l1_weights.0[bucket];
-        for ig in 0..L1_SIZE / 4 {
-            for b in 0..4 {
-                let input = ft_out[ig * 4 + b] as i32;
-                if input == 0 {
-                    continue;
-                }
-                for j in 0..L2_SIZE {
-                    pre_act[j] += input * weights[ig][j * 4 + b] as i32;
-                }
-            }
-        }
-        let mut output = [0.0f32; 2 * L2_SIZE];
-        for j in 0..L2_SIZE {
-            let val =
-                pre_act[j] as f32 * L1_NORMALISATION + network::params().l1_biases.0[bucket][j];
-            let clamped = val.clamp(0.0, 1.0);
-            output[j] = clamped;
-            output[j + L2_SIZE] = (val * val).min(1.0); // min(val², 1)
-        }
-        output
-    }
-
     #[test]
     fn test_activate_ft_zeroed_weights() {
         let pst_acc = Accumulator::new();
         let combined = Aligned([[0i16; L1_SIZE]; 2]);
-        let simd_out = activate_ft(&pst_acc, &combined, Color::White);
+        let simd_out = activate_ft(&fused(&pst_acc, &combined), Color::White);
         let ref_out = activate_ft_reference(&pst_acc, &combined, Color::White);
         for i in 0..L1_SIZE {
             assert_eq!(simd_out.0[i], ref_out[i], "activate_ft mismatch at {i}");
@@ -337,7 +366,7 @@ mod tests {
         }
 
         for stm in [Color::White, Color::Black] {
-            let simd_out = activate_ft(&pst_acc, &combined, stm);
+            let simd_out = activate_ft(&fused(&pst_acc, &combined), stm);
             let ref_out = activate_ft_reference(&pst_acc, &combined, stm);
             let mismatches = (0..L1_SIZE)
                 .filter(|&i| simd_out.0[i] != ref_out[i])
@@ -355,7 +384,7 @@ mod tests {
     #[test]
     fn test_find_nnz_all_zero() {
         let ft_out = Aligned([0u8; L1_SIZE]);
-        let (_, count) = find_nnz(&ft_out);
+        let count = unsafe { find_nnz(&ft_out, [0u16; NNZ_SIZE].as_mut_ptr()) };
         assert_eq!(count, 0, "all-zero should have 0 NNZ groups");
     }
 
@@ -365,7 +394,7 @@ mod tests {
         for i in 0..L1_SIZE {
             ft_out.0[i] = 1;
         }
-        let (_, count) = find_nnz(&ft_out);
+        let count = unsafe { find_nnz(&ft_out, [0u16; NNZ_SIZE].as_mut_ptr()) };
         assert_eq!(
             count,
             L1_SIZE / 4,
@@ -379,44 +408,50 @@ mod tests {
         let mut ft_out = Aligned([0u8; L1_SIZE]);
         ft_out.0[0] = 42;
         ft_out.0[8] = 99;
-        let (indices, count) = find_nnz(&ft_out);
+        let mut indices = [0u16; NNZ_SIZE];
+        let count = unsafe { find_nnz(&ft_out, indices.as_mut_ptr()) };
         assert_eq!(count, 2, "should have 2 NNZ groups");
         assert_eq!(indices[0], 0, "first NNZ group should be 0");
         assert_eq!(indices[1], 2, "second NNZ group should be 2");
     }
 
+    /// The kernels of this build compute the reference's integers, on random weights
+    /// and inputs (the cross-tier test in `kernels` holds every other tier to it).
     #[test]
-    fn test_propagate_l1_zero_input() {
-        let ft_out = Aligned([0u8; L1_SIZE]);
-        let (nnz, count) = find_nnz(&ft_out);
-        let simd_out = propagate_l1(&ft_out, &nnz[..count], 0);
-        let ref_out = propagate_l1_reference(&ft_out.0, 0);
-        for j in 0..2 * L2_SIZE {
-            assert!(
-                (simd_out.0[j] - ref_out[j]).abs() < 1e-6,
-                "propagate_l1 zero mismatch at {j}: simd={}, ref={}",
-                simd_out.0[j],
-                ref_out[j]
-            );
+    fn the_dense_layers_of_this_build_are_the_reference() {
+        let mut state = 0x5DEE_CE66_D1CE_4E5Bu64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut params = super::super::network::NNUEParams::zeroed_box();
+        for s in 0..super::super::STACKS {
+            for g in params.l1_weights.0[s].iter_mut() {
+                g.iter_mut().for_each(|w| *w = next() as i8);
+            }
+            for g in params.l2_weights.0[s].iter_mut() {
+                g.iter_mut().for_each(|w| *w = next() as i8);
+            }
+            params.l1_biases.0[s].iter_mut().for_each(|b| *b = (next() % 60_001) as i32 - 30_000);
+            params.l2_biases.0[s].iter_mut().for_each(|b| *b = (next() % 20_001) as i32 - 10_000);
+            params.l3_weights_a.0[s].iter_mut().for_each(|w| *w = next() as i8);
+            params.l3_weights_h.0[s].iter_mut().for_each(|w| *w = (next() % 255) as i32 - 127);
+            params.l3_biases.0[s] = (next() % 20_001) as i32 - 10_000;
         }
-    }
-
-    #[test]
-    fn test_propagate_l1_nonzero_input() {
-        let mut ft_out = Aligned([0u8; L1_SIZE]);
-        for i in 0..L1_SIZE {
-            ft_out.0[i] = ((i * 7 + 13) % 127) as u8;
-        }
-        let (nnz, count) = find_nnz(&ft_out);
-        let simd_out = propagate_l1(&ft_out, &nnz[..count], 0);
-        let ref_out = propagate_l1_reference(&ft_out.0, 0);
-        for j in 0..2 * L2_SIZE {
-            assert!(
-                (simd_out.0[j] - ref_out[j]).abs() < 1e-4,
-                "propagate_l1 mismatch at {j}: simd={}, ref={}",
-                simd_out.0[j],
-                ref_out[j]
-            );
+        for _ in 0..50 {
+            let mut ft_out = Aligned([0u8; L1_SIZE]);
+            for x in ft_out.0.iter_mut() {
+                let v = (next() >> 57) as u8;
+                *x = if v < 70 { 0 } else { v };
+            }
+            let mut nnz = [0u16; NNZ_SIZE];
+            let count = unsafe { find_nnz(&ft_out, nnz.as_mut_ptr()) };
+            for stack in 0..super::super::STACKS {
+                let got = unsafe { k::dense_layers(&params, &ft_out, &nnz[..count], stack) };
+                assert_eq!(got, dense_reference(&params, &ft_out, stack), "stack {stack}");
+            }
         }
     }
 
@@ -442,7 +477,7 @@ mod tests {
     #[test]
     fn test_compute_full_threats_kk_endgame() {
         let pos = crate::position::Position::from_fen("4k3/8/8/8/8/8/8/4K3 w - - 0 1").unwrap();
-        let (combined, _psqt) = threats::compute_full_threats(&pos);
+        let combined = threats::compute_full_threats(&pos);
         // With zeroed weights the buffer should be all zeros.
         for pov in 0..2 {
             for i in 0..L1_SIZE {
@@ -461,7 +496,7 @@ mod tests {
             "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
         )
         .unwrap();
-        let (combined, _psqt) = threats::compute_full_threats(&pos);
+        let combined = threats::compute_full_threats(&pos);
 
         if !crate::nnue::network::has_network() {
             // Nothing embedded, so every weight is zero and so is every sum.

@@ -91,18 +91,26 @@ impl OnlineTbEntry {
     /// clock 0, which is only this position's at clock 0.
     pub fn score(&self, ply: i32, halfmove_clock: u8) -> Option<i32> {
         let moves_left = 100 - halfmove_clock as i32;
+        // The distance as the server sent it, which may be any i32: `i32::MIN` has no
+        // i32 magnitude, and once wrapped it passed for a mate within the clock. One
+        // that fits the half-moves left fits an i32 again.
+        let distance = self
+            .dtm
+            .map(i32::unsigned_abs)
+            .filter(|&d| i64::from(d) <= i64::from(moves_left))
+            .map(|d| d as i32);
         match self.category {
             TbCategory::Draw => Some(0),
             TbCategory::Unknown => None,
-            TbCategory::Win => match self.dtm.map(i32::abs) {
+            TbCategory::Win => match distance {
                 // A win is never zero half-moves away: zero would read as mated now.
-                Some(d) if d != 0 && d <= moves_left => Some(dtm_score(ply, d)),
+                Some(d) if d != 0 => Some(dtm_score(ply, d)),
                 _ if halfmove_clock == 0 => Some(tb_win_in(ply)),
                 _ => None,
             },
-            TbCategory::Loss => match self.dtm.map(i32::abs) {
+            TbCategory::Loss => match distance {
                 // Zero half-moves to be mated is the mate on the board.
-                Some(d) if d <= moves_left => Some(dtm_score(ply, -d)),
+                Some(d) => Some(dtm_score(ply, -d)),
                 _ if halfmove_clock == 0 => Some(tb_loss_in(ply)),
                 _ => None,
             },
@@ -428,7 +436,18 @@ fn probe_lichess(fen: &str) -> Result<OnlineTbEntry, String> {
         .read_to_string()
         .map_err(|e| e.to_string())?;
 
-    let resp: LichessResponse = serde_json::from_str(&body).map_err(|e| e.to_string())?;
+    parse_response(&body)
+}
+
+/// [`parse_response`] for the fuzz targets under `fuzz/`.
+#[cfg(fuzzing)]
+pub fn fuzz_parse_response(body: &str) -> Result<OnlineTbEntry, String> {
+    parse_response(body)
+}
+
+/// The cache entry for the server's answer, from the body of its reply.
+fn parse_response(body: &str) -> Result<OnlineTbEntry, String> {
+    let resp: LichessResponse = serde_json::from_str(body).map_err(|e| e.to_string())?;
 
     let category = category_of(resp.category.as_str());
 
@@ -488,5 +507,20 @@ mod tests {
         assert_eq!(draw.score(5, 90), Some(0), "a draw at clock 0 stays one");
         let unsure = OnlineTbEntry { dtm: None, category: TbCategory::Unknown };
         assert_eq!(unsure.score(5, 0), None);
+    }
+
+    /// A distance with no i32 magnitude is a distance past any clock, never a mate:
+    /// `i32::abs` panicked on it, and wrapped it passed for one. Found by the
+    /// `online_tb` fuzz target.
+    #[test]
+    fn a_distance_past_any_clock_proves_no_mate() {
+        let reply = r#"{"dtm":-2147483648,"dtz":null,"category":"win"}"#;
+        let win = parse_response(reply).unwrap();
+        assert_eq!(win.score(2, 0), Some(tb_win_in(2)));
+        assert_eq!(win.score(2, 1), None);
+        let loss = OnlineTbEntry { dtm: Some(i32::MIN), category: TbCategory::Loss };
+        assert_eq!(loss.score(3, 0), Some(tb_loss_in(3)));
+        let far = OnlineTbEntry { dtm: Some(i32::MAX), category: TbCategory::Win };
+        assert_eq!(far.score(3, 0), Some(tb_win_in(3)));
     }
 }

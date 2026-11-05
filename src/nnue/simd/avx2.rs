@@ -19,6 +19,8 @@ pub const F32_LANES: usize = 8;
 /// Independent sparse-L1 dpbusd chains. Emulated maddubs is short enough
 /// that one chain wins; VNNI's 5-cycle `vpdpbusd` wants three.
 pub const DPBUSD_CHAINS: usize = 1;
+/// `mul_add_f32` is one fused instruction (one rounding).
+pub const MUL_ADD_FUSED: bool = true;
 
 // ============================================================
 // i16 operations (accumulator, FT activation)
@@ -54,14 +56,12 @@ pub unsafe fn min_i16(a: __m256i, b: __m256i) -> __m256i {
     _mm256_min_epi16(a, b)
 }
 
+/// The pairwise FT product `(left * right) >> 9` (`FT_SHIFT`), for `left` in
+/// `0..=FT_QUANT`: `mulhi(left << 7, right)`, the shift putting the product's bits
+/// 9 and up into the high half.
 #[inline(always)]
-pub unsafe fn shift_left_i16<const SHIFT: i32>(a: __m256i) -> __m256i {
-    _mm256_slli_epi16(a, SHIFT)
-}
-
-#[inline(always)]
-pub unsafe fn mul_high_i16(a: __m256i, b: __m256i) -> __m256i {
-    _mm256_mulhi_epi16(a, b)
+pub unsafe fn ft_product(left: __m256i, right: __m256i) -> __m256i {
+    _mm256_mulhi_epi16(_mm256_slli_epi16::<7>(left), right)
 }
 
 /// Pack two vectors of i16 → one vector of u8 (unsigned saturation).
@@ -76,12 +76,40 @@ pub unsafe fn permute(a: __m256i) -> __m256i {
     _mm256_permute4x64_epi64::<0b11_01_10_00>(a)
 }
 
-/// Load I16_LANES (16) i8 values from `ptr` and sign-extend to i16.
+/// Two registers of i16 from `2 * I16_LANES` bytes of each of two i8 rows,
+/// summed lane by lane.
 ///
-/// Used for threat accumulator: i8 weights → i16 additions.
+/// `unpack{lo,hi}_epi8` interleave the rows byte by byte inside each 128-bit
+/// lane, and `maddubs` against ones adds each pair into one i16 — exactly, the
+/// sum lies in [-256, 254]. One shuffle per register for two rows, where a
+/// `vpmovsxbw` costs one per register and per row.
+///
+/// The first register gets the low 8 bytes of each 128-bit lane, the second the
+/// high 8: the interleaving `packus` undoes, so rows held in logical order land
+/// on the accumulator's packus-ordered lanes.
 #[inline(always)]
-pub unsafe fn load_i8_as_i16(ptr: *const i8) -> __m256i {
-    _mm256_cvtepi8_epi16(_mm_loadu_si128(ptr as *const __m128i))
+pub unsafe fn widen_i8_pair(a: *const i8, b: *const i8) -> [__m256i; 2] {
+    let ones = _mm256_set1_epi8(1);
+    let wa = _mm256_loadu_si256(a as *const __m256i);
+    let wb = _mm256_loadu_si256(b as *const __m256i);
+    [
+        _mm256_maddubs_epi16(ones, _mm256_unpacklo_epi8(wa, wb)),
+        _mm256_maddubs_epi16(ones, _mm256_unpackhi_epi8(wa, wb)),
+    ]
+}
+
+/// One i8 row alone, in the order of [`widen_i8_pair`]: paired with zero, through
+/// the same `maddubs`. A sign-extending shift of the unpacked bytes is exact too,
+/// but measured about 0.5 % slower on Zen 5.
+#[inline(always)]
+pub unsafe fn widen_i8(a: *const i8) -> [__m256i; 2] {
+    let ones = _mm256_set1_epi8(1);
+    let zero = _mm256_setzero_si256();
+    let w = _mm256_loadu_si256(a as *const __m256i);
+    [
+        _mm256_maddubs_epi16(ones, _mm256_unpacklo_epi8(w, zero)),
+        _mm256_maddubs_epi16(ones, _mm256_unpackhi_epi8(w, zero)),
+    ]
 }
 
 /// Multiply pairs of adjacent i16 and accumulate into i32.
@@ -212,3 +240,35 @@ pub unsafe fn horizontal_sum(x: [__m256; 2]) -> f32 {
 
 /// Number of __m256 vectors needed for horizontal_sum input.
 pub const HSUM_VECS: usize = 2;
+
+// ============================================================
+// i32 operations (integer dense layers)
+// ============================================================
+
+/// Arithmetic right shift of every i32 lane: a floor division by `2^n`.
+#[inline(always)]
+pub unsafe fn srai_i32(a: __m256i, n: i32) -> __m256i {
+    _mm256_sra_epi32(a, _mm_cvtsi32_si128(n))
+}
+
+/// Clamp every i32 lane to `[lo, hi]`.
+#[inline(always)]
+pub unsafe fn clamp_i32(x: __m256i, lo: __m256i, hi: __m256i) -> __m256i {
+    _mm256_min_epi32(_mm256_max_epi32(x, lo), hi)
+}
+
+/// Low 32 bits of each lane's product.
+#[inline(always)]
+pub unsafe fn mullo_i32(a: __m256i, b: __m256i) -> __m256i {
+    _mm256_mullo_epi32(a, b)
+}
+
+/// Four registers of i32 in `0..=255` narrowed to one register of u8, in order:
+/// the lanes of `a`, then those of `b`, `c`, `d`. The two packs interleave the
+/// 128-bit lanes of the four inputs; one dword permute puts them back.
+#[inline(always)]
+pub unsafe fn narrow_u8(a: __m256i, b: __m256i, c: __m256i, d: __m256i) -> __m256i {
+    let packed = _mm256_packus_epi16(_mm256_packs_epi32(a, b), _mm256_packs_epi32(c, d));
+    // Dword `4l + k` holds the lanes `4l..4l+4` of input `k`: logical dword `2k + l`.
+    _mm256_permutevar8x32_epi32(packed, _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7))
+}

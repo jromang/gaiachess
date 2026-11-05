@@ -16,6 +16,10 @@ const MAX_HISTORY: i32 = 16384;
 /// Maximum correction history value for gravity formula.
 pub const CORRHIST_LIMIT: i32 = 1024;
 
+// Every table stores its clamped value as an i16.
+const _: () = assert!(MAX_HISTORY <= i16::MAX as i32);
+const _: () = assert!(CORRHIST_LIMIT <= i16::MAX as i32);
+
 /// Entries per thread in the key-indexed correction history tables.
 ///
 /// The scale of the reference engines, which is four times what this was. Sharing the
@@ -90,6 +94,10 @@ impl ButterflyHistory {
         let from_thr = ((threats >> m.from_sq().index()) & 1) as usize;
         let to_thr = ((threats >> m.to_sq().index()) & 1) as usize;
         let entry = &mut self.table[color.index()][from_thr][to_thr][Self::index(m)];
+        debug_assert!(
+            bonus.abs() <= MAX_HISTORY,
+            "history bonus {bonus} beyond the gravity bound"
+        );
         let val = *entry as i32;
         let new_val = val + bonus - val * bonus.abs() / MAX_HISTORY;
         *entry = new_val.clamp(-MAX_HISTORY, MAX_HISTORY) as i16;
@@ -140,6 +148,10 @@ impl PawnHistory {
         );
         debug_assert!(to.0 < 64, "PawnHistory::update: to sq {} OOB", to.0);
         let entry = &mut self.table[pawn_key as usize % PAWN_HIST_SIZE][piece.index()][to.index()];
+        debug_assert!(
+            bonus.abs() <= MAX_HISTORY,
+            "history bonus {bonus} beyond the gravity bound"
+        );
         let val = *entry as i32;
         let new_val = val + bonus - val * bonus.abs() / MAX_HISTORY;
         *entry = new_val.clamp(-MAX_HISTORY, MAX_HISTORY) as i16;
@@ -249,6 +261,10 @@ impl CaptureHistory {
             "CaptureHistory::update: captured_pt OOB"
         );
         let entry = &mut self.table[piece.index()][to.index()][captured_pt.index()];
+        debug_assert!(
+            bonus.abs() <= MAX_HISTORY,
+            "history bonus {bonus} beyond the gravity bound"
+        );
         let val = *entry as i32;
         let new_val = val + bonus - val * bonus.abs() / MAX_HISTORY;
         *entry = new_val.clamp(-MAX_HISTORY, MAX_HISTORY) as i16;
@@ -279,7 +295,7 @@ impl ContinuationHistory {
 
     pub fn clear(&mut self) {
         unsafe {
-            let ptr = &mut *self.table as *mut _ as *mut u8;
+            let ptr = &raw mut *self.table as *mut u8;
             let size = std::mem::size_of::<[[[PieceToTable; Square::NUM]; Piece::NUM]; 2]>();
             std::ptr::write_bytes(ptr, 0, size);
         }
@@ -328,6 +344,10 @@ impl ContinuationHistory {
         debug_assert!(piece.0 < 12, "ContinuationHistory::update: piece NONE");
         debug_assert!(to.0 < 64, "ContinuationHistory::update: sq OOB {}", to.0);
         let entry = unsafe { &mut (*subtable_ptr)[piece.index()][to.index()] };
+        debug_assert!(
+            bonus.abs() <= MAX_HISTORY,
+            "history bonus {bonus} beyond the gravity bound"
+        );
         let val = *entry as i32;
         let new_val = val + bonus - val * bonus.abs() / MAX_HISTORY;
         *entry = new_val.clamp(-MAX_HISTORY, MAX_HISTORY) as i16;
@@ -492,6 +512,17 @@ impl SharedCorrectionHistory {
         unsafe { &*self.table.as_ptr().cast::<AtomicI16>().add(idx) }
     }
 
+    /// Ask for the four slots [`get`](Self::get) will read for a position with these
+    /// keys and side to move. Each kind is looked up with its own key, so these are
+    /// four cache lines anywhere in a table of megabytes.
+    #[inline]
+    pub fn prefetch(&self, pawn: u64, minor: u64, non_pawn: [u64; 2], stm: Color) {
+        prefetch_line(self.slot(CorrKind::Pawn, pawn, stm));
+        prefetch_line(self.slot(CorrKind::Minor, minor, stm));
+        prefetch_line(self.slot(CorrKind::NonPawnWhite, non_pawn[0], stm));
+        prefetch_line(self.slot(CorrKind::NonPawnBlack, non_pawn[1], stm));
+    }
+
     /// Correction value for a key and side to move.
     #[inline]
     pub fn get(&self, kind: CorrKind, key: u64, stm: Color) -> i32 {
@@ -544,7 +575,7 @@ impl ContCorrectionHistory {
 
     pub fn clear(&mut self) {
         unsafe {
-            let ptr = &mut *self.table as *mut _ as *mut u8;
+            let ptr = &raw mut *self.table as *mut u8;
             let size = std::mem::size_of::<[[PieceToCorrTable; Square::NUM]; Piece::NUM]>();
             std::ptr::write_bytes(ptr, 0, size);
         }
@@ -563,6 +594,18 @@ impl ContCorrectionHistory {
             to.0
         );
         &raw mut self.table[piece.index()][to.index()]
+    }
+
+    /// Ask for the cell [`get`](Self::get) will read with the same arguments.
+    #[inline]
+    pub fn prefetch(subtable_ptr: *const PieceToCorrTable, piece: Piece, to: Square) {
+        if subtable_ptr.is_null() {
+            return;
+        }
+        debug_assert!(piece.0 < 12, "ContCorrectionHistory::prefetch: piece NONE");
+        debug_assert!(to.0 < 64, "ContCorrectionHistory::prefetch: sq OOB {}", to.0);
+        // SAFETY: an address inside the subtable, computed without reading it.
+        prefetch_line(unsafe { (&raw const (*subtable_ptr)[piece.index()][to.index()]).cast::<i16>() });
     }
 
     /// Get the correction value from a subtable pointer.
@@ -585,9 +628,39 @@ impl ContCorrectionHistory {
         debug_assert!(piece.0 < 12, "ContCorrectionHistory::update: piece NONE");
         debug_assert!(to.0 < 64, "ContCorrectionHistory::update: sq OOB {}", to.0);
         let entry = unsafe { &mut (*subtable_ptr)[piece.index()][to.index()] };
+        debug_assert!(
+            bonus.abs() <= CORRHIST_LIMIT,
+            "correction bonus {bonus} beyond the gravity bound"
+        );
         let val = *entry as i32;
         let new_val = val + bonus - val * bonus.abs() / CORRHIST_LIMIT;
         *entry = new_val.clamp(-CORRHIST_LIMIT, CORRHIST_LIMIT) as i16;
+    }
+}
+
+/// Ask the CPU to bring the cache line holding `ptr` towards L1, without waiting for
+/// it. A hint: it never faults and changes nothing a later read will see.
+#[inline(always)]
+#[cfg_attr(
+    not(any(target_arch = "x86_64", target_arch = "aarch64")),
+    allow(unused_variables)
+)]
+fn prefetch_line<T>(ptr: *const T) {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: a prefetch of any address is defined behaviour; it does not dereference.
+    unsafe {
+        use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
+        _mm_prefetch::<{ _MM_HINT_T0 }>(ptr.cast::<i8>());
+    }
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: as above; the options tell the compiler the instruction neither writes
+    // memory nor touches the stack or the flags, so code around it is not held back.
+    unsafe {
+        std::arch::asm!(
+            "prfm pldl1keep, [{ptr}]",
+            ptr = in(reg) ptr,
+            options(nostack, readonly, preserves_flags)
+        );
     }
 }
 

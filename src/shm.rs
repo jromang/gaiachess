@@ -180,6 +180,67 @@ pub fn describe_policy(enabled: bool, var: &str) -> String {
     format!("enabled, {n} peer(s) serving{verify}")
 }
 
+/// Which executable this process is running, as a short digest.
+///
+/// Two different binaries must never read each other's memory, whatever
+/// their names for the same blob happen to agree on. That is not a
+/// hypothetical: an SPRT runs a patched engine against its base at the
+/// same time, on the same machine, over the same weights, and any code
+/// change between them could change what the image is supposed to hold.
+/// Keying on the executable itself makes the question moot.
+///
+/// Identity is the file behind the running process — `/proc/self/exe` on
+/// Linux — and what tells it from a replacement at the same path (see
+/// [`file_identity`]): a rebuild lands on a new tag. When the file cannot be
+/// read the path alone has to do, and the caller's own name for the blob
+/// carries the rest.
+#[cfg(any(target_os = "linux", windows))]
+fn binary_tag() -> u64 {
+    use crate::nnue::integrity::fnv1a64;
+    static TAG: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *TAG.get_or_init(|| {
+        #[cfg(target_os = "linux")]
+        let path = std::fs::read_link("/proc/self/exe").or_else(|_| std::env::current_exe());
+        #[cfg(windows)]
+        let path = std::env::current_exe();
+        let path = path.unwrap_or_default();
+        let mut acc = fnv1a64(path.as_os_str().as_encoded_bytes());
+        if let Ok(md) = std::fs::metadata(&path) {
+            for v in file_identity(&md) {
+                acc = fnv1a64(&{
+                    let mut b = acc.to_le_bytes().to_vec();
+                    b.extend_from_slice(&v.to_le_bytes());
+                    b
+                });
+            }
+        }
+        acc
+    })
+}
+
+/// What tells a file from another later put at its path: device, inode, size
+/// and modification time.
+#[cfg(target_os = "linux")]
+fn file_identity(md: &std::fs::Metadata) -> [u64; 5] {
+    use std::os::unix::fs::MetadataExt;
+    [
+        md.dev(),
+        md.ino(),
+        md.size(),
+        md.mtime() as u64,
+        md.mtime_nsec() as u64,
+    ]
+}
+
+/// What tells a file from another later put at its path. The stable library
+/// gives no file index on Windows, so size, creation and last write, to the
+/// 100 ns the file system keeps.
+#[cfg(windows)]
+fn file_identity(md: &std::fs::Metadata) -> [u64; 3] {
+    use std::os::windows::fs::MetadataExt;
+    [md.file_size(), md.creation_time(), md.last_write_time()]
+}
+
 // ============================================================
 // Linux: memfd + abstract sockets
 // ============================================================
@@ -300,49 +361,9 @@ mod imp {
         unsafe { nix::libc::geteuid() }
     }
 
-    /// Which executable this process is running, as a short digest.
-    ///
-    /// Two different binaries must never read each other's memory, whatever
-    /// their names for the same blob happen to agree on. That is not a
-    /// hypothetical: an SPRT runs a patched engine against its base at the
-    /// same time, on the same machine, over the same weights, and any code
-    /// change between them could change what the image is supposed to hold.
-    /// Keying on the executable itself makes the question moot.
-    ///
-    /// Identity is the file behind `/proc/self/exe`: device, inode, size and
-    /// modification time. A rebuild replaces the file, so it lands on a new
-    /// tag even at the same path. Where `/proc` is not mounted the path alone
-    /// has to do, and the caller's own name for the blob carries the rest.
-    fn binary_tag() -> u64 {
-        static TAG: OnceLock<u64> = OnceLock::new();
-        *TAG.get_or_init(|| {
-            let path = std::fs::read_link("/proc/self/exe")
-                .or_else(|_| std::env::current_exe())
-                .unwrap_or_default();
-            let mut acc = crate::nnue::integrity::fnv1a64(path.as_os_str().as_encoded_bytes());
-            if let Ok(md) = std::fs::metadata(&path) {
-                use std::os::unix::fs::MetadataExt;
-                for v in [
-                    md.dev(),
-                    md.ino(),
-                    md.size(),
-                    md.mtime() as u64,
-                    md.mtime_nsec() as u64,
-                ] {
-                    acc = crate::nnue::integrity::fnv1a64(&{
-                        let mut b = acc.to_le_bytes().to_vec();
-                        b.extend_from_slice(&v.to_le_bytes());
-                        b
-                    });
-                }
-            }
-            acc
-        })
-    }
-
     /// The namespace a blob lives in: this user, this executable, this blob.
     fn scope(name: &str) -> String {
-        format!("gaiachess/{}/{:016x}/{name}", euid(), binary_tag())
+        format!("gaiachess/{}/{:016x}/{name}", euid(), super::binary_tag())
     }
 
     fn serve_prefix(name: &str) -> String {
@@ -817,10 +838,11 @@ mod imp {
 // ============================================================
 
 /// Windows shares a blob through a named, pagefile-backed file mapping in the
-/// session namespace. The first process to take the mapping's mutex and find no
-/// "initialised" marker builds the blob; everyone else maps the same pages. Large
-/// pages are tried first, as for the engine's other big tables. The mapping lives
-/// as long as one process holds a handle to it, and nothing touches the disk.
+/// session namespace, named after the executable as on Linux. The first process
+/// to take the mapping's mutex and find no "initialised" marker builds the blob;
+/// everyone else maps the same pages. Large pages are tried first, as for the
+/// engine's other big tables. The mapping lives as long as one process holds a
+/// handle to it, and nothing touches the disk.
 #[cfg(windows)]
 mod imp {
     use super::{Mapped, Origin};
@@ -914,9 +936,10 @@ mod imp {
         build: &mut dyn FnMut(&mut [u8]),
     ) -> Result<Mapped, String> {
         let size = len + TRAILER;
-        let map_name = std::ffi::CString::new(format!("Local\\gaiachess-{name}"))
-            .map_err(|_| String::from("bad image name"))?;
-        let mutex_name = std::ffi::CString::new(format!("Local\\gaiachess-{name}$mutex"))
+        let scoped = format!("Local\\gaiachess-{:016x}-{name}", super::binary_tag());
+        let map_name =
+            std::ffi::CString::new(scoped.as_str()).map_err(|_| String::from("bad image name"))?;
+        let mutex_name = std::ffi::CString::new(format!("{scoped}$mutex"))
             .map_err(|_| String::from("bad image name"))?;
 
         let mapping = create(&map_name, size);

@@ -9,10 +9,11 @@
 #![allow(dead_code)]
 
 pub use super::neon::{
-    F32_LANES, HSUM_VECS, I16_LANES, I32_LANES, add_i16, add_i32, clamp_f32, clamp_i16,
-    convert_to_f32, horizontal_sum, horizontal_sum_i32, load_i8_as_i16, madd_i16, min_i16,
-    mul_add_f32, mul_f32, mul_high_i16, nnz_bitmask, packus, permute, shift_left_i16, splat_f32,
-    splat_i16, splat_i32, sub_i16, zero_f32, zeroed_i16, zeroed_i32,
+    F32_LANES, HSUM_VECS, I16_LANES, I32_LANES, MUL_ADD_FUSED, add_i16, add_i32, clamp_f32,
+    clamp_i16, clamp_i32, convert_to_f32, ft_product, horizontal_sum, horizontal_sum_i32,
+    madd_i16, min_i16, mul_add_f32, mul_f32, mullo_i32, narrow_u8, nnz_bitmask, packus, permute,
+    splat_f32, splat_i16, splat_i32, srai_i32, sub_i16, widen_i8, widen_i8_pair, zero_f32,
+    zeroed_i16, zeroed_i32,
 };
 
 /// Native `sdot` latency: three chains, same idea as VNNI.

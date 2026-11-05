@@ -21,6 +21,8 @@ use crate::types::*;
 struct LoadedProber {
     prober: NalimovProber,
     paths: String,
+    /// The paths' directories' times when they were read (`tb::dir_stamps`).
+    stamps: Vec<Option<std::time::SystemTime>>,
 }
 
 static PROBER: RwLock<Option<LoadedProber>> = RwLock::new(None);
@@ -40,6 +42,7 @@ pub fn init(paths: &str) -> bool {
     let path_list: Vec<&str> = paths.split(';').collect();
     #[cfg(not(windows))]
     let path_list: Vec<&str> = paths.split([':', ';']).collect();
+    let stamps = crate::tb::dir_stamps(paths);
     let detected = detect_max_pieces(&path_list);
     match NalimovProber::new(&path_list, cache_size_mb() as usize) {
         Ok(prober) => {
@@ -47,6 +50,7 @@ pub fn init(paths: &str) -> bool {
             *PROBER.write().expect("Nalimov prober lock poisoned") = Some(LoadedProber {
                 prober,
                 paths: paths.to_owned(),
+                stamps,
             });
             true
         }
@@ -56,6 +60,20 @@ pub fn init(paths: &str) -> bool {
             false
         }
     }
+}
+
+/// Whether the prober in service was built from `paths`, and none of their directories
+/// has gained or lost a table since: naming them again need not rebuild it, nor throw
+/// away its cache of decompressed blocks, which fastchess's options before every game
+/// otherwise did.
+pub fn is_loaded_from(paths: &str) -> bool {
+    PROBER
+        .read()
+        .expect("Nalimov prober lock poisoned")
+        .as_ref()
+        .is_some_and(|loaded| {
+            loaded.paths == paths && loaded.stamps == crate::tb::dir_stamps(paths)
+        })
 }
 
 /// Unload the current tablebases and release their cache.

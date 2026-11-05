@@ -436,6 +436,22 @@ pub fn hardware_signature() -> u32 {
     })
 }
 
+/// The hardware node of the first processor the process was started on: what tells
+/// apart the images of two processes pinned to two different nodes.
+pub fn startup_hardware_node() -> usize {
+    let hardware = hardware_config();
+    let first = match startup_affinity() {
+        Some(cpus) => cpus.first().copied(),
+        None => hardware.nodes().first().and_then(|n| n.first().copied()),
+    };
+    first.and_then(|c| hardware.node_of_cpu(c)).unwrap_or(0)
+}
+
+/// Whether the machine has more than one memory node.
+pub fn several_hardware_nodes() -> bool {
+    hardware_config().node_count() > 1
+}
+
 /// Reads the machine. `respect_affinity` keeps only the processors the process was
 /// started on; `bundle_l3` subdivides memory nodes into bundles of cache domains.
 fn system_config(respect_affinity: bool, bundle_l3: bool) -> NumaConfig {
@@ -444,24 +460,50 @@ fn system_config(respect_affinity: bool, bundle_l3: bool) -> NumaConfig {
     } else {
         None
     };
-    let is_allowed = |c: usize| allowed.as_ref().is_none_or(|a| a.binary_search(&c).is_ok());
+    let l3 = if bundle_l3 { sys::l3_domains() } else { None };
+    let mut cfg = build_config(
+        sys::memory_nodes(),
+        l3,
+        allowed.as_deref(),
+        hardware_concurrency(),
+    );
+    if cfg!(all(windows, target_pointer_width = "64")) {
+        cfg = cfg.split_at_groups(WIN_GROUP_SIZE);
+    }
+    cfg
+}
 
-    let memory = match sys::memory_nodes() {
+/// The configuration of a machine with these memory nodes (`None`: one node of
+/// `concurrency` processors) and last-level cache domains (`None`: no bundling), seen
+/// by a process allowed on `allowed` (`None`: everywhere).
+///
+/// Every logical node is named after its hardware node, the index it has with no
+/// affinity at all: two processes pinned to two sockets must not both call theirs
+/// node 0, or the images they share per node would be shared across sockets.
+fn build_config(
+    memory_nodes: Option<Vec<Vec<usize>>>,
+    l3_domains: Option<Vec<Vec<usize>>>,
+    allowed: Option<&[usize]>,
+    concurrency: usize,
+) -> NumaConfig {
+    let is_allowed = |c: usize| allowed.is_none_or(|a| a.binary_search(&c).is_ok());
+    let hardware = match &memory_nodes {
+        Some(nodes) => NumaConfig::from_nodes(nodes.clone()),
+        None => NumaConfig::single(concurrency),
+    };
+
+    let memory = match memory_nodes {
         Some(nodes) => NumaConfig::from_nodes(
             nodes
                 .into_iter()
                 .map(|cpus| cpus.into_iter().filter(|&c| is_allowed(c)).collect())
                 .collect(),
         ),
-        None => NumaConfig::from_nodes(vec![
-            (0..hardware_concurrency())
-                .filter(|&c| is_allowed(c))
-                .collect(),
-        ]),
+        None => NumaConfig::from_nodes(vec![(0..concurrency).filter(|&c| is_allowed(c)).collect()]),
     };
 
     let mut cfg = memory.clone();
-    if bundle_l3 && let Some(domains) = sys::l3_domains() {
+    if let Some(domains) = l3_domains {
         let domains: Vec<(usize, Vec<usize>)> = domains
             .into_iter()
             .filter_map(|cpus| {
@@ -477,11 +519,7 @@ fn system_config(respect_affinity: bool, bundle_l3: bool) -> NumaConfig {
             cfg = bundled;
         }
     }
-
-    if cfg!(all(windows, target_pointer_width = "64")) {
-        cfg = cfg.split_at_groups(WIN_GROUP_SIZE);
-    }
-    cfg
+    cfg.with_system_nodes_from(&hardware)
 }
 
 /// Pins the calling thread to the processors of `node`.
@@ -1213,4 +1251,30 @@ mod tests {
         let got = run_on_node(&cfg, 0, || 41 + 1);
         assert_eq!(got, 42);
     }
+
+    /// Two processes pinned to the two sockets of a dual-socket machine: the second
+    /// names its node 1, as the machine does, under every policy. Both used to call
+    /// theirs node 0 (the filtered nodes renumbered from 0) and share one network image.
+    #[test]
+    fn a_process_pinned_to_the_second_socket_names_it_node_one() {
+        let sockets = || Some(vec![(0..96).collect::<Vec<_>>(), (96..192).collect()]);
+        // Cache domains of 32 processors, as on the EPYC 9R14.
+        let l3 = || Some((0..6).map(|d| (d * 32..d * 32 + 32).collect()).collect::<Vec<Vec<usize>>>());
+        let second: Vec<usize> = (96..192).collect();
+        let first: Vec<usize> = (0..96).collect();
+
+        // Auto bundles cache domains; System keeps memory nodes.
+        for bundle in [true, false] {
+            let l3 = if bundle { l3() } else { None };
+            let cfg = build_config(sockets(), l3.clone(), Some(&second), 192);
+            assert!(cfg.nodes().iter().flatten().all(|&c| c >= 96), "only the allowed processors");
+            assert_eq!(cfg.system_nodes(), vec![1], "bundle {bundle}: the second socket is node 1");
+            let cfg = build_config(sockets(), l3.clone(), Some(&first), 192);
+            assert_eq!(cfg.system_nodes(), vec![0], "bundle {bundle}: the first socket is node 0");
+            // Unpinned, both nodes keep their hardware index.
+            let cfg = build_config(sockets(), l3, None, 192);
+            assert_eq!(cfg.system_nodes(), vec![0, 1]);
+        }
+    }
+
 }

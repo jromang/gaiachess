@@ -20,12 +20,36 @@
 use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut};
 use std::ptr::NonNull;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[cfg(windows)]
 pub(crate) use sys::with_large_page_privilege;
 
 /// The page size large allocations are aligned to.
 pub const HUGE_PAGE: usize = 2 * 1024 * 1024;
+
+/// Blocks alive right now that asked for large pages (at least [`HUGE_PAGE`]), by how
+/// they ended up backed.
+static LIVE: [AtomicUsize; 4] = [const { AtomicUsize::new(0) }; 4];
+
+/// One line about the blocks alive now that asked for large pages, for an `info
+/// string`: how many got them. Windows only, where each allocation either gets them
+/// or does not; Linux leaves it to the kernel behind an advice.
+pub fn summary() -> Option<String> {
+    #[cfg(windows)]
+    {
+        let got = LIVE[Backing::LargePages as usize].load(Ordering::Relaxed);
+        let total = got + LIVE[Backing::Small as usize].load(Ordering::Relaxed);
+        let why = if got == 0 && !sys::right_enabled() {
+            " (the \"Lock pages in memory\" right could not be enabled)"
+        } else {
+            ""
+        };
+        Some(format!("Large pages: {got} of {total} tables{why}"))
+    }
+    #[cfg(not(windows))]
+    None
+}
 
 /// One gibibyte, the size of an explicit huge page.
 pub const GIGA_PAGE: usize = 1024 * 1024 * 1024;
@@ -77,6 +101,9 @@ impl LargeMem {
         let len = len.max(1);
         let (ptr, mapped, backing) = sys::alloc(len, giga_hint);
         debug_assert!(mapped >= len, "LargeMem: mapped {mapped} < requested {len}");
+        if len >= HUGE_PAGE {
+            LIVE[backing as usize].fetch_add(1, Ordering::Relaxed);
+        }
         LargeMem {
             ptr,
             len,
@@ -105,6 +132,10 @@ impl LargeMem {
 
 impl Drop for LargeMem {
     fn drop(&mut self) {
+        if self.len >= HUGE_PAGE {
+            let before = LIVE[self.backing as usize].fetch_sub(1, Ordering::Relaxed);
+            debug_assert!(before > 0, "LargeMem: a block released twice");
+        }
         // SAFETY: the block came from `sys::alloc` with exactly these figures.
         unsafe { sys::free(self.ptr, self.mapped, self.backing) };
     }
@@ -258,6 +289,8 @@ mod sys {
     use super::{Backing, round_up};
     use std::ffi::c_void;
     use std::ptr::NonNull;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     type Handle = *mut c_void;
 
@@ -310,10 +343,24 @@ mod sys {
         ) -> i32;
     }
 
+    /// Whether the "Lock pages in memory" right was ever enabled, for [`super::summary`].
+    static RIGHT_ENABLED: AtomicBool = AtomicBool::new(false);
+
+    pub fn right_enabled() -> bool {
+        RIGHT_ENABLED.load(Ordering::Relaxed)
+    }
+
     /// Runs `f` with the "Lock pages in memory" right enabled on the process token, as
     /// large pages require, handing it the large page size; the previous state is
     /// restored after. `None` when the right is not held or large pages do not exist.
+    ///
+    /// One call at a time: the token belongs to the whole process, and the pool builds
+    /// its threads' tables side by side. Two overlapping calls would have the first
+    /// restore — hence disable — the right while the second is still allocating, and
+    /// the second fall back to ordinary pages without a word. `f` must not call back.
     pub fn with_large_page_privilege<R>(f: impl FnOnce(usize) -> Option<R>) -> Option<R> {
+        static TOKEN: Mutex<()> = Mutex::new(());
+        let _held = TOKEN.lock().unwrap_or_else(|e| e.into_inner());
         // SAFETY: plain Win32 calls on locals; every handle opened is closed.
         unsafe {
             let page = GetLargePageMinimum();
@@ -355,6 +402,7 @@ mod sys {
                 ) != 0
                     && GetLastError() == ERROR_SUCCESS
                 {
+                    RIGHT_ENABLED.store(true, Ordering::Relaxed);
                     result = f(page);
                     AdjustTokenPrivileges(
                         token,
@@ -486,6 +534,15 @@ mod tests {
         let mem = LargeMem::zeroed(5 * 1024 * 1024, false);
         assert_eq!(mem.as_ptr() as usize % HUGE_PAGE, 0);
         assert_eq!(mem.backing(), Backing::HugeAdvised);
+    }
+
+    /// A block that asks for large pages is counted under its backing while it lives.
+    /// Other tests allocate at the same time, so only a lower bound holds.
+    #[test]
+    fn large_blocks_are_counted_while_alive() {
+        let mem = LargeMem::zeroed(3 * HUGE_PAGE, false);
+        assert!(LIVE[mem.backing() as usize].load(Ordering::Relaxed) >= 1);
+        assert_eq!(summary().is_some(), cfg!(windows));
     }
 
     #[test]

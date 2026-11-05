@@ -41,6 +41,49 @@ pub(crate) const POSITIONS: [&str; 27] = [
     "8/k7/rnn5/8/8/8/5RBB/K7 w - - 0 1",
 ];
 
+/// Evaluation throughput, apart from any search: for every position of `epd`, each
+/// legal move played from the position's accumulator and evaluated (the work a search
+/// does at its leaves, the incremental update and the forward pass), `rounds` passes
+/// over the file. The checksum of the evaluations ties a figure to the network that
+/// produced it.
+pub fn run_eval(epd: &std::path::Path, rounds: usize) {
+    let text = std::fs::read_to_string(epd).unwrap_or_else(|e| panic!("{}: {e}", epd.display()));
+    let positions: Vec<Position> = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .filter_map(|l| Position::from_fen(l).ok())
+        .collect();
+    let mut net = crate::nnue::Network::new();
+    let mut moves = crate::types::ArrayBuf::<crate::types::Move, { crate::types::MAX_MOVES }>::new();
+    let (mut evals, mut checksum) = (0u64, 0i64);
+    let start = Instant::now();
+    for _ in 0..rounds {
+        for base in &positions {
+            let mut pos = base.clone();
+            net.refresh(&pos);
+            let n = crate::movegen::generate_legal_moves(&pos, &mut moves);
+            for i in 0..n {
+                let m = moves[i];
+                net.push(m, &pos);
+                pos.make_move(m);
+                if pos.checkers == 0 {
+                    checksum += net.evaluate(&pos) as i64;
+                    evals += 1;
+                }
+                pos.unmake_move(m);
+                net.pop();
+            }
+        }
+    }
+    let secs = start.elapsed().as_secs_f64();
+    println!(
+        "{evals} evals in {secs:.2}s: {:.0} evals/s, {} positions (checksum {checksum})",
+        evals as f64 / secs,
+        positions.len()
+    );
+}
+
 /// Default bench depth.
 const BENCH_DEPTH: i32 = 16;
 
@@ -82,6 +125,11 @@ pub fn run(depth_override: Option<i32>, threads: Option<usize>) {
         let limits = SearchLimits::depth(depth);
 
         STOP.store(false, Ordering::Relaxed);
+
+        // Every `go` of a game ages the table; the bench does the same, so the age
+        // term of the replacement policy is at work here too (the threaded path ages
+        // through `start_search_armed`).
+        shared.tt.new_search();
 
         // Prepare search — override tm since prepare_search gives infinite
         // limits to id!=0 (same pattern as datagen.rs:prepare_datagen_search)
@@ -246,6 +294,8 @@ pub fn run_stats(depth_override: Option<i32>, num_runs: u32, verbose: bool) {
 
             STOP.store(false, Ordering::Relaxed);
 
+            // Aged per position, as a game ages it per `go` (see `run`).
+            shared.tt.new_search();
             td.prepare_search(&pos, &limits);
             let game_ply = td.pos.game_ply();
             td.tm =

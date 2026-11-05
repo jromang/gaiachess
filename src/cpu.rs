@@ -10,7 +10,7 @@
 //!
 //! Environment overrides, for per-tier verification, per-tier PGO profiling
 //! and user support:
-//! - `GAIA_SIMD=scalar|avx2|avx512|vnni512` caps the tier. It never raises it
+//! - `GAIA_SIMD=scalar|avx2|avxvnni|avx512|vnni512` caps the tier. It never raises it
 //!   above what the CPU supports — forcing upward would be an
 //!   illegal-instruction crash, so an impossible request is clamped down.
 //! - `GAIA_THREATS=bitboards|avx2|vbmi2` caps the move-threat path alone, the
@@ -24,14 +24,15 @@
 
 use std::sync::OnceLock;
 
+use crate::movegen;
 use crate::nnue::L1_SIZE;
-use crate::nnue::accumulator::{AccDelta, Accumulator};
-use crate::nnue::forward::{self, NNZ_SIZE};
-use crate::nnue::kernels::{self, k_avx2, k_avx512, k_scalar, k_vnni512, threat512};
+use crate::nnue::accumulator::AccDelta;
+use crate::nnue::forward;
+use crate::nnue::kernels::{self, k_avx2, k_avx512, k_avxvnni, k_scalar, k_vnni512, threat512};
 use crate::nnue::move_threats::{self, MoveThreats};
 use crate::nnue::network::{Aligned, NNUEParams, PermKind};
 use crate::position::Position;
-use crate::types::Color;
+use crate::types::{ArrayBuf, Color, MAX_MOVES, ScoredMove};
 
 // ============================================================
 // Tiers and axes
@@ -42,6 +43,10 @@ use crate::types::Color;
 pub enum SimdTier {
     Scalar,
     Avx2,
+    /// AVX2 with the VEX `vpdpbusd` of AVX-VNNI: Intel cores since the 12th
+    /// generation, which have no AVX-512. Same register width and weight layout
+    /// as AVX2.
+    AvxVnni,
     Avx512,
     Vnni512,
 }
@@ -51,6 +56,7 @@ impl SimdTier {
         match self {
             SimdTier::Scalar => "scalar",
             SimdTier::Avx2 => "avx2",
+            SimdTier::AvxVnni => "avxvnni",
             SimdTier::Avx512 => "avx512",
             SimdTier::Vnni512 => "vnni512",
         }
@@ -59,7 +65,9 @@ impl SimdTier {
 
 /// `find_nnz` algorithm — an axis independent from the tier: Cascade Lake has
 /// VNNI without VBMI2, so the compress form cannot be implied by `Vnni512`.
-/// All three produce identical indices; only the speed differs.
+/// All three produce the same indices; only the speed differs. The compress form
+/// runs inside the activation (`forward_dense_vbmi2`), in lane order rather than
+/// sorted, which the sparse L1 does not mind.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum NnzKind {
     Generic,
@@ -119,6 +127,24 @@ impl MoveThreatsKind {
     }
 }
 
+/// How the quiet generator writes its moves — the last axis: writing a whole target
+/// set at once needs VBMI2 byte compression, which Skylake-X and Cascade Lake lack.
+/// Both write the same moves in the same order; only the speed differs.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MoveListKind {
+    Serial,
+    Compress,
+}
+
+impl MoveListKind {
+    pub fn name(self) -> &'static str {
+        match self {
+            MoveListKind::Serial => "one by one",
+            MoveListKind::Compress => "vpcompressb",
+        }
+    }
+}
+
 // ============================================================
 // The dispatch table
 // ============================================================
@@ -126,18 +152,16 @@ impl MoveThreatsKind {
 /// Function pointers into the resolved kernel instance, plus the metadata the
 /// loader (`perm`) and the `info` report need.
 pub struct CpuDispatch {
-    pub forward_dense:
-        unsafe fn(&NNUEParams, &Accumulator, &Aligned<[[i16; L1_SIZE]; 2]>, Color, usize) -> f32,
-    pub find_nnz: unsafe fn(&Aligned<[u8; L1_SIZE]>) -> ([u16; NNZ_SIZE], usize),
-    pub acc_add1_sub1: unsafe fn(&NNUEParams, *const i16, *mut i16, usize, usize),
-    pub acc_add1_sub2: unsafe fn(&NNUEParams, *const i16, *mut i16, usize, usize, usize),
-    pub acc_add2_sub2: unsafe fn(&NNUEParams, *const i16, *mut i16, usize, usize, usize, usize),
-    pub finny_apply: unsafe fn(&NNUEParams, *mut i16, &[usize], &[usize]),
-    pub threat_batch: unsafe fn(*const i16, *mut i16, *const [i8; L1_SIZE], &[u32], &[u32]),
+    pub forward_dense: unsafe fn(&NNUEParams, &Aligned<[[i16; L1_SIZE]; 2]>, Color, usize) -> i32,
+    pub find_nnz: unsafe fn(&Aligned<[u8; L1_SIZE]>, *mut u16) -> usize,
+    pub threat_batch: unsafe fn(*const i16, *mut i16, *const crate::nnue::network::ThreatRow, &[u32], &[u32]),
+    pub combined_batch: crate::nnue::kernels::CombinedBatchFn,
     pub(crate) move_threats: unsafe fn(&Position, &AccDelta, &mut MoveThreats),
+    pub(crate) generate_quiets: unsafe fn(&Position, &mut ArrayBuf<ScoredMove, MAX_MOVES>) -> usize,
     pub tier: SimdTier,
     pub nnz: NnzKind,
     pub threats: MoveThreatsKind,
+    pub movelist: MoveListKind,
     pub perm: PermKind,
     pub attacks: AttackKind,
     /// AVX-512 Kogge-Stone setwise slider fill available.
@@ -221,6 +245,20 @@ pub fn effective_attacks() -> AttackKind {
     }
 }
 
+/// The quiet-move writer actually running: a build that pins VBMI2 calls the
+/// compression writer directly, past the table.
+pub fn effective_movelist() -> MoveListKind {
+    if cfg!(all(
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "avx512vbmi2"
+    )) {
+        MoveListKind::Compress
+    } else {
+        get_or_init().movelist
+    }
+}
+
 /// Whether the AVX-512 setwise slider fill actually runs.
 pub fn effective_setwise512() -> bool {
     if cfg!(gaia_dist) {
@@ -240,6 +278,7 @@ pub fn effective_setwise512() -> bool {
 pub struct Caps {
     pub avx2: bool,
     pub fma: bool,
+    pub avxvnni: bool,
     pub avx512f: bool,
     pub avx512bw: bool,
     pub avx512vl: bool,
@@ -258,6 +297,7 @@ fn detect() -> Caps {
     Caps {
         avx2: std::arch::is_x86_feature_detected!("avx2"),
         fma: std::arch::is_x86_feature_detected!("fma"),
+        avxvnni: std::arch::is_x86_feature_detected!("avxvnni"),
         avx512f: std::arch::is_x86_feature_detected!("avx512f"),
         avx512bw: std::arch::is_x86_feature_detected!("avx512bw"),
         avx512vl: std::arch::is_x86_feature_detected!("avx512vl"),
@@ -298,10 +338,11 @@ fn read_simd_cap() -> Option<SimdTier> {
     match v.to_ascii_lowercase().as_str() {
         "scalar" => Some(SimdTier::Scalar),
         "avx2" => Some(SimdTier::Avx2),
+        "avxvnni" => Some(SimdTier::AvxVnni),
         "avx512" => Some(SimdTier::Avx512),
         "vnni512" => Some(SimdTier::Vnni512),
         other => {
-            eprintln!("info string GAIA_SIMD '{other}' ignored (scalar|avx2|avx512|vnni512)");
+            eprintln!("info string GAIA_SIMD '{other}' ignored (scalar|avx2|avxvnni|avx512|vnni512)");
             None
         }
     }
@@ -342,6 +383,7 @@ struct Selection {
     tier: SimdTier,
     nnz: NnzKind,
     threats: MoveThreatsKind,
+    movelist: MoveListKind,
     perm: PermKind,
     attacks: AttackKind,
     setwise512: bool,
@@ -366,6 +408,8 @@ fn choose(
         SimdTier::Vnni512
     } else if b512_ok {
         SimdTier::Avx512
+    } else if avx2_ok && caps.avxvnni {
+        SimdTier::AvxVnni
     } else if avx2_ok {
         SimdTier::Avx2
     } else {
@@ -381,6 +425,11 @@ fn choose(
                 forced = Some(c);
             }
         }
+    }
+    // AVX-VNNI is the one tier the 512-bit ones do not imply (Skylake-X, Ice Lake and
+    // Zen 4 lack it): a cap that lands on it runs AVX2 there instead of faulting.
+    if tier == SimdTier::AvxVnni && !caps.avxvnni {
+        tier = SimdTier::Avx2;
     }
 
     let nnz = if tier >= SimdTier::Avx512 && caps.avx512vbmi2 {
@@ -399,9 +448,15 @@ fn choose(
         MoveThreatsKind::Bitboards
     };
 
+    let movelist = if tier >= SimdTier::Avx512 && caps.avx512vbmi2 {
+        MoveListKind::Compress
+    } else {
+        MoveListKind::Serial
+    };
+
     let perm = match tier {
         SimdTier::Vnni512 | SimdTier::Avx512 => PermKind::File512,
-        SimdTier::Avx2 => PermKind::Avx2,
+        SimdTier::AvxVnni | SimdTier::Avx2 => PermKind::Avx2,
         SimdTier::Scalar => PermKind::Linear,
     };
 
@@ -431,6 +486,7 @@ fn choose(
         tier,
         nnz,
         threats,
+        movelist,
         perm,
         attacks,
         setwise512: caps.avx512f,
@@ -455,6 +511,7 @@ fn resolve() -> CpuDispatch {
         tier,
         nnz,
         threats,
+        movelist,
         perm,
         attacks,
         setwise512,
@@ -471,7 +528,7 @@ fn resolve() -> CpuDispatch {
     let find_nnz = match nnz {
         NnzKind::Compress512 => {
             forward::find_nnz_compress512
-                as unsafe fn(&Aligned<[u8; L1_SIZE]>) -> ([u16; NNZ_SIZE], usize)
+                as unsafe fn(&Aligned<[u8; L1_SIZE]>, *mut u16) -> usize
         }
         NnzKind::Avx2Table => forward::find_nnz_avx2,
         NnzKind::Generic => k_scalar::find_nnz_generic,
@@ -490,20 +547,30 @@ fn resolve() -> CpuDispatch {
         MoveThreatsKind::Avx2View => move_threats::x86::record_avx2,
         MoveThreatsKind::Bitboards => move_threats::record_scalar,
     };
+    let generate_quiets = match movelist {
+        MoveListKind::Compress => {
+            movegen::x86::quiets_compress
+                as unsafe fn(&Position, &mut ArrayBuf<ScoredMove, MAX_MOVES>) -> usize
+        }
+        MoveListKind::Serial => movegen::quiets_serial,
+    };
 
     match tier {
         SimdTier::Vnni512 => CpuDispatch {
-            forward_dense: k_vnni512::forward_dense,
+            forward_dense: if nnz == NnzKind::Compress512 {
+                k_vnni512::forward_dense_vbmi2
+            } else {
+                k_vnni512::forward_dense
+            },
             find_nnz,
-            acc_add1_sub1: k_vnni512::acc_add1_sub1,
-            acc_add1_sub2: k_vnni512::acc_add1_sub2,
-            acc_add2_sub2: k_vnni512::acc_add2_sub2,
-            finny_apply: k_vnni512::finny_apply,
             threat_batch: threat512::threat_batch,
+            combined_batch: threat512::combined_batch,
             move_threats,
+            generate_quiets,
             tier,
             nnz,
             threats,
+            movelist,
             perm,
             attacks,
             setwise512,
@@ -512,17 +579,38 @@ fn resolve() -> CpuDispatch {
             threats_forced,
         },
         SimdTier::Avx512 => CpuDispatch {
-            forward_dense: k_avx512::forward_dense,
+            forward_dense: if nnz == NnzKind::Compress512 {
+                k_avx512::forward_dense_vbmi2
+            } else {
+                k_avx512::forward_dense
+            },
             find_nnz,
-            acc_add1_sub1: k_avx512::acc_add1_sub1,
-            acc_add1_sub2: k_avx512::acc_add1_sub2,
-            acc_add2_sub2: k_avx512::acc_add2_sub2,
-            finny_apply: k_avx512::finny_apply,
             threat_batch: threat512::threat_batch,
+            combined_batch: threat512::combined_batch,
             move_threats,
+            generate_quiets,
             tier,
             nnz,
             threats,
+            movelist,
+            perm,
+            attacks,
+            setwise512,
+            forced,
+            pext_forced,
+            threats_forced,
+        },
+        SimdTier::AvxVnni => CpuDispatch {
+            forward_dense: k_avxvnni::forward_dense,
+            find_nnz,
+            threat_batch: k_avxvnni::threat_batch,
+            combined_batch: k_avxvnni::combined_batch,
+            move_threats,
+            generate_quiets,
+            tier,
+            nnz,
+            threats,
+            movelist,
             perm,
             attacks,
             setwise512,
@@ -533,15 +621,14 @@ fn resolve() -> CpuDispatch {
         SimdTier::Avx2 => CpuDispatch {
             forward_dense: k_avx2::forward_dense,
             find_nnz,
-            acc_add1_sub1: k_avx2::acc_add1_sub1,
-            acc_add1_sub2: k_avx2::acc_add1_sub2,
-            acc_add2_sub2: k_avx2::acc_add2_sub2,
-            finny_apply: k_avx2::finny_apply,
             threat_batch: k_avx2::threat_batch,
+            combined_batch: k_avx2::combined_batch,
             move_threats,
+            generate_quiets,
             tier,
             nnz,
             threats,
+            movelist,
             perm,
             attacks,
             setwise512,
@@ -552,15 +639,14 @@ fn resolve() -> CpuDispatch {
         SimdTier::Scalar => CpuDispatch {
             forward_dense: k_scalar::forward_dense,
             find_nnz,
-            acc_add1_sub1: k_scalar::acc_add1_sub1,
-            acc_add1_sub2: k_scalar::acc_add1_sub2,
-            acc_add2_sub2: k_scalar::acc_add2_sub2,
-            finny_apply: k_scalar::finny_apply,
             threat_batch: k_scalar::threat_batch,
+            combined_batch: k_scalar::combined_batch,
             move_threats,
+            generate_quiets,
             tier,
             nnz,
             threats,
+            movelist,
             perm,
             attacks,
             setwise512,
@@ -583,6 +669,7 @@ mod tests {
         Caps {
             avx2,
             fma,
+            avxvnni: false,
             avx512f: f,
             avx512bw: bw,
             avx512vl: vl,
@@ -607,6 +694,7 @@ mod tests {
         assert_eq!(s.tier, SimdTier::Vnni512);
         assert_eq!(s.nnz, NnzKind::Compress512);
         assert_eq!(s.threats, MoveThreatsKind::Vbmi2View);
+        assert_eq!(s.movelist, MoveListKind::Compress);
         assert_eq!(s.perm, PermKind::File512);
         // AMD default: AVX2 attacks measured faster than PEXT in the
         // dispatched binary (Zen 5, +1.2%).
@@ -638,6 +726,8 @@ mod tests {
         assert_eq!(s.nnz, NnzKind::Avx2Table);
         // No byte permutation either: the move threats take the AVX2 view.
         assert_eq!(s.threats, MoveThreatsKind::Avx2View);
+        // Nor byte compression: the quiet moves are written one by one.
+        assert_eq!(s.movelist, MoveListKind::Serial);
     }
 
     #[test]
@@ -655,12 +745,53 @@ mod tests {
     }
 
     #[test]
+    fn the_compressed_move_lists_follow_a_lowered_tier() {
+        let all = caps(true, true, true, true, true, true, true);
+        assert_eq!(pick(all, Some(SimdTier::Avx512)).movelist, MoveListKind::Compress);
+        assert_eq!(pick(all, Some(SimdTier::Avx2)).movelist, MoveListKind::Serial);
+    }
+
+    #[test]
     fn skylake_x_stops_at_plain_avx512() {
         let s = pick(caps(true, true, true, true, true, false, false), None);
         assert_eq!(s.tier, SimdTier::Avx512);
         assert_eq!(s.nnz, NnzKind::Avx2Table);
         assert_eq!(s.perm, PermKind::File512);
         assert!(s.setwise512);
+    }
+
+    #[test]
+    fn alder_lake_takes_the_avx_vnni_tier_with_the_avx2_layout() {
+        // AVX2 and AVX-VNNI, no AVX-512: every Intel core since the 12th generation.
+        let mut c = caps(true, true, false, false, false, false, false);
+        c.avxvnni = true;
+        let s = pick(c, None);
+        assert_eq!(s.tier, SimdTier::AvxVnni);
+        assert_eq!(s.perm, PermKind::Avx2);
+        assert_eq!(s.nnz, NnzKind::Avx2Table);
+        assert_eq!(s.threats, MoveThreatsKind::Avx2View);
+        assert_eq!(s.movelist, MoveListKind::Serial);
+        // The cap can still take it back to plain AVX2.
+        assert_eq!(pick(c, Some(SimdTier::Avx2)).tier, SimdTier::Avx2);
+    }
+
+    #[test]
+    fn the_512_bit_tiers_outrank_avx_vnni() {
+        // Zen 5 and Sapphire Rapids have both.
+        let mut c = caps(true, true, true, true, true, true, true);
+        c.avxvnni = true;
+        assert_eq!(pick(c, None).tier, SimdTier::Vnni512);
+        assert_eq!(pick(c, Some(SimdTier::AvxVnni)).tier, SimdTier::AvxVnni);
+    }
+
+    #[test]
+    fn an_avx_vnni_cap_on_a_cpu_without_it_runs_avx2() {
+        // Zen 4: AVX-512 VNNI, no AVX-VNNI. Capping to avxvnni must not pick
+        // kernels this CPU cannot execute.
+        let c = caps(true, true, true, true, true, true, true);
+        let s = pick(c, Some(SimdTier::AvxVnni));
+        assert_eq!(s.tier, SimdTier::Avx2);
+        assert_eq!(s.perm, PermKind::Avx2);
     }
 
     #[test]
@@ -768,7 +899,7 @@ mod tests {
         // Whatever the host, the invariant that matters: permutation follows tier.
         let expected_perm = match d.tier {
             SimdTier::Vnni512 | SimdTier::Avx512 => PermKind::File512,
-            SimdTier::Avx2 => PermKind::Avx2,
+            SimdTier::AvxVnni | SimdTier::Avx2 => PermKind::Avx2,
             SimdTier::Scalar => PermKind::Linear,
         };
         assert_eq!(d.perm, expected_perm);

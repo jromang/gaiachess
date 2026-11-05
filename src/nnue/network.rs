@@ -1,24 +1,28 @@
 //! Network parameters struct and loading.
 //!
-//! `NNUEParams` binary layout: 87,311,392 bytes.
+//! Network file (GaiaNet-T7): the fields of `NNUEParams` end to end, byte for byte,
+//! `NNUE_FILE_SIZE` bytes, then the 16-byte integrity footer.
 //!
 //! Loading:
 //! - Compile-time: `include_bytes!` → zstd-compressed in binary
 //! - Runtime: `load_from_file()` via UCI `setoption name EvalFile value <path>`
 //!
-//! L1 weights are already in NNZ-permuted dpbusd layout — no transform needed.
+//! The dense layers' weights are already in the dpbusd layout — no transform needed.
 //!
-//! The FT weights/biases, however, carry the *packus* permutation written by the
-//! trainer, and that permutation is tier-dependent: `activate_ft` writes the result
-//! of `packus` straight to memory without a fixup `permute`, so the weights must be
+//! The FT biases, however, carry the *packus* permutation written by the trainer,
+//! and that permutation is tier-dependent: `activate_ft` writes the result of
+//! `packus` straight to memory without a fixup `permute`, so the accumulator must be
 //! pre-ordered to cancel the lane interleaving of that tier's `packus`. The trainer
 //! bakes the AVX-512 pattern; `repermute_ft` converts it to whatever the tier
-//! resolved for this machine needs. Skipped entirely on the AVX-512 tiers.
+//! resolved for this machine needs. The i8 rows (piece squares, pawn pairs, threats)
+//! are widened by an `unpack` that interleaves as `packus` does, so they are held in
+//! logical order on every tier.
 
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
+use std::cell::OnceCell;
 use std::sync::{Mutex, OnceLock};
 
-use super::{FT_SIZE, L1_SIZE, L2_SIZE, L3_SIZE, OUTPUT_BUCKETS, THREAT_INPUT_SIZE};
+use super::{A1_SIZE, GATED, L1_OUT, L1_SIZE, L2_OUT, PSQ_SIZE, STACKS, THREAT_INPUT_SIZE};
 
 // ============================================================
 // Aligned wrapper for SIMD-friendly memory
@@ -48,81 +52,119 @@ impl<T> std::ops::DerefMut for Aligned<T> {
 // Network parameters
 // ============================================================
 
-/// Complete NNUE network parameters.
+/// One feature-transformer row as the engine holds it: the `L1_SIZE` i8 weights the
+/// accumulator kernels stream, aligned on a cache line.
+#[repr(C, align(64))]
+pub struct FtRow<T> {
+    pub w: [T; L1_SIZE],
+}
+
+impl<T> FtRow<T> {
+    /// The row's weights, for the kernels.
+    #[inline(always)]
+    pub fn as_ptr(&self) -> *const T {
+        self.w.as_ptr()
+    }
+}
+
+#[cfg(test)]
+impl<T> FtRow<T> {
+    pub fn new(w: [T; L1_SIZE]) -> Self {
+        FtRow { w }
+    }
+}
+
+/// A piece-square, pawn-pair or threat row: i8 weights (unit 256).
+pub type ThreatRow = FtRow<i8>;
+
+const _: () = assert!(size_of::<ThreatRow>() == L1_SIZE);
+
+/// Complete NNUE network parameters, as the engine reads them.
 ///
-/// Binary layout: all arrays are 64-byte aligned.
-/// All arrays are 64-byte aligned; all field sizes are multiples of 64 bytes
-/// (except l3_biases which is 32 bytes, padded to 64 by Aligned).
-/// Direct memcpy from the `.bin` file — no post-load transforms needed.
+/// All arrays are 64-byte aligned and all field sizes are multiples of 64 bytes, so
+/// the struct is the file's payload byte for byte.
 ///
-/// Architecture: PST (i16) + pawn pairs + threats (i8) → FT 1024 →
-///   L1 (1024→16, dpbusd) → CReLU+squared → f32[32] →
-///   L2 (32→32, FMA) → squared → f32[32] →
-///   L3 (concat(L2[32], L1[32]) → 1) × 8 buckets → centipawns
+/// Architecture: K32Q2 piece squares + pawn pairs + threats (i8) → FT 1024 →
+///   L1 (1024→32, dpbusd) → [x², x] → u8[64] →
+///   L2 (64→64, dpbusd) → h = g² · v, i32[32] →
+///   L3 (u8[64] and h[32] → 1) + skip, × 32 stacks → centipawns
 #[repr(C, align(64))]
 pub struct NNUEParams {
-    /// PST feature transformer weights: `[pst_feature][neuron]`.
-    /// i16 quantized (QA=255). FT_SIZE = 12×768 = 9,216 features.
-    pub ft_pst_weights: Aligned<[[i16; L1_SIZE]; FT_SIZE]>,
+    /// Piece-square feature transformer rows: `[psq_feature]`, each `L1_SIZE` i8
+    /// weights. PSQ_SIZE = 64 blocks × 704 = 45,056 features.
+    pub ft_psq_weights: Aligned<[ThreatRow; PSQ_SIZE]>,
 
-    /// Full threat feature transformer weights: `[threat_feature][neuron]`.
-    /// i8 quantized (×255). Pawn pairs (4,560) then pairwise threats (59,808).
-    pub ft_threat_weights: Aligned<[[i8; L1_SIZE]; THREAT_INPUT_SIZE]>,
+    /// Threat feature transformer rows: `[threat_feature]`, each `L1_SIZE` i8
+    /// weights. Pawn pairs (4,560) then pairwise threats (59,808).
+    pub ft_threat_weights: Aligned<[ThreatRow; THREAT_INPUT_SIZE]>,
 
     /// Feature transformer biases: initial accumulator values.
     pub ft_biases: Aligned<[i16; L1_SIZE]>,
 
-    /// PSQT head weights for PST features: `[pst_feature][bucket]`.
-    /// i32 quantized (×PSQT_QUANT). One scalar per feature per output bucket;
-    /// accumulated per perspective, `stm − ntm` added to the network output.
-    pub psqt_pst_weights: Aligned<[[i32; OUTPUT_BUCKETS]; FT_SIZE]>,
+    /// L1 sparse layer weights: `[stack][input_group_of_4][output*4+byte]`, the
+    /// dpbusd layout (×128). Input: L1_SIZE u8 (FT activation output), output:
+    /// L1_OUT i32.
+    pub l1_weights: Aligned<[[[i8; L1_OUT * 4]; L1_SIZE / 4]; STACKS]>,
 
-    /// PSQT head weights for aux features (pawn pairs then threats):
-    /// `[feature][bucket]`, i32 quantized (×PSQT_QUANT).
-    pub psqt_threat_weights: Aligned<[[i32; OUTPUT_BUCKETS]; THREAT_INPUT_SIZE]>,
+    /// L1 biases per stack: `[stack][neuron]`, unit 2^14.
+    pub l1_biases: Aligned<[[i32; L1_OUT]; STACKS]>,
 
-    /// L1 sparse layer weights: `[bucket][input_group_of_4][output*4+byte]`.
-    /// Already in NNZ-permuted dpbusd layout (no post-load transform needed).
-    /// Input: L1_SIZE u8 (FT activation output), Output: L2_SIZE (16) i32.
-    pub l1_weights: Aligned<[[[i8; L2_SIZE * 4]; L1_SIZE / 4]; OUTPUT_BUCKETS]>,
+    /// L2 dense layer weights: `[stack][input_group_of_4][output*4+byte]` (×64).
+    /// Input: the A1_SIZE u8 L1 activations, output: L2_OUT i32 (gates, then values).
+    pub l2_weights: Aligned<[[[i8; L2_OUT * 4]; A1_SIZE / 4]; STACKS]>,
 
-    /// L1 biases per output bucket: `[bucket][neuron]`.
-    pub l1_biases: Aligned<[[f32; L2_SIZE]; OUTPUT_BUCKETS]>,
+    /// L2 biases per stack: `[stack][neuron]`, unit 2^13.
+    pub l2_biases: Aligned<[[i32; L2_OUT]; STACKS]>,
 
-    /// L2 dense layer weights: `[bucket][input][output]`.
-    /// 2*L2_SIZE (32) inputs, L3_SIZE (32) outputs.
-    /// Note: Rust type dimensions match only because 2*L2_SIZE == L3_SIZE == 32.
-    pub l2_weights: Aligned<[[[f32; L3_SIZE]; 2 * L2_SIZE]; OUTPUT_BUCKETS]>,
+    /// L3 weights on the L1 activations: `[stack][input]` (×128).
+    pub l3_weights_a: Aligned<[[i8; A1_SIZE]; STACKS]>,
 
-    /// L2 biases per output bucket: `[bucket][neuron]`.
-    pub l2_biases: Aligned<[[f32; L3_SIZE]; OUTPUT_BUCKETS]>,
+    /// L3 weights on the gated L2 outputs: `[stack][input]` (×128), held in i32 for
+    /// the products with the signed gated values.
+    pub l3_weights_h: Aligned<[[i32; GATED]; STACKS]>,
 
-    /// L3 output layer weights: `[bucket][input]`.
-    /// L3_SIZE (32) from L2 + 2*L2_SIZE (32) skip from L1 = 64 inputs.
-    pub l3_weights: Aligned<[[f32; L3_SIZE + 2 * L2_SIZE]; OUTPUT_BUCKETS]>,
+    /// L3 biases per stack, unit 2^14.
+    pub l3_biases: Aligned<[i32; STACKS]>,
 
-    /// L3 biases per output bucket.
-    /// Note: 32 bytes of data, padded to 64 by Aligned. Binary ends at +32 bytes.
-    pub l3_biases: Aligned<[f32; OUTPUT_BUCKETS]>,
+    /// Network metadata: `[0]` the output scale (centipawns per unit), the rest zero.
+    pub meta: Aligned<[i32; 16]>,
 }
 
-/// Exact byte count of the network binary.
-pub const NNUE_FILE_SIZE: usize = FT_SIZE * L1_SIZE * 2                              // ft_pst_weights: i16
+/// Exact byte count of the network payload.
+pub const NNUE_FILE_SIZE: usize = PSQ_SIZE * L1_SIZE                  // ft_psq_weights: i8
     + THREAT_INPUT_SIZE * L1_SIZE                      // ft_threat_weights: i8
     + L1_SIZE * 2                                      // ft_biases: i16
-    + FT_SIZE * OUTPUT_BUCKETS * 4                     // psqt_pst_weights: i32
-    + THREAT_INPUT_SIZE * OUTPUT_BUCKETS * 4           // psqt_threat_weights: i32
-    + OUTPUT_BUCKETS * (L1_SIZE / 4) * (L2_SIZE * 4)  // l1_weights: i8
-    + OUTPUT_BUCKETS * L2_SIZE * 4                     // l1_biases: f32
-    + OUTPUT_BUCKETS * L3_SIZE * (2 * L2_SIZE) * 4    // l2_weights: f32
-    + OUTPUT_BUCKETS * L3_SIZE * 4                     // l2_biases: f32
-    + OUTPUT_BUCKETS * (L3_SIZE + 2 * L2_SIZE) * 4    // l3_weights: f32
-    + OUTPUT_BUCKETS * 4; // l3_biases: f32
+    + STACKS * (L1_SIZE / 4) * (L1_OUT * 4)            // l1_weights: i8
+    + STACKS * L1_OUT * 4                              // l1_biases: i32
+    + STACKS * (A1_SIZE / 4) * (L2_OUT * 4)            // l2_weights: i8
+    + STACKS * L2_OUT * 4                              // l2_biases: i32
+    + STACKS * A1_SIZE                                 // l3_weights_a: i8
+    + STACKS * GATED * 4                               // l3_weights_h: i32
+    + STACKS * 4                                       // l3_biases: i32
+    + 16 * 4; // meta: i32
 
 const _: () = assert!(
-    NNUE_FILE_SIZE == 87_311_392,
-    "NNUE_FILE_SIZE must be 87,311,392"
+    NNUE_FILE_SIZE == 113_250_496,
+    "NNUE_FILE_SIZE must be 113,250,496"
 );
+// The file is the struct, byte for byte.
+const _: () = assert!(NNUE_FILE_SIZE == size_of::<NNUEParams>());
+
+/// Where each field starts in the network file: the struct's own offsets, the file
+/// being the struct byte for byte.
+pub(crate) mod file {
+    use super::NNUEParams;
+    use std::mem::offset_of;
+
+    pub const PSQ: usize = offset_of!(NNUEParams, ft_psq_weights);
+    pub const THREAT: usize = offset_of!(NNUEParams, ft_threat_weights);
+    pub const BIASES: usize = offset_of!(NNUEParams, ft_biases);
+    /// The L1 weights, and everything after them.
+    pub const L1: usize = offset_of!(NNUEParams, l1_weights);
+}
+
+/// Bounds of a believable output scale (centipawns per network unit).
+const SCALE_RANGE: std::ops::RangeInclusive<i32> = 1..=10_000;
 
 impl NNUEParams {
     /// Allocate a zeroed network on the heap.
@@ -130,6 +172,25 @@ impl NNUEParams {
         // SAFETY: NNUEParams is repr(C) with only integer and float arrays.
         // Zero-initialized values are valid for all field types.
         unsafe { Box::<NNUEParams>::new_zeroed().assume_init() }
+    }
+
+    /// Centipawns per network unit, as the network file declares it. A network with
+    /// no scale (all zero: no network loaded) evaluates with the default one.
+    #[inline]
+    pub fn output_scale(&self) -> i32 {
+        let scale = self.meta.0[0];
+        if scale == 0 { super::NETWORK_SCALE } else { scale }
+    }
+}
+
+/// The output scale of a network file's payload, refused if it cannot be one.
+pub(crate) fn file_scale(data: &[u8]) -> Result<i32, String> {
+    let at = NNUE_FILE_SIZE - 16 * 4;
+    let scale = i32::from_le_bytes(data[at..at + 4].try_into().unwrap());
+    if SCALE_RANGE.contains(&scale) {
+        Ok(scale)
+    } else {
+        Err(format!("output scale {scale} out of range {SCALE_RANGE:?}"))
     }
 }
 
@@ -191,8 +252,9 @@ const IMAGE_FORMAT_VERSION: u32 = 1;
 /// patch that changes how rows are permuted, without moving a field, would
 /// then have one binary reading the other's weights — wrong evaluation with
 /// nothing to see. So the name carries the result of running the real
-/// transform over a canary row: change the permutation and the name changes
-/// with it, whether or not anybody remembered to say so.
+/// transform over canary rows, one i16 bias row and one i8 weight row: change
+/// either permutation and the name changes with it, whether or not anybody
+/// remembered to say so.
 fn transform_fingerprint() -> u32 {
     static FINGERPRINT: OnceLock<u32> = OnceLock::new();
     *FINGERPRINT.get_or_init(|| {
@@ -203,10 +265,17 @@ fn transform_fingerprint() -> u32 {
         if let Some(perm) = target_perm() {
             repermute_row(&mut row, perm);
         }
-        // SAFETY: reading an i16 array as its own bytes.
-        let bytes =
-            unsafe { std::slice::from_raw_parts(row.as_ptr() as *const u8, size_of_val(&row)) };
-        super::integrity::fnv1a64(bytes) as u32
+        let mut threat_row = [0i8; L1_SIZE];
+        for (i, v) in threat_row.iter_mut().enumerate() {
+            *v = (i as i8).wrapping_mul(31).wrapping_add(5);
+        }
+        repermute_row(&mut threat_row, THREAT_PERM);
+        let bytes: Vec<u8> = row
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .chain(threat_row.iter().map(|&v| v as u8))
+            .collect();
+        super::integrity::fnv1a64(&bytes) as u32
     })
 }
 
@@ -221,7 +290,7 @@ pub(crate) const LAYOUT_HASH: u32 = {
     let mut h = 0x811c_9dc5u32;
     h = h32(h, size_of::<NNUEParams>() as u32);
     h = h32(h, align_of::<NNUEParams>() as u32);
-    h = h32(h, std::mem::offset_of!(NNUEParams, ft_pst_weights) as u32);
+    h = h32(h, std::mem::offset_of!(NNUEParams, ft_psq_weights) as u32);
     h = h32(
         h,
         std::mem::offset_of!(NNUEParams, ft_threat_weights) as u32,
@@ -231,8 +300,10 @@ pub(crate) const LAYOUT_HASH: u32 = {
     h = h32(h, std::mem::offset_of!(NNUEParams, l1_biases) as u32);
     h = h32(h, std::mem::offset_of!(NNUEParams, l2_weights) as u32);
     h = h32(h, std::mem::offset_of!(NNUEParams, l2_biases) as u32);
-    h = h32(h, std::mem::offset_of!(NNUEParams, l3_weights) as u32);
+    h = h32(h, std::mem::offset_of!(NNUEParams, l3_weights_a) as u32);
+    h = h32(h, std::mem::offset_of!(NNUEParams, l3_weights_h) as u32);
     h = h32(h, std::mem::offset_of!(NNUEParams, l3_biases) as u32);
+    h = h32(h, std::mem::offset_of!(NNUEParams, meta) as u32);
     h32(h, IMAGE_FORMAT_VERSION)
 };
 
@@ -305,10 +376,6 @@ fn repermute_row<T: Copy + Default>(row: &mut [T], target_perm: &[usize]) {
     }
 }
 
-/// Re-permute every FT array that `activate_ft` reads through `packus`,
-/// to the layout of the tier resolved for this machine.
-///
-/// No-op on the AVX-512 tiers, where the file's layout is already the right one.
 /// The permutation to apply to a row on this machine, or `None` when the
 /// file's own layout is already the right one.
 fn target_perm() -> Option<&'static [usize]> {
@@ -319,17 +386,68 @@ fn target_perm() -> Option<&'static [usize]> {
     }
 }
 
+/// The i8 rows (piece squares, pawn pairs, threats) are held in logical order on
+/// every tier.
+///
+/// The kernels widen them with `widen_i8_pair` / `widen_i8`, whose x86 forms
+/// interleave each register exactly as `packus` does, so a row in logical order
+/// lands on the accumulator's packus-ordered lanes; the other tiers do not
+/// interleave at all.
+const THREAT_PERM: &[usize] = &[0];
+
+/// Re-permute every FT array to the layout of the tier resolved for this machine:
+/// the i8 rows to [`THREAT_PERM`], the biases to the order `activate_ft`'s `packus`
+/// needs (nothing to do on the AVX-512 tiers, whose layout is the file's).
 fn repermute_ft(params: &mut NNUEParams) {
+    for row in params.ft_psq_weights.0.iter_mut() {
+        repermute_row(&mut row.w, THREAT_PERM);
+    }
+    for row in params.ft_threat_weights.0.iter_mut() {
+        repermute_row(&mut row.w, THREAT_PERM);
+    }
     let Some(target_perm) = target_perm() else {
         return;
     };
-    for row in params.ft_pst_weights.0.iter_mut() {
-        repermute_row(row, target_perm);
-    }
-    for row in params.ft_threat_weights.0.iter_mut() {
-        repermute_row(row, target_perm);
-    }
     repermute_row(&mut params.ft_biases.0, target_perm);
+}
+
+/// One row from the file's layout to logical order, in place: column `i` of the
+/// result is the neuron whose product lands on output byte `i` (left half) or
+/// pairs with it (right half).
+#[cfg(test)]
+pub(super) fn file_to_linear<T: Copy + Default>(row: &mut [T]) {
+    repermute_row(row, &[0]);
+}
+
+/// One row from logical order to the file's layout, in place — what the trainer
+/// writes: `permuted[j] = original[FILE_PERM[j]]`, in blocks of 8 over 64-groups.
+pub(super) fn linear_to_file<T: Copy + Default>(row: &mut [T]) {
+    const FILE_GROUP: usize = PERM_BLOCK * FILE_PERM.len(); // 64
+    debug_assert_eq!(row.len() % FILE_GROUP, 0);
+    let mut tmp = [T::default(); FILE_GROUP];
+    for chunk in row.chunks_exact_mut(FILE_GROUP) {
+        for (j, &p) in FILE_PERM.iter().enumerate() {
+            tmp[j * PERM_BLOCK..(j + 1) * PERM_BLOCK]
+                .copy_from_slice(&chunk[p * PERM_BLOCK..(p + 1) * PERM_BLOCK]);
+        }
+        chunk.copy_from_slice(&tmp);
+    }
+}
+
+/// For each column of an FT row as this machine holds it in memory, the logical
+/// neuron it carries — the output byte `activate_ft` writes its product to.
+///
+/// Memory is not in logical order on the tiers whose `packus` interleaves lanes:
+/// the weights are pre-ordered to cancel it, so the output comes out logical while
+/// the accumulator does not. Anything that reads the accumulator and reasons about
+/// output bytes goes through this map.
+pub(super) fn memory_to_logical() -> [u16; L1_SIZE] {
+    let mut row: [u16; L1_SIZE] = std::array::from_fn(|i| i as u16);
+    linear_to_file(&mut row);
+    if let Some(perm) = target_perm() {
+        repermute_row(&mut row, perm);
+    }
+    row
 }
 
 // ============================================================
@@ -342,20 +460,25 @@ fn repermute_ft(params: &mut NNUEParams) {
 
 /// Turn the bytes of a network file into the bytes the engine reads.
 ///
-/// One place, because two of them would be two chances for a private copy and
-/// a shared image to disagree — and a disagreement there is silently wrong
-/// evaluation, not a crash.
+/// The file goes to the image, and [`fill_image_in_place`] takes it from there: the
+/// streaming load of [`reserve`] has the host write the file into the image itself,
+/// and both paths must end in the same bytes. One conversion, because two would be
+/// two chances for a private copy, a shared image and the browser's to disagree —
+/// and a disagreement there is silently wrong evaluation, not a crash.
 fn fill_image(data: &[u8], dst: &mut [u8]) {
     debug_assert_eq!(dst.len(), size_of::<NNUEParams>());
     debug_assert!(data.len() >= NNUE_FILE_SIZE);
+    dst.copy_from_slice(&data[..NNUE_FILE_SIZE]);
+    fill_image_in_place(dst);
+}
+
+/// Turn a network file written into `dst` into the image the engine reads, in the
+/// same memory. The file is the struct byte for byte; only the FT changes order.
+fn fill_image_in_place(dst: &mut [u8]) {
+    debug_assert_eq!(dst.len(), size_of::<NNUEParams>());
     debug_assert_eq!(dst.as_ptr() as usize % align_of::<NNUEParams>(), 0);
-
-    dst[..NNUE_FILE_SIZE].copy_from_slice(&data[..NNUE_FILE_SIZE]);
-    // The file stops short of the struct: the last field is padded out.
-    dst[NNUE_FILE_SIZE..].fill(0);
-
     // SAFETY: `dst` is exactly one `NNUEParams` and correctly aligned, and
-    // every bit pattern of its integer and float arrays is valid.
+    // every bit pattern of its integer arrays is valid.
     let params = unsafe { &mut *(dst.as_mut_ptr() as *mut NNUEParams) };
     repermute_ft(params);
 }
@@ -374,6 +497,55 @@ fn build_private(data: &[u8]) -> Box<NNUEParams> {
     params
 }
 
+/// The file bytes of a structured (deterministic) random network, every weight in
+/// the range its type stores, a believable output scale: the network the tests
+/// evaluate when the build embeds none.
+#[cfg(test)]
+pub(crate) fn random_network_bytes(seed: u64) -> Vec<u8> {
+    let mut state = seed | 1;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    let mut params = NNUEParams::zeroed_box();
+    for row in params.ft_psq_weights.0.iter_mut().chain(params.ft_threat_weights.0.iter_mut()) {
+        row.w.iter_mut().for_each(|w| *w = next() as i8);
+    }
+    params.ft_biases.0.iter_mut().for_each(|b| *b = (next() % 201) as i16 - 100);
+    for s in 0..STACKS {
+        for g in params.l1_weights.0[s].iter_mut() {
+            g.iter_mut().for_each(|w| *w = next() as i8);
+        }
+        params.l1_biases.0[s].iter_mut().for_each(|b| *b = (next() % 60_001) as i32 - 30_000);
+        for g in params.l2_weights.0[s].iter_mut() {
+            g.iter_mut().for_each(|w| *w = next() as i8);
+        }
+        params.l2_biases.0[s].iter_mut().for_each(|b| *b = (next() % 20_001) as i32 - 10_000);
+        params.l3_weights_a.0[s].iter_mut().for_each(|w| *w = next() as i8);
+        params.l3_weights_h.0[s].iter_mut().for_each(|w| *w = (next() % 255) as i32 - 127);
+        params.l3_biases.0[s] = (next() % 20_001) as i32 - 10_000;
+    }
+    params.meta.0[0] = super::NETWORK_SCALE;
+    // SAFETY: the struct is plain integer arrays, its bytes are the file's payload.
+    let bytes = unsafe {
+        std::slice::from_raw_parts(params.as_ref() as *const NNUEParams as *const u8, NNUE_FILE_SIZE)
+    };
+    let mut data = bytes.to_vec();
+    data.extend_from_slice(&super::integrity::footer(&data));
+    data
+}
+
+/// A private copy of a network from the bytes of its file, installed nowhere: a test
+/// evaluates with it without swapping the network under every search the other tests
+/// of the process are running, or turning on the NNUE path halfway through one.
+#[cfg(test)]
+pub(crate) fn params_from_bytes(data: &[u8]) -> Box<NNUEParams> {
+    debug_assert!(data.len() >= NNUE_FILE_SIZE, "a network file of {} bytes", data.len());
+    build_private(data)
+}
+
 /// What the weights the engine is reading are actually backed by.
 pub use crate::shm::Backing as NetBacking;
 
@@ -384,7 +556,29 @@ pub use crate::shm::Backing as NetBacking;
 #[cfg_attr(not(all(feature = "nnue", net_embedded)), allow(dead_code))]
 enum NetSource {
     Embedded,
-    File(String),
+    /// The file as it was named, and what it looked like when it was read.
+    File {
+        path: String,
+        stamp: Option<FileStamp>,
+    },
+}
+
+/// Length and modification time of a network file: enough to tell, without reading
+/// it again, that the file named again is still the one that was read. `None` where
+/// the platform has no modification time, which makes every load a fresh one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FileStamp {
+    len: u64,
+    modified: std::time::SystemTime,
+}
+
+impl FileStamp {
+    fn of(meta: &std::fs::Metadata) -> Option<FileStamp> {
+        Some(FileStamp {
+            len: meta.len(),
+            modified: meta.modified().ok()?,
+        })
+    }
 }
 
 static SOURCE: Mutex<Option<NetSource>> = Mutex::new(None);
@@ -403,12 +597,30 @@ pub fn backing() -> Option<NetBacking> {
     BACKING.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
+/// A network file's bytes, in hand or produced on first use: a process that maps the
+/// image a peer built never reads them, so the embedded network is decoded only by
+/// the process that fills an image.
+enum NetBytes<'a> {
+    Ready(&'a [u8]),
+    #[cfg_attr(not(all(feature = "nnue", net_embedded)), allow(dead_code))]
+    Lazy(OnceCell<Vec<u8>>, fn() -> Vec<u8>),
+}
+
+impl NetBytes<'_> {
+    fn get(&self) -> &[u8] {
+        match self {
+            NetBytes::Ready(data) => data,
+            NetBytes::Lazy(cell, produce) => cell.get_or_init(produce),
+        }
+    }
+}
+
 /// Install a network, sharing its image with the other engine processes on
 /// this machine when that is possible.
 ///
 /// Falls back to a private copy on any trouble at all: sharing is a throughput
 /// optimisation for test lanes, never a condition for playing chess.
-fn materialise(data: &[u8], content_hash: u64) -> &'static NNUEParams {
+fn materialise(data: &NetBytes, content_hash: u64) -> &'static NNUEParams {
     let len = size_of::<NNUEParams>();
     MASTER_HASH.store(content_hash, Ordering::Relaxed);
 
@@ -418,8 +630,15 @@ fn materialise(data: &[u8], content_hash: u64) -> &'static NNUEParams {
         String::from("no sharing on this platform")
     };
     if shared_policy().load(Ordering::Relaxed) {
-        let name = image_name(content_hash);
-        match crate::shm::acquire(&name, len, &mut |dst| fill_image(data, dst)) {
+        // On a machine with several memory nodes the image is placed where it was
+        // first written: named after the node this process starts on, so that a
+        // process pinned to another socket builds its own instead of reading this
+        // one across the link.
+        let mut name = image_name(content_hash);
+        if crate::numa::several_hardware_nodes() {
+            name = format!("{name}-n{}", crate::numa::startup_hardware_node());
+        }
+        match crate::shm::acquire(&name, len, &mut |dst| fill_image(data.get(), dst)) {
             Ok(mapped) => {
                 let bytes = mapped.bytes();
                 debug_assert_eq!(bytes.len(), len);
@@ -431,7 +650,7 @@ fn materialise(data: &[u8], content_hash: u64) -> &'static NNUEParams {
                 // rebuilds and compares, so such a change is caught here
                 // instead of becoming silently wrong evaluation.
                 if crate::shm::verify_requested() {
-                    let mine = build_private(data);
+                    let mine = build_private(data.get());
                     // SAFETY: viewing one `NNUEParams` as its bytes.
                     let mine = unsafe {
                         std::slice::from_raw_parts(
@@ -445,7 +664,7 @@ fn materialise(data: &[u8], content_hash: u64) -> &'static NNUEParams {
                              falling back to a private copy (bump IMAGE_FORMAT_VERSION)"
                         );
                         return install_private(
-                            build_private(data),
+                            build_private(data.get()),
                             String::from("image mismatch"),
                         );
                     }
@@ -465,7 +684,7 @@ fn materialise(data: &[u8], content_hash: u64) -> &'static NNUEParams {
             Err(e) => private_reason = e,
         }
     }
-    install_private(build_private(data), private_reason)
+    install_private(build_private(data.get()), private_reason)
 }
 
 /// Leak a private copy and record why it is not shared.
@@ -527,6 +746,30 @@ pub fn has_network() -> bool {
 /// Decompress the embedded network and check it, yielding the file's bytes.
 #[cfg(all(feature = "nnue", net_embedded))]
 fn embedded_file_bytes() -> Vec<u8> {
+    // Decompress the whole stream (the footer is 16 bytes past the payload) and
+    // run the integrity gate on the file image. `build.rs` refuses a network
+    // without a footer, so a failed check is a corrupt or mismatched binary, and
+    // panics like the decoder errors.
+    let mut data = Vec::with_capacity(NNUE_FILE_SIZE + super::integrity::FOOTER_SIZE);
+    decode_embedded(&mut data);
+    super::integrity::verify(&data)
+        .unwrap_or_else(|e| panic!("Embedded NNUE network failed integrity check: {e}"));
+    data
+}
+
+/// Native builds that link the C zstd (for GaiaTB) decode with it: about three
+/// times faster than ruzstd on the 87 MB image. The image size is known, so the
+/// single-pass decoder writes straight into the vector's capacity.
+#[cfg(all(feature = "nnue", net_embedded, feature = "gaiatb", not(target_arch = "wasm32")))]
+fn decode_embedded(data: &mut Vec<u8>) {
+    zstd::bulk::Decompressor::new()
+        .and_then(|mut d| d.decompress_to_buffer(COMPRESSED_MODEL, data))
+        .expect("Failed to decompress embedded NNUE network");
+}
+
+/// Pure-Rust fallback (wasm, or builds without GaiaTB).
+#[cfg(all(feature = "nnue", net_embedded, not(all(feature = "gaiatb", not(target_arch = "wasm32")))))]
+fn decode_embedded(data: &mut Vec<u8>) {
     use std::io::Read;
     // The decoder's default window ceiling (100 MB) guards against a hostile stream
     // claiming a window big enough to exhaust memory. This stream is our own network,
@@ -536,27 +779,32 @@ fn embedded_file_bytes() -> Vec<u8> {
     let mut decoder =
         ruzstd::decoding::StreamingDecoder::new_with_max_window_size(COMPRESSED_MODEL, WINDOW)
             .expect("Failed to init zstd decoder for embedded NNUE");
-    // Decompress the whole stream (a footered network carries 16 trailing
-    // bytes past the payload) and run the integrity gate on the file image.
-    // A legacy embedded network passes silently — embedding it was a build
-    // choice; a failed check is a corrupt or mismatched binary and panics
-    // like the decoder errors above.
-    let mut data = Vec::with_capacity(NNUE_FILE_SIZE + super::integrity::FOOTER_SIZE);
     decoder
-        .read_to_end(&mut data)
+        .read_to_end(data)
         .expect("Failed to decompress embedded NNUE network");
-    super::integrity::verify(&data)
-        .unwrap_or_else(|e| panic!("Embedded NNUE network failed integrity check: {e}"));
-    data
 }
 
 /// Install the embedded network. Called once on first access via OnceLock.
 #[cfg(all(feature = "nnue", net_embedded))]
 fn decompress_embedded() -> &'static NNUEParams {
-    let data = embedded_file_bytes();
-    let hash = super::integrity::content_hash(&data);
     *SOURCE.lock().unwrap_or_else(|e| e.into_inner()) = Some(NetSource::Embedded);
-    materialise(&data, hash)
+    // A footered network declares its digest in the tail the build kept apart: the
+    // image is named, and a peer's mapped, without decoding anything.
+    let data = NetBytes::Lazy(OnceCell::new(), embedded_file_bytes);
+    let hash = super::integrity::declared_hash(model_meta::EMBEDDED_LEN, model_meta::EMBEDDED_TAIL)
+        .unwrap_or_else(|| super::integrity::content_hash(data.get()));
+    let params = materialise(&data, hash);
+    debug_assert!(
+        !matches!(&data, NetBytes::Lazy(cell, _) if cell.get().is_some_and(|d| super::integrity::content_hash(d) != hash)),
+        "embedded network: the declared digest is not the decoded file's"
+    );
+    params
+}
+
+/// The embedded file's length and last bytes, written by `build.rs`.
+#[cfg(all(feature = "nnue", net_embedded))]
+mod model_meta {
+    include!(concat!(env!("OUT_DIR"), "/model_meta.rs"));
 }
 
 /// Puts the embedded network back in service if `EvalFile` replaced it: what
@@ -571,12 +819,12 @@ fn decompress_embedded() -> &'static NNUEParams {
 pub fn load_internal() -> bool {
     if !matches!(
         *SOURCE.lock().unwrap_or_else(|e| e.into_inner()),
-        Some(NetSource::File(_))
+        Some(NetSource::File { .. })
     ) {
         return false;
     }
     let data = embedded_file_bytes();
-    let params = materialise(&data, super::integrity::content_hash(&data));
+    let params = materialise(&NetBytes::Ready(&data), super::integrity::content_hash(&data));
     // The file's network is left where it is, for the reason given on `load_from_bytes`.
     RUNTIME_PARAMS.store(
         params as *const NNUEParams as *mut NNUEParams,
@@ -632,7 +880,7 @@ pub fn set_shared(enabled: bool) -> Result<NetBacking, String> {
     let in_service = MASTER_HASH.load(Ordering::Relaxed);
     let source = SOURCE.lock().unwrap_or_else(|e| e.into_inner());
     let data = match source.as_ref() {
-        Some(NetSource::File(path)) => {
+        Some(NetSource::File { path, .. }) => {
             let data = std::fs::read(path).map_err(|e| format!("Failed to re-read {path}: {e}"))?;
             check_same_network(&data, in_service).map_err(|e| format!("{path}: {e}"))?;
             data
@@ -650,7 +898,7 @@ pub fn set_shared(enabled: bool) -> Result<NetBacking, String> {
     drop(source);
     policy.store(enabled, Ordering::Relaxed);
 
-    let params = materialise(&data, in_service);
+    let params = materialise(&NetBytes::Ready(&data), in_service);
     // The old backing is left where it is, for the reason given on
     // `load_from_bytes`: a search thread may be reading through it.
     RUNTIME_PARAMS.store(
@@ -663,16 +911,48 @@ pub fn set_shared(enabled: bool) -> Result<NetBacking, String> {
 
 /// Load a network from a `.bin` file at runtime.
 ///
-/// Accepts a footered file (payload + 16-byte integrity footer, verified), or
-/// a legacy file of exactly `NNUE_FILE_SIZE` bytes plus up to 63 bytes of
-/// Bullet alignment padding (size-checked only).
-pub fn load_from_file(path: &str) -> Result<super::integrity::Provenance, String> {
-    let data = std::fs::read(path).map_err(|e| format!("Failed to read {path}: {e}"))?;
-    let provenance = load_from_bytes(&data)?;
+/// Accepts the payload followed by its 16-byte integrity footer, verified.
+pub fn load_from_file(path: &str) -> Result<(), String> {
+    use std::io::Read;
+    let read_error = |e: std::io::Error| format!("Failed to read {path}: {e}");
+    let mut file = std::fs::File::open(path).map_err(read_error)?;
+    // Taken before the bytes are read: a file rewritten meanwhile looks changed the
+    // next time it is named, and is read again.
+    let meta = file.metadata().ok();
+    let stamp = meta.as_ref().and_then(FileStamp::of);
+    let mut data = Vec::with_capacity(meta.map_or(0, |m| m.len() as usize));
+    file.read_to_end(&mut data).map_err(read_error)?;
+    load_from_bytes(&data)?;
     // Remembered so the sharing policy can be changed later without the file
-    // having to be named again.
-    *SOURCE.lock().unwrap_or_else(|e| e.into_inner()) = Some(NetSource::File(path.to_string()));
-    Ok(provenance)
+    // having to be named again, and so that naming it again changes nothing.
+    *SOURCE.lock().unwrap_or_else(|e| e.into_inner()) = Some(NetSource::File {
+        path: path.to_string(),
+        stamp,
+    });
+    Ok(())
+}
+
+/// Whether the network in service was loaded from `path`, and the file is still the
+/// one that was read: same length, same modification time.
+///
+/// A match runner names the network again before every game. Loading it again would
+/// read and check the whole file, and keep one more copy of the weights for good (see
+/// [`load_from_bytes`]): memory without sharing, address space with it.
+pub fn is_loaded_from(path: &str) -> bool {
+    let source = SOURCE.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(NetSource::File {
+        path: loaded,
+        stamp: Some(stamp),
+    }) = source.as_ref()
+    else {
+        return false;
+    };
+    loaded == path
+        && std::fs::metadata(path)
+            .ok()
+            .as_ref()
+            .and_then(FileStamp::of)
+            == Some(*stamp)
 }
 
 /// Install a network from the raw contents of a `.bin` file.
@@ -686,13 +966,13 @@ pub fn load_from_file(path: &str) -> Result<super::integrity::Provenance, String
 /// knowing otherwise would take a reclamation protocol this does not have. In practice
 /// nothing accumulates: the option is set between searches, and a browser loads once at
 /// start-up and never again.
-pub fn load_from_bytes(data: &[u8]) -> Result<super::integrity::Provenance, String> {
+pub fn load_from_bytes(data: &[u8]) -> Result<(), String> {
     // Integrity gate before anything is installed: a rejected network must
     // neither leak a box nor bump the generation. The hashes are over the
     // file bytes — repermute_ft below makes memory machine-dependent.
-    let provenance = super::integrity::verify(data)?;
+    super::integrity::verify(data)?;
 
-    let params = materialise(data, super::integrity::content_hash(data));
+    let params = materialise(&NetBytes::Ready(data), super::integrity::content_hash(data));
 
     // The pointer is stored as mutable because that is what `AtomicPtr` holds,
     // but nothing ever writes through it: shared images are sealed read-only by
@@ -706,7 +986,7 @@ pub fn load_from_bytes(data: &[u8]) -> Result<super::integrity::Provenance, Stri
     NETWORK_GENERATION.fetch_add(1, Ordering::Release);
     refresh_replicas();
 
-    Ok(provenance)
+    Ok(())
 }
 
 // ============================================================
@@ -839,9 +1119,10 @@ static RESERVED: AtomicPtr<NNUEParams> = AtomicPtr::new(std::ptr::null_mut());
 /// the caller is given the network's own memory to fill, and calls [`publish_reserved`]
 /// when it is full.
 ///
-/// Exactly `NNUE_FILE_SIZE` bytes may be written. Reserving twice without publishing
-/// leaks the first, which is why nothing but a host loading its one network should call
-/// this.
+/// Exactly `NNUE_FILE_SIZE` bytes may be written, as the file holds them, and
+/// [`publish_reserved`] converts them in place. Reserving twice without publishing
+/// leaks the first, which is why nothing but a host loading its one network should
+/// call this.
 pub fn reserve() -> *mut u8 {
     let params = NNUEParams::zeroed_box();
     let ptr = Box::into_raw(params);
@@ -858,9 +1139,9 @@ pub fn publish_reserved() -> Result<(), String> {
         return Err(String::from("no network was reserved"));
     }
     // SAFETY: the pointer came from `Box::into_raw` in `reserve` and has been taken out
-    // of RESERVED, so nothing else can reach it.
-    let params = unsafe { &mut *ptr };
-    repermute_ft(params);
+    // of RESERVED, so nothing else can reach it; this views the network as its bytes.
+    let image = unsafe { std::slice::from_raw_parts_mut(ptr as *mut u8, size_of::<NNUEParams>()) };
+    fill_image_in_place(image);
     RUNTIME_PARAMS.store(ptr, Ordering::Release);
     NETWORK_GENERATION.fetch_add(1, Ordering::Release);
     refresh_replicas();
@@ -895,17 +1176,41 @@ mod tests {
     /// word under the old network's table and caches, and a truncated one panicked.
     #[test]
     fn a_reread_network_must_be_the_one_in_service() {
+        let footered = |payload: &mut Vec<u8>| {
+            let footer = super::super::integrity::footer(payload);
+            payload.extend_from_slice(&footer);
+        };
         let mut data = vec![0u8; NNUE_FILE_SIZE];
         data[0] = 1;
+        let at = NNUE_FILE_SIZE - 64;
+        data[at..at + 4].copy_from_slice(&287i32.to_le_bytes());
+        let mut rewritten = data.clone();
+        rewritten[1] = 2;
+        footered(&mut data);
+        footered(&mut rewritten);
         let in_service = super::super::integrity::content_hash(&data);
         assert_eq!(check_same_network(&data, in_service), Ok(()));
 
-        let mut rewritten = data.clone();
-        rewritten[1] = 2;
         let refused = check_same_network(&rewritten, in_service).unwrap_err();
         assert!(refused.contains("EvalFile"), "{refused}");
 
         assert!(check_same_network(&data[..1000], in_service).is_err());
+    }
+
+    /// `EvalFile` naming the network in service again reads nothing, unless the file
+    /// was rewritten: its stamp follows the rewrite.
+    #[test]
+    fn a_rewritten_network_file_no_longer_matches_its_stamp() {
+        let path =
+            std::env::temp_dir().join(format!("gaia-net-stamp-{}.bin", std::process::id()));
+        let stamp = |p: &std::path::Path| FileStamp::of(&std::fs::metadata(p).unwrap());
+        std::fs::write(&path, [0u8; 16]).unwrap();
+        let read = stamp(&path);
+        assert!(read.is_some(), "no modification time on this platform");
+        assert_eq!(stamp(&path), read, "the same file, untouched");
+        std::fs::write(&path, [0u8; 32]).unwrap();
+        assert_ne!(stamp(&path), read, "the file was rewritten");
+        std::fs::remove_file(&path).unwrap();
     }
 
     /// Lay a linear row out the way the trainer writes the file:
@@ -940,5 +1245,34 @@ mod tests {
             }
         }
         assert_eq!(row, want, "file -> avx2");
+    }
+
+    #[test]
+    fn logical_order_round_trips_through_the_file_layout() {
+        let ramp: Vec<i16> = (0..L1_SIZE as i16).collect();
+        let mut row = ramp.clone();
+        super::linear_to_file(&mut row);
+        assert_eq!(row, linear_to_file(&ramp), "the trainer's layout");
+        super::file_to_linear(&mut row);
+        assert_eq!(row, ramp, "and back");
+    }
+
+    #[test]
+    fn every_memory_column_maps_to_one_logical_neuron_and_halves_stay_paired() {
+        let map = memory_to_logical();
+        let mut seen = [false; L1_SIZE];
+        for &l in &map {
+            assert!(!seen[l as usize], "logical neuron {l} carried twice");
+            seen[l as usize] = true;
+        }
+        let half = L1_SIZE / 2;
+        for m in 0..half {
+            assert!((map[m] as usize) < half, "left column {m} maps right");
+            assert_eq!(
+                map[m + half] as usize,
+                map[m] as usize + half,
+                "column {m} unpaired"
+            );
+        }
     }
 }

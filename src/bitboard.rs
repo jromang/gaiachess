@@ -717,55 +717,76 @@ fn use_pext() -> bool {
 /// Distribution builds elect PEXT at runtime; others pin it at compile time.
 #[inline(always)]
 pub fn bishop_attacks(sq: Square, occupied: u64) -> u64 {
-    #[cfg(target_arch = "aarch64")]
-    return aarch64_hq::bishop_attacks(sq, occupied);
     #[cfg(all(target_arch = "x86_64", gaia_dist))]
     if use_pext() {
         return unsafe { pext::bishop_attacks(sq, occupied) };
     }
-    #[cfg(all(target_feature = "bmi2", not(gaia_dist)))]
-    return unsafe { pext::bishop_attacks(sq, occupied) };
-    #[cfg(all(target_feature = "avx2", any(not(target_feature = "bmi2"), gaia_dist)))]
-    return crate::simd_attacks::bishop_attacks(sq, occupied);
-    #[cfg(all(not(target_feature = "avx2"), not(target_arch = "aarch64")))]
-    magic_bishop_attacks(sq, occupied)
+    cfg_select! {
+        target_arch = "aarch64" => { aarch64_hq::bishop_attacks(sq, occupied) }
+        all(target_feature = "bmi2", not(gaia_dist)) => {
+            unsafe { pext::bishop_attacks(sq, occupied) }
+        }
+        target_feature = "avx2" => { crate::simd_attacks::bishop_attacks(sq, occupied) }
+        _ => { magic_bishop_attacks(sq, occupied) }
+    }
 }
 
 /// Rook attacks: PEXT (BMI2) > AVX2 BLSMSK > magic bitboards.
 /// Distribution builds elect PEXT at runtime; others pin it at compile time.
 #[inline(always)]
 pub fn rook_attacks(sq: Square, occupied: u64) -> u64 {
-    #[cfg(target_arch = "aarch64")]
-    return aarch64_hq::rook_attacks(sq, occupied);
     #[cfg(all(target_arch = "x86_64", gaia_dist))]
     if use_pext() {
         return unsafe { pext::rook_attacks(sq, occupied) };
     }
-    #[cfg(all(target_feature = "bmi2", not(gaia_dist)))]
-    return unsafe { pext::rook_attacks(sq, occupied) };
-    #[cfg(all(target_feature = "avx2", any(not(target_feature = "bmi2"), gaia_dist)))]
-    return crate::simd_attacks::rook_attacks(sq, occupied);
-    #[cfg(all(not(target_feature = "avx2"), not(target_arch = "aarch64")))]
-    magic_rook_attacks(sq, occupied)
+    cfg_select! {
+        target_arch = "aarch64" => { aarch64_hq::rook_attacks(sq, occupied) }
+        all(target_feature = "bmi2", not(gaia_dist)) => {
+            unsafe { pext::rook_attacks(sq, occupied) }
+        }
+        target_feature = "avx2" => { crate::simd_attacks::rook_attacks(sq, occupied) }
+        _ => { magic_rook_attacks(sq, occupied) }
+    }
 }
 
 /// Queen attacks (bishop | rook): PEXT > AVX2 BLSMSK > magic.
 /// Distribution builds elect PEXT at runtime; others pin it at compile time.
 #[inline(always)]
 pub fn queen_attacks(sq: Square, occupied: u64) -> u64 {
-    #[cfg(target_arch = "aarch64")]
-    return aarch64_hq::bishop_attacks(sq, occupied) | aarch64_hq::rook_attacks(sq, occupied);
     #[cfg(all(target_arch = "x86_64", gaia_dist))]
     if use_pext() {
         return unsafe { pext::bishop_attacks(sq, occupied) | pext::rook_attacks(sq, occupied) };
     }
-    #[cfg(all(target_feature = "bmi2", not(gaia_dist)))]
-    return unsafe { pext::bishop_attacks(sq, occupied) | pext::rook_attacks(sq, occupied) };
-    #[cfg(all(target_feature = "avx2", any(not(target_feature = "bmi2"), gaia_dist)))]
-    return crate::simd_attacks::queen_attacks(sq, occupied);
-    #[cfg(all(not(target_feature = "avx2"), not(target_arch = "aarch64")))]
-    {
-        magic_bishop_attacks(sq, occupied) | magic_rook_attacks(sq, occupied)
+    cfg_select! {
+        target_arch = "aarch64" => {
+            aarch64_hq::bishop_attacks(sq, occupied) | aarch64_hq::rook_attacks(sq, occupied)
+        }
+        all(target_feature = "bmi2", not(gaia_dist)) => {
+            unsafe { pext::bishop_attacks(sq, occupied) | pext::rook_attacks(sq, occupied) }
+        }
+        target_feature = "avx2" => { crate::simd_attacks::queen_attacks(sq, occupied) }
+        _ => { magic_bishop_attacks(sq, occupied) | magic_rook_attacks(sq, occupied) }
+    }
+}
+
+/// Bishop and rook attacks of the same square on the same board, as
+/// `(bishop, rook)`. One pass on the AVX2 path (dual hyperbola quintessence); two
+/// lookups elsewhere, where there is nothing to share. For callers that need both.
+#[inline(always)]
+pub fn both_attacks(sq: Square, occupied: u64) -> (u64, u64) {
+    #[cfg(all(target_arch = "x86_64", gaia_dist))]
+    if use_pext() {
+        return unsafe { (pext::bishop_attacks(sq, occupied), pext::rook_attacks(sq, occupied)) };
+    }
+    cfg_select! {
+        target_arch = "aarch64" => {
+            (aarch64_hq::bishop_attacks(sq, occupied), aarch64_hq::rook_attacks(sq, occupied))
+        }
+        all(target_feature = "bmi2", not(gaia_dist)) => {
+            unsafe { (pext::bishop_attacks(sq, occupied), pext::rook_attacks(sq, occupied)) }
+        }
+        target_feature = "avx2" => { crate::simd_attacks::both_attacks(sq, occupied) }
+        _ => { (magic_bishop_attacks(sq, occupied), magic_rook_attacks(sq, occupied)) }
     }
 }
 
@@ -803,12 +824,13 @@ pub fn attackers_to(sq: Square, occupied: u64, pieces: &[u64; 12]) -> u64 {
     let queens = pieces[Piece::WHITE_QUEEN.index()] | pieces[Piece::BLACK_QUEEN.index()];
     let kings = pieces[Piece::WHITE_KING.index()] | pieces[Piece::BLACK_KING.index()];
 
+    let (diagonal, straight) = both_attacks(sq, occupied);
     (knight_attacks(sq) & knights)
         | (king_attacks(sq) & kings)
         | (pawn_attacks(sq, Color::White) & pieces[Piece::BLACK_PAWN.index()])
         | (pawn_attacks(sq, Color::Black) & pieces[Piece::WHITE_PAWN.index()])
-        | (bishop_attacks(sq, occupied) & (bishops | queens))
-        | (rook_attacks(sq, occupied) & (rooks | queens))
+        | (diagonal & (bishops | queens))
+        | (straight & (rooks | queens))
 }
 
 /// Attackers of a specific color to a square

@@ -27,8 +27,9 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: 1.98.1  # rust-toolchain.toml's
           targets: wasm32-unknown-unknown
 
       - name: Cache cargo
@@ -67,6 +68,31 @@ jobs:
             echo 'the engine module named no move'
             exit 1
           }
+
+      # A move is not enough: a module that reads its weights in the wrong layout still
+      # names one (#321). The network's judgement of three quiet positions has to stay
+      # within a few pawns, where a misread table gives millions.
+      - name: Check the engine module evaluates sanely
+        run: |
+          cat > /tmp/eval.uci <<'SESSION'
+          uci
+          isready
+          position startpos
+          eval
+          position startpos moves e2e4
+          eval
+          position fen r1bqkb1r/pppp1ppp/2n2n2/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 4 4
+          eval
+          quit
+          SESSION
+          node web/engine/host.mjs web/dist/engine.wasm --net /tmp/net.bin < /tmp/eval.uci > /tmp/eval.txt
+          grep 'NNUE eval' /tmp/eval.txt
+          python3 - <<'PY'
+          import re, sys
+          evals = [int(v) for v in re.findall(r'NNUE eval:\s*(-?\d+) cp', open('/tmp/eval.txt').read())]
+          if len(evals) != 3 or any(abs(v) >= 1000 for v in evals):
+              sys.exit(f'implausible NNUE evaluations: {evals}')
+          PY
 
       - name: Check the archive
         run: python3 tools/web/check-zip.py var/web/gaiachess-web.zip

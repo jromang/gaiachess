@@ -753,13 +753,19 @@ impl GameScene {
     /// once the pieces have, so a budget worked out two plies early would be short by one
     /// and the engine would think itself poorer than it is.
     fn engine_budget(&self, owed: u64) -> SearchLimits {
+        let us = self.game.pos.side_to_move;
         let clock = self.clocks.enabled().then(|| {
             (
-                self.clocks.remaining_ms(self.game.pos.side_to_move) + owed,
+                self.clocks.remaining_ms(us) + owed,
                 self.clocks.increment_ms(),
             )
         });
-        level_limits(self.level, clock)
+        SearchLimits {
+            // The engine thinks on a player's time whenever it can (see
+            // `start_pondering`), and budgets every move for it.
+            ponder_allowed: self.level == MAX_LEVEL && !self.cpu[(!us) as usize],
+            ..level_limits(self.level, clock)
+        }
     }
 
     /// Sets the engine thinking about the position it expects next — its own move, then

@@ -141,17 +141,21 @@ fn emit_pairs(
 /// set that involve a removed pawn, `adds` the pairs of the new set that involve an
 /// added pawn. Each pair is emitted once, even when both of its pawns changed.
 ///
+/// The two configurations need not be one move apart: `N` = [`MAX_DELTA_PAIRS`] holds
+/// what a move changes, [`MAX_ACTIVE_PAIRS`] any difference at all, since `subs` are
+/// pairs of the old set and `adds` pairs of the new one.
+///
 /// Returns `(n_subs, n_adds)`.
 #[allow(clippy::too_many_arguments)]
-pub fn collect_delta_for_pov(
+pub fn collect_delta_for_pov<const N: usize>(
     old_white: u64,
     old_black: u64,
     new_white: u64,
     new_black: u64,
     pov: usize,
     mirrored: bool,
-    subs: &mut [u32; MAX_DELTA_PAIRS],
-    adds: &mut [u32; MAX_DELTA_PAIRS],
+    subs: &mut [u32; N],
+    adds: &mut [u32; N],
 ) -> (usize, usize) {
     debug_assert!(pov < 2);
     let square_flip = (7 * mirrored as usize) ^ (56 * pov);
@@ -182,13 +186,13 @@ pub fn collect_delta_for_pov(
 /// Pairs of the set (`set_f`, `set_e`) that involve at least one pawn of
 /// (`changed_f`, `changed_e`). A changed pawn leaves the partner sets once handled, so
 /// a pair of two changed pawns is produced exactly once and no pawn pairs with itself.
-fn emit_touching(
+fn emit_touching<const N: usize>(
     mut changed_f: u64,
     mut changed_e: u64,
     mut set_f: u64,
     mut set_e: u64,
     square_flip: usize,
-    out: &mut [u32; MAX_DELTA_PAIRS],
+    out: &mut [u32; N],
 ) -> usize {
     debug_assert!(
         changed_f & !set_f == 0 && changed_e & !set_e == 0,
@@ -216,18 +220,18 @@ fn emit_touching(
 
 /// Pairs between pawn `id` and every pawn of `partners`.
 #[inline]
-fn emit_partners(
+fn emit_partners<const N: usize>(
     id: usize,
     mut partners: u64,
     partner_off: usize,
     square_flip: usize,
-    out: &mut [u32; MAX_DELTA_PAIRS],
+    out: &mut [u32; N],
     n: &mut usize,
 ) {
     while partners != 0 {
         let t = pop_lsb(&mut partners);
         let other = pawn_id(t, partner_off, square_flip);
-        debug_assert!(*n < MAX_DELTA_PAIRS, "too many pawn-pair changes for one move");
+        debug_assert!(*n < N, "too many pawn-pair changes for a buffer of {N}");
         out[*n] = pair_index(id, other) as u32;
         *n += 1;
     }

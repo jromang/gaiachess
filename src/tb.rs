@@ -38,43 +38,52 @@ pub unsafe extern "C" fn gaiachess_poplsb(bb: *mut u64) -> u64 {
     }
 }
 
+/// The square Pyrrhic names, which is always on the board: a larger one would read
+/// past the attack tables.
+#[cfg(feature = "syzygy")]
+#[inline(always)]
+fn tb_square(sq: u32) -> Square {
+    debug_assert!(sq < 64, "square {sq} from the Syzygy prober");
+    Square(sq as u8)
+}
+
 /// `colour`: true = white, false = black (matches Pyrrhic convention).
 #[cfg(feature = "syzygy")]
 #[unsafe(no_mangle)]
 pub extern "C" fn gaiachess_pawn_attacks(sq: u32, colour: bool) -> u64 {
     let c = if colour { Color::White } else { Color::Black };
-    bitboard::pawn_attacks(Square(sq as u8), c)
+    bitboard::pawn_attacks(tb_square(sq), c)
 }
 
 #[cfg(feature = "syzygy")]
 #[unsafe(no_mangle)]
 pub extern "C" fn gaiachess_knight_attacks(sq: u32) -> u64 {
-    bitboard::knight_attacks(Square(sq as u8))
+    bitboard::knight_attacks(tb_square(sq))
 }
 
 #[cfg(feature = "syzygy")]
 #[unsafe(no_mangle)]
 pub extern "C" fn gaiachess_bishop_attacks(sq: u32, occupied: u64) -> u64 {
-    bitboard::bishop_attacks(Square(sq as u8), occupied)
+    bitboard::bishop_attacks(tb_square(sq), occupied)
 }
 
 #[cfg(feature = "syzygy")]
 #[unsafe(no_mangle)]
 pub extern "C" fn gaiachess_rook_attacks(sq: u32, occupied: u64) -> u64 {
-    bitboard::rook_attacks(Square(sq as u8), occupied)
+    bitboard::rook_attacks(tb_square(sq), occupied)
 }
 
 #[cfg(feature = "syzygy")]
 #[unsafe(no_mangle)]
 pub extern "C" fn gaiachess_queen_attacks(sq: u32, occupied: u64) -> u64 {
-    bitboard::bishop_attacks(Square(sq as u8), occupied)
-        | bitboard::rook_attacks(Square(sq as u8), occupied)
+    bitboard::bishop_attacks(tb_square(sq), occupied)
+        | bitboard::rook_attacks(tb_square(sq), occupied)
 }
 
 #[cfg(feature = "syzygy")]
 #[unsafe(no_mangle)]
 pub extern "C" fn gaiachess_king_attacks(sq: u32) -> u64 {
-    bitboard::king_attacks(Square(sq as u8))
+    bitboard::king_attacks(tb_square(sq))
 }
 
 // ============================================================
@@ -169,6 +178,36 @@ pub enum Wdl {
     Loss,
 }
 
+/// When each directory of a tablebase path list was last changed, in order: adding or
+/// removing a table changes its directory's time. `None` for one that cannot be read.
+#[cfg(any(feature = "syzygy", feature = "nalimov"))]
+pub fn dir_stamps(paths: &str) -> Vec<Option<std::time::SystemTime>> {
+    #[cfg(windows)]
+    let dirs = paths.split(';');
+    #[cfg(not(windows))]
+    let dirs = paths.split([':', ';']);
+    dirs.map(|d| std::fs::metadata(d).and_then(|m| m.modified()).ok()).collect()
+}
+
+/// The path the tables in service were read from, and its directories' times then.
+#[cfg(feature = "syzygy")]
+static LOADED: std::sync::Mutex<Option<(String, Vec<Option<std::time::SystemTime>>)>> =
+    std::sync::Mutex::new(None);
+
+/// Whether the tables in service were read from `path`, and none of its directories has
+/// gained or lost a table since: naming it again need not scan anything.
+///
+/// fastchess sends every option again before each game. Scanning again frees and maps
+/// every file anew, and each table's first probe in the game pays for it.
+#[cfg(feature = "syzygy")]
+pub fn is_loaded_from(path: &str) -> bool {
+    LOADED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .is_some_and(|(loaded, stamps)| loaded == path && *stamps == dir_stamps(path))
+}
+
 /// Initialize Syzygy tablebases from the given path. Can be called with multiple paths
 /// separated by `;` (Windows) or `:` (Unix).
 ///
@@ -177,8 +216,11 @@ pub enum Wdl {
 /// loaded is read from [`max_pieces`] instead (see [`file_counts`] for the detail).
 #[cfg(feature = "syzygy")]
 pub fn init(path: &str) -> bool {
+    // Taken before the scan: a table added meanwhile reads as a change next time.
+    let stamps = dir_stamps(path);
     let cstr = std::ffi::CString::new(path).expect("invalid syzygy path");
     let ok = unsafe { ffi::tb_init(cstr.as_ptr()) };
+    *LOADED.lock().unwrap_or_else(|e| e.into_inner()) = Some((path.to_owned(), stamps));
     ok && max_pieces() > 0
 }
 
@@ -200,6 +242,7 @@ pub fn file_counts() -> (u32, u32) {
 #[cfg(feature = "syzygy")]
 #[allow(dead_code)]
 pub fn free() {
+    *LOADED.lock().unwrap_or_else(|e| e.into_inner()) = None;
     unsafe { ffi::tb_free() }
 }
 
@@ -452,8 +495,9 @@ pub fn rank_root_moves(pos: &Position) -> Option<RootRanking> {
 
 /// Like [`rank_root_moves`], with every certain win and loss ranked by DTZ as well:
 /// the move that leads to mate along the shortest zeroing path comes first, and on
-/// the losing side the longest. For walking a line to mate, not for the root search,
-/// which wants every certain win in one group.
+/// the losing side the longest. For walking a line to mate and for choosing the
+/// winning move played when the search proves no mate, not for the root search,
+/// which wants every certain win in one group to look for a mate among them.
 #[cfg(feature = "syzygy")]
 pub fn rank_root_moves_by_dtz(pos: &Position) -> Option<RootRanking> {
     rank_root_moves_with(pos, true)

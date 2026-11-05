@@ -1,7 +1,7 @@
 //! [Static Exchange Evaluation](https://www.chessprogramming.org/Static_Exchange_Evaluation)
 //! using the swap algorithm.
 
-use crate::bitboard::{attackers_to, between_bb, bishop_attacks, more_than_one, pop_lsb, rook_attacks};
+use crate::bitboard::{attackers_to, between_bb, bishop_attacks, both_attacks, more_than_one, pop_lsb, rook_attacks};
 use crate::position::Position;
 use crate::types::*;
 
@@ -28,6 +28,13 @@ fn king_blockers(pos: &Position, us: Color) -> (u64, u64) {
         }
     }
     (blockers, pinners)
+}
+
+/// No enemy piece attacks `to` once the piece on `from` has moved there: what the
+/// threat-map shortcut of [`see`] assumes, checked the long way in debug builds.
+fn exchange_is_empty(pos: &Position, from: Square, to: Square) -> bool {
+    let occ = (pos.occupancies[2] ^ from.bb()) | to.bb();
+    attackers_to(to, occ, &pos.pieces) & pos.occupancies[(!pos.side_to_move) as usize] == 0
 }
 
 /// SEE piece values (indexed by `PieceType`: Pawn=0..King=5, None=6).
@@ -60,6 +67,11 @@ pub fn see(pos: &Position, m: Move, threshold: i32) -> bool {
         threshold.abs() < SCORE_MATE,
         "SEE: threshold {} suspiciously large",
         threshold
+    );
+    debug_assert!(
+        pos.board[m.from_sq().index()].color() == pos.side_to_move,
+        "SEE: {} is not a move of the side to move",
+        m.to_uci()
     );
 
     // Castling and promotions are almost always good — skip SEE.
@@ -102,6 +114,20 @@ pub fn see(pos: &Position, m: Move, threshold: i32) -> bool {
         0
     };
 
+    // Nothing can take back on the target square: neither it nor the square the piece
+    // leaves is attacked. `pos.threats` holds every enemy attack (our king lifted, so a
+    // superset), and the piece leaving can only open a line to the target for a slider
+    // that already sees its square. The exchange then stops at the first capture. Not
+    // for en passant, whose victim's square can open a line of its own.
+    if mt == MT_NORMAL && (from.bb() | to.bb()) & pos.threats == 0 {
+        debug_assert!(
+            exchange_is_empty(pos, from, to),
+            "SEE: {} has a recapture the threat map missed",
+            m.to_uci()
+        );
+        return captured_val >= threshold;
+    }
+
     let mut v = captured_val - threshold;
     if v < 0 {
         return false;
@@ -128,19 +154,42 @@ pub fn see(pos: &Position, m: Move, threshold: i32) -> bool {
         | pos.pieces[Piece::WHITE_QUEEN.index()]
         | pos.pieces[Piece::BLACK_QUEEN.index()];
 
-    let mut stm = pos.side_to_move;
+    let us = pos.side_to_move;
+    let mut stm = us;
     let mut result = 1i32;
 
-    // A piece pinned to its king cannot recapture while its pinner stands. Computed
-    // here, once the exchange is known to matter: [white king, black king].
-    let pins = [king_blockers(pos, Color::White), king_blockers(pos, Color::Black)];
+    // A piece pinned to its king cannot recapture while its pinner stands. Our pinned
+    // pieces are known (`pos.pinned`, the same rule as `king_blockers`); their pinners
+    // are only needed if one of them is among the recapturers. The other side's pins are
+    // computed the first time it has a recapture to make.
+    debug_assert_eq!(
+        pos.pinned,
+        king_blockers(pos, us).0,
+        "SEE: pos.pinned is stale"
+    );
+    let mut our_pinners = None;
+    let mut their_pins = None;
 
     loop {
         stm = !stm;
         attackers &= occ;
 
         let mut mine = attackers & pos.occupancies[stm as usize];
-        let (blockers, pinners) = pins[stm as usize];
+        if mine == 0 {
+            break;
+        }
+        let (blockers, pinners) = if stm == us {
+            if mine & pos.pinned == 0 {
+                (0, 0)
+            } else {
+                (
+                    pos.pinned,
+                    *our_pinners.get_or_insert_with(|| king_blockers(pos, us).1),
+                )
+            }
+        } else {
+            *their_pins.get_or_insert_with(|| king_blockers(pos, !us))
+        };
         if pinners & occ != 0 {
             mine &= !blockers;
         }
@@ -160,7 +209,7 @@ pub fn see(pos: &Position, m: Move, threshold: i32) -> bool {
             if v < result {
                 break;
             }
-            occ ^= bb & bb.wrapping_neg();
+            occ ^= bb.isolate_lowest_one();
             attackers |= bishop_attacks(to, occ) & diag;
         } else if {
             bb = mine & pos.pieces[Piece::new(PieceType::Knight, stm).index()];
@@ -170,7 +219,7 @@ pub fn see(pos: &Position, m: Move, threshold: i32) -> bool {
             if v < result {
                 break;
             }
-            occ ^= bb & bb.wrapping_neg();
+            occ ^= bb.isolate_lowest_one();
         } else if {
             bb = mine & pos.pieces[Piece::new(PieceType::Bishop, stm).index()];
             bb != 0
@@ -179,7 +228,7 @@ pub fn see(pos: &Position, m: Move, threshold: i32) -> bool {
             if v < result {
                 break;
             }
-            occ ^= bb & bb.wrapping_neg();
+            occ ^= bb.isolate_lowest_one();
             attackers |= bishop_attacks(to, occ) & diag;
         } else if {
             bb = mine & pos.pieces[Piece::new(PieceType::Rook, stm).index()];
@@ -189,7 +238,7 @@ pub fn see(pos: &Position, m: Move, threshold: i32) -> bool {
             if v < result {
                 break;
             }
-            occ ^= bb & bb.wrapping_neg();
+            occ ^= bb.isolate_lowest_one();
             attackers |= rook_attacks(to, occ) & orth;
         } else if {
             bb = mine & pos.pieces[Piece::new(PieceType::Queen, stm).index()];
@@ -199,8 +248,9 @@ pub fn see(pos: &Position, m: Move, threshold: i32) -> bool {
             if v < result {
                 break;
             }
-            occ ^= bb & bb.wrapping_neg();
-            attackers |= (bishop_attacks(to, occ) & diag) | (rook_attacks(to, occ) & orth);
+            occ ^= bb.isolate_lowest_one();
+            let (diagonal, straight) = both_attacks(to, occ);
+            attackers |= (diagonal & diag) | (straight & orth);
         } else {
             // King: if opponent still has attackers, king can't recapture
             return (attackers & !pos.occupancies[stm as usize] != 0) != (result != 0);
@@ -366,6 +416,29 @@ mod tests {
             "d5",
             100
         ));
+    }
+
+    /// The threat-map shortcut: nothing attacks the target nor the square left, so a
+    /// quiet move is worth exactly zero and a capture exactly its victim.
+    #[test]
+    fn an_unattacked_move_is_worth_its_victim() {
+        // Rd1-d4, nothing of Black's sees d1 or d4.
+        let quiet = "4k3/8/8/8/8/8/8/3RK3 w - - 0 1";
+        assert!(see_test(quiet, "d1", "d4", 0));
+        assert!(!see_test(quiet, "d1", "d4", 1));
+        // Nxe5 on an undefended pawn.
+        let capture = "4k3/8/8/4p3/8/5N2/8/4K3 w - - 0 1";
+        assert!(see_test(capture, "f3", "e5", 100));
+        assert!(!see_test(capture, "f3", "e5", 101));
+    }
+
+    /// Leaving a square can open the very line to the target: Rd4-d2 under Rd8, which
+    /// sees d4 but not d2. The shortcut must not take it, and the rook is lost.
+    #[test]
+    fn leaving_a_watched_square_along_the_line_is_not_free() {
+        let fen = "3rk3/8/8/8/3R4/8/8/7K w - - 0 1";
+        assert!(!see_test(fen, "d4", "d2", 0));
+        assert!(see_test(fen, "d4", "d2", -500));
     }
 
     fn see_ep(fen: &str, from: &str, to: &str, threshold: i32) -> bool {

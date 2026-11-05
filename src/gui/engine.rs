@@ -213,9 +213,9 @@ mod desktop {
         /// Sets the engine thinking about `pos` — the position it expects to be asked
         /// about next — while the player thinks about the one on the board.
         ///
-        /// The budget quoted is the one the engine will have when its turn comes; none of
-        /// it is spent until [`Engine::ponderhit`] says the wait is over, so a player who
-        /// takes an hour costs it nothing.
+        /// The budget quoted is the one the engine will have when its turn comes. The
+        /// search counts it from now: a player who takes an hour costs the engine's clock
+        /// nothing, and [`Engine::ponderhit`] then gets the move at once.
         pub fn ponder(
             &mut self,
             pos: &Position,
@@ -270,8 +270,8 @@ mod desktop {
                 return false;
             }
             self.busy = Busy::Searching;
-            // Read by the search on its own tick, which restarts its clock: the budget
-            // begins now, not when the guess was made.
+            // Read by the search on its own tick. Its clock has run since the guess was
+            // made: a search that has already spent the budget answers there and then.
             PONDER.store(false, Ordering::Relaxed);
             true
         }

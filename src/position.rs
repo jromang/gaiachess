@@ -54,6 +54,8 @@ pub enum FenParseError {
     InvalidKingCount { color: &'static str, count: u32 },
     /// The side NOT to move must not have its king in check.
     OpponentKingInCheck,
+    /// The side to move cannot be in check from more than two pieces.
+    TooManyCheckers { count: u32 },
     /// Pawns cannot be placed on rank 1 or rank 8.
     PawnsOnBackRank,
     /// Each side can have at most 8 pawns.
@@ -101,6 +103,9 @@ impl std::fmt::Display for FenParseError {
             }
             Self::OpponentKingInCheck => {
                 write!(f, "opponent's king is in check (illegal position)")
+            }
+            Self::TooManyCheckers { count } => {
+                write!(f, "king in check from {count} pieces, at most 2 (illegal position)")
             }
             Self::PawnsOnBackRank => write!(f, "pawns on rank 1 or 8 (illegal position)"),
             Self::TooManyPawns { color, count } => {
@@ -647,8 +652,11 @@ impl Position {
         let their_rooks_queens =
             self.piece_type_bb(PieceType::Rook, them) | self.piece_type_bb(PieceType::Queen, them);
 
+        // Rays through our own pieces, stopped by theirs: both kinds in one pass.
+        let (diagonal_rays, straight_rays) = both_attacks(ksq, self.color_bb(them));
+
         // Diagonal snipers
-        let mut snipers = bishop_attacks(ksq, self.color_bb(them)) & their_bishops_queens;
+        let mut snipers = diagonal_rays & their_bishops_queens;
         while snipers != 0 {
             let sniper_sq = pop_lsb(&mut snipers);
             let between = between_bb(ksq, sniper_sq) & occ & !sniper_sq.bb();
@@ -664,7 +672,7 @@ impl Position {
         }
 
         // Orthogonal snipers
-        snipers = rook_attacks(ksq, self.color_bb(them)) & their_rooks_queens;
+        snipers = straight_rays & their_rooks_queens;
         while snipers != 0 {
             let sniper_sq = pop_lsb(&mut snipers);
             let between = between_bb(ksq, sniper_sq) & occ & !sniper_sq.bb();
@@ -996,6 +1004,22 @@ impl Position {
         if pos.ep_square != Square::NONE {
             let us = pos.side_to_move;
             if pawn_attacks(pos.ep_square, !us) & pos.piece_type_bb(PieceType::Pawn, us) == 0 {
+                pos.ep_square = Square::NONE;
+            }
+        }
+
+        // 9. Nor where a knight or a pawn gives check other than the one that just
+        // moved, which no game reaches: the capture's legality test (`is_legal`) looks
+        // only for the sliders it uncovers, the capture removing the one pawn that
+        // could be giving check. Read as written, the capture left the king in check.
+        if pos.ep_square != Square::NONE {
+            let us = pos.side_to_move;
+            let them = !us;
+            let pushed = Square((pos.ep_square.0 as i8 - pawn_push(us)) as u8);
+            let leapers =
+                pos.piece_type_bb(PieceType::Knight, them) | pos.piece_type_bb(PieceType::Pawn, them);
+            let checkers = attackers_to_color(pos.king_sq(us), them, pos.occupied(), &pos.pieces);
+            if checkers & leapers & !pushed.bb() != 0 {
                 pos.ep_square = Square::NONE;
             }
         }
@@ -1865,6 +1889,18 @@ impl Position {
         let attackers = attackers_to_color(their_king, us, self.occupied(), &self.pieces);
         if attackers != 0 {
             return Err(FenParseError::OpponentKingInCheck);
+        }
+
+        // 6b. At most two checkers: a move gives check with the piece it moves and with
+        // the one it uncovers, never more. Move generation evades on that assumption.
+        let checkers = popcount(attackers_to_color(
+            self.king_sq(us),
+            them,
+            self.occupied(),
+            &self.pieces,
+        ));
+        if checkers > 2 {
+            return Err(FenParseError::TooManyCheckers { count: checkers });
         }
 
         // 7. Castling rights coherence (king on back rank, rook on its recorded square)
@@ -3179,6 +3215,37 @@ pub(crate) mod tests {
             Position::from_fen("4k3/8/8/8/8/8/8/r3K3 b - - 0 1"),
             Err(FenParseError::OpponentKingInCheck)
         ));
+    }
+
+    /// Three checkers is no position a game reaches; two is a double check. Found by
+    /// the `fen` fuzz target: the king on e6 was in check from d7, f7 and e7.
+    #[test]
+    fn test_fen_three_checkers_refused_two_accepted() {
+        assert!(matches!(
+            Position::from_fen("rnbqkbnr/ppppqppp/4K3/8/8/8/8/Q7 w - - 0 1"),
+            Err(FenParseError::TooManyCheckers { count: 3 })
+        ));
+        let double = Position::from_fen("4k3/8/8/8/8/5n2/8/4K2r w - - 0 1").unwrap();
+        assert_eq!(popcount(double.checkers), 2);
+    }
+
+    /// An en passant square stands beside a check only from the pawn that just moved:
+    /// with the king in check from d7, d2-d4 cannot have been the last move, and
+    /// exd3 would leave the check on. Found by the `fen` fuzz target.
+    #[test]
+    fn test_fen_ep_square_dropped_beside_another_pawn_check() {
+        let pos =
+            Position::from_fen("rnbqkbrn/pppP1ppp/8/8/3Pp3/8/PPP2PPP/RBNQKBNR b q d3 0 1").unwrap();
+        assert_eq!(pos.ep_square, Square::NONE);
+        let mut buf: ArrayBuf<Move, MAX_MOVES> = ArrayBuf::new();
+        let count = crate::movegen::generate_legal_moves(&pos, &mut buf);
+        assert!((0..count).all(|i| buf[i].move_type() != MT_EN_PASSANT));
+
+        // The pushed pawn itself giving check: the capture takes the checker.
+        let pos = Position::from_fen("8/8/8/4k3/3Pp3/8/8/4K3 b - d3 0 1").unwrap();
+        assert_eq!(pos.ep_square, Square::D3);
+        let count = crate::movegen::generate_legal_moves(&pos, &mut buf);
+        assert!((0..count).any(|i| buf[i].move_type() == MT_EN_PASSANT));
     }
 
     #[test]

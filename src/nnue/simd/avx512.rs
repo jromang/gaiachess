@@ -18,6 +18,8 @@ pub const I32_LANES: usize = 16;
 pub const F32_LANES: usize = 16;
 /// Emulated 512-bit dpbusd: one chain, same as AVX2.
 pub const DPBUSD_CHAINS: usize = 1;
+/// `mul_add_f32` is one fused instruction (one rounding).
+pub const MUL_ADD_FUSED: bool = true;
 
 // ============================================================
 // i16 operations (accumulator, FT activation)
@@ -53,14 +55,12 @@ pub unsafe fn min_i16(a: __m512i, b: __m512i) -> __m512i {
     _mm512_min_epi16(a, b)
 }
 
+/// The pairwise FT product `(left * right) >> 9` (`FT_SHIFT`), for `left` in
+/// `0..=FT_QUANT`: `mulhi(left << 7, right)`, the shift putting the product's bits
+/// 9 and up into the high half.
 #[inline(always)]
-pub unsafe fn shift_left_i16<const SHIFT: u32>(a: __m512i) -> __m512i {
-    _mm512_slli_epi16(a, SHIFT)
-}
-
-#[inline(always)]
-pub unsafe fn mul_high_i16(a: __m512i, b: __m512i) -> __m512i {
-    _mm512_mulhi_epi16(a, b)
+pub unsafe fn ft_product(left: __m512i, right: __m512i) -> __m512i {
+    _mm512_mulhi_epi16(_mm512_slli_epi16::<7>(left), right)
 }
 
 /// Pack two vectors of i16 → one vector of u8 (unsigned saturation).
@@ -75,12 +75,30 @@ pub unsafe fn permute(a: __m512i) -> __m512i {
     _mm512_permutexvar_epi64(_mm512_setr_epi64(0, 2, 4, 6, 1, 3, 5, 7), a)
 }
 
-/// Load I16_LANES (32) i8 values from `ptr` and sign-extend to i16.
-///
-/// Used for threat accumulator: i8 weights → i16 additions.
+/// Two registers of i16 from `2 * I16_LANES` bytes of each of two i8 rows,
+/// summed lane by lane: see the AVX2 form, which this widens to four 128-bit
+/// lanes. The interleaving is again the one `packus` undoes.
 #[inline(always)]
-pub unsafe fn load_i8_as_i16(ptr: *const i8) -> __m512i {
-    _mm512_cvtepi8_epi16(_mm256_loadu_si256(ptr as *const __m256i))
+pub unsafe fn widen_i8_pair(a: *const i8, b: *const i8) -> [__m512i; 2] {
+    let ones = _mm512_set1_epi8(1);
+    let wa = _mm512_loadu_si512(a as *const __m512i);
+    let wb = _mm512_loadu_si512(b as *const __m512i);
+    [
+        _mm512_maddubs_epi16(ones, _mm512_unpacklo_epi8(wa, wb)),
+        _mm512_maddubs_epi16(ones, _mm512_unpackhi_epi8(wa, wb)),
+    ]
+}
+
+/// One i8 row alone, in the order of [`widen_i8_pair`].
+#[inline(always)]
+pub unsafe fn widen_i8(a: *const i8) -> [__m512i; 2] {
+    let ones = _mm512_set1_epi8(1);
+    let zero = _mm512_setzero_si512();
+    let w = _mm512_loadu_si512(a as *const __m512i);
+    [
+        _mm512_maddubs_epi16(ones, _mm512_unpacklo_epi8(w, zero)),
+        _mm512_maddubs_epi16(ones, _mm512_unpackhi_epi8(w, zero)),
+    ]
 }
 
 /// Multiply pairs of adjacent i16 and accumulate into i32.
@@ -197,3 +215,36 @@ pub unsafe fn horizontal_sum(x: [__m512; 1]) -> f32 {
 
 /// Number of __m512 vectors needed for horizontal_sum input.
 pub const HSUM_VECS: usize = 1;
+
+// ============================================================
+// i32 operations (integer dense layers)
+// ============================================================
+
+/// Arithmetic right shift of every i32 lane: a floor division by `2^n`.
+#[inline(always)]
+pub unsafe fn srai_i32(a: __m512i, n: i32) -> __m512i {
+    _mm512_sra_epi32(a, _mm_cvtsi32_si128(n))
+}
+
+/// Clamp every i32 lane to `[lo, hi]`.
+#[inline(always)]
+pub unsafe fn clamp_i32(x: __m512i, lo: __m512i, hi: __m512i) -> __m512i {
+    _mm512_min_epi32(_mm512_max_epi32(x, lo), hi)
+}
+
+/// Low 32 bits of each lane's product.
+#[inline(always)]
+pub unsafe fn mullo_i32(a: __m512i, b: __m512i) -> __m512i {
+    _mm512_mullo_epi32(a, b)
+}
+
+/// Four registers of i32 in `0..=255` narrowed to one register of u8, in order:
+/// the lanes of `a`, then those of `b`, `c`, `d`. The two packs interleave the
+/// 128-bit lanes of the four inputs; one dword permute puts them back.
+#[inline(always)]
+pub unsafe fn narrow_u8(a: __m512i, b: __m512i, c: __m512i, d: __m512i) -> __m512i {
+    let packed = _mm512_packus_epi16(_mm512_packs_epi32(a, b), _mm512_packs_epi32(c, d));
+    // Dword `4l + k` holds the lanes `4l..4l+4` of input `k`: logical dword `4k + l`.
+    let order = _mm512_setr_epi32(0, 4, 8, 12, 1, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15);
+    _mm512_permutexvar_epi32(order, packed)
+}

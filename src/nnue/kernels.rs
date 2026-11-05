@@ -7,7 +7,7 @@
 //!
 //! Every hot NNUE loop lives in the `nnue_kernels!` macro below and is stamped
 //! out once per backend (`use <backend> as simd;`), because the backends do not
-//! share types: a kernel that walks `[_; L2_SIZE / simd::F32_LANES]` needs its
+//! share types: a kernel that walks `[_; L1_OUT / simd::I32_LANES]` needs its
 //! array length — and therefore its whole body — monomorphized per register
 //! width. Function-level granularity is what a runtime dispatch table can point
 //! into; primitive-level granularity could not be (the signatures differ).
@@ -16,32 +16,109 @@
 //! - `find_nnz` (in `forward.rs`): three genuinely different algorithms per ISA.
 //! - `threat512::threat_batch`: a hand-scheduled 16-ZMM tile; the macro
 //!   instances carry the same algorithm at `THREAT_REGISTERS` of the
-//!   backend's width (8 YMM on AVX2).
+//!   backend's width (8 YMM on AVX2, 16 Q registers on AArch64).
 //!
 //! Which instance runs is selected at compile time (`pub use ... as k`),
 //! mirroring the historical `#[cfg(target_feature)]` cascade.
 
-/// Number of SIMD registers held in flight by the Finny batch apply.
-/// Must divide L1_SIZE / I16_LANES for all SIMD widths — asserted per instance.
-pub(crate) const FINNY_REGISTERS: usize = 4;
-
 /// Number of SIMD registers held in flight by the generic threat-batch tile.
-/// Same divisor constraint as `FINNY_REGISTERS`. Eight matches a half-file of
-/// AVX2 YMMs and leaves room for the i8→i16 weight load; AVX-512 uses the
-/// dedicated 16-ZMM form instead.
+/// Must divide L1_SIZE / I16_LANES for all SIMD widths — asserted per instance —
+/// and be even: rows are widened into register pairs. Eight matches a half-file of
+/// AVX2 YMMs and leaves room for two weight loads and their widened pair; AVX-512
+/// uses the dedicated 16-ZMM form instead. AArch64 takes 16 of its 32 vector
+/// registers.
+#[cfg(not(target_arch = "aarch64"))]
 pub(crate) const THREAT_REGISTERS: usize = 8;
+#[cfg(target_arch = "aarch64")]
+pub(crate) const THREAT_REGISTERS: usize = 16;
+
+/// Signature of `combined_batch` in the dispatch tables: accumulator in and out,
+/// the piece-square rows added and removed, the threat and pawn-pair rows added and
+/// removed.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+pub(crate) type CombinedBatchFn = unsafe fn(
+    *const i16,
+    *mut i16,
+    *const crate::nnue::network::ThreatRow,
+    &[u32],
+    &[u32],
+    *const crate::nnue::network::ThreatRow,
+    &[u32],
+    &[u32],
+);
+
+/// Expands `$body` once per listed index, with `$K` bound to it as a constant.
+///
+/// A register tile — an array of vectors held across a loop over weight rows —
+/// stays in registers only if every access to it has a constant index. A `for`
+/// over the tile gives constant indices only once the compiler has chosen to
+/// unroll it completely, and that choice rests on a cost estimate that can be
+/// far off: LLVM prices each 512-bit byte unpack of `widen_i8_pair` at 19 when
+/// AVX512-VBMI is not enabled, for a single instruction, so without VBMI (the
+/// runtime-dispatched kernels of the universal build, AVX-512 CPUs before Ice
+/// Lake) it kept the pair loop rolled and the tile went to the stack — about
+/// 12 % of the engine's speed. Spelled out, the indices are constants whatever
+/// the estimate.
+macro_rules! unroll {
+    ($K:ident in [$($i:literal),+] $body:block) => {
+        $({
+            const $K: usize = $i;
+            $body
+        })+
+    };
+}
+
+/// Applies i8 weight rows of one sign to a tile of i16 registers.
+///
+/// Rows go two at a time through `widen_i8_pair`, which widens and sums both in
+/// one go (one shuffle per register for two rows on x86); an odd row out goes
+/// through `widen_i8`. Each call fills a pair of registers, so the tile is
+/// walked in register pairs, listed by `[$k]` (one entry per pair, see
+/// [`unroll`]). The rows are in logical order on every tier: the x86 forms
+/// interleave exactly as `packus` does, which lands logical bytes on the
+/// accumulator's packus-ordered lanes.
+///
+/// The sums are wrapping i16 throughout, so pairing rows leaves every lane
+/// equal to the row-at-a-time result.
+macro_rules! apply_i8_rows {
+    ($simd:ident, $regs:ident, $weights:expr, $base:expr, $rows:expr, $op:path,
+     [$($k:literal),+]) => {{
+        debug_assert_eq!(2 * [$($k),+].len(), $regs.len(), "one listed index per register pair");
+        let mut pairs = $rows.chunks_exact(2);
+        for pair in pairs.by_ref() {
+            let a = (*$weights.add(pair[0] as usize)).as_ptr().add($base);
+            let b = (*$weights.add(pair[1] as usize)).as_ptr().add($base);
+            unroll!(K in [$($k),+] {
+                let offset = 2 * K * $simd::I16_LANES;
+                let [lo, hi] = $simd::widen_i8_pair(a.add(offset), b.add(offset));
+                $regs[2 * K] = $op($regs[2 * K], lo);
+                $regs[2 * K + 1] = $op($regs[2 * K + 1], hi);
+            });
+        }
+        if let [row] = pairs.remainder() {
+            let a = (*$weights.add(*row as usize)).as_ptr().add($base);
+            unroll!(K in [$($k),+] {
+                let [lo, hi] = $simd::widen_i8(a.add(2 * K * $simd::I16_LANES));
+                $regs[2 * K] = $op($regs[2 * K], lo);
+                $regs[2 * K + 1] = $op($regs[2 * K + 1], hi);
+            });
+        }
+    }};
+}
 
 macro_rules! nnue_kernels {
-    ($backend:path $(, #[$tf:meta])?) => {
+    ($backend:path $(, #[$tf:meta])? $(, vbmi2: #[$tf2:meta])?) => {
         use $backend as simd;
-        use crate::nnue::accumulator::Accumulator;
         use crate::nnue::network::{self, Aligned};
-        use crate::nnue::{FT_QUANT, FT_SHIFT, L1_NORMALISATION, L1_SIZE, L2_SIZE, L3_SIZE};
+        use crate::nnue::{
+            A1_SIZE, FT_QUANT, FT_SHIFT, GATE_SHIFT, GATED, HIDDEN_MAX, L1_OUT, L1_SHIFT, L1_SIZE,
+            L1_SQR_CLAMP, L1_SQR_SHIFT, L2_OUT, L2_SHIFT, SKIP_NEG, SKIP_POS,
+        };
         use crate::types::Color;
 
-        const _: () = assert!(
-            L1_SIZE.is_multiple_of(crate::nnue::kernels::FINNY_REGISTERS * simd::I16_LANES)
-        );
+        const _: () = assert!(L1_OUT.is_multiple_of(simd::I32_LANES));
+        const _: () = assert!(GATED.is_multiple_of(simd::I32_LANES));
+        const _: () = assert!(A1_SIZE.is_multiple_of(4 * simd::I32_LANES));
         const _: () = assert!(
             L1_SIZE.is_multiple_of(crate::nnue::kernels::THREAT_REGISTERS * simd::I16_LANES)
         );
@@ -66,57 +143,63 @@ macro_rules! nnue_kernels {
         /// The two forms below are selected by a const-folded lane-count branch:
         /// the packus path needs real vector registers, the element loop does not.
         $(#[$tf])?
+        #[cfg(test)]
         #[inline]
         pub unsafe fn activate_ft(
-            pst_acc: &Accumulator,
-            combined: &Aligned<[[i16; L1_SIZE]; 2]>,
+            acc: &Aligned<[[i16; L1_SIZE]; 2]>,
             stm: Color,
         ) -> Aligned<[u8; L1_SIZE]> {
             let mut output = Aligned([0u8; L1_SIZE]);
+            activate_ft_into(acc, stm, output.0.as_mut_ptr());
+            output
+        }
+
+        /// [`activate_ft`] into a caller-provided buffer of `L1_SIZE` bytes, aligned
+        /// as `Aligned`, every byte written: the hot path hands it uninitialised
+        /// memory instead of a zeroed 1 KB returned by value.
+        $(#[$tf])?
+        #[inline]
+        pub unsafe fn activate_ft_into(
+            acc: &Aligned<[[i16; L1_SIZE]; 2]>,
+            stm: Color,
+            output: *mut u8,
+        ) {
             let half = L1_SIZE / 2;
 
             if simd::I16_LANES == 1 {
                 for flip in 0..2usize {
                     let pov = stm.index() ^ flip;
-                    let pst_vals = &pst_acc.values.0[pov];
-                    let comb_vals = &combined.0[pov];
+                    let vals = &acc.0[pov];
 
                     for i in 0..half {
-                        let left = (pst_vals[i] + comb_vals[i]).clamp(0, FT_QUANT);
+                        let left = vals[i].clamp(0, FT_QUANT);
                         // Right: asymmetric — only upper clamp (matches SIMD packus saturation)
-                        let right = (pst_vals[i + half] + comb_vals[i + half]).min(FT_QUANT);
+                        let right = vals[i + half].min(FT_QUANT);
                         let product =
                             ((left as i32 * right as i32) >> FT_SHIFT).clamp(0, 255) as u8;
-                        output.0[i + flip * half] = product;
+                        *output.add(i + flip * half) = product;
                     }
                 }
-                return output;
+                return;
             }
 
+            // `ft_product` bakes the shift in.
+            const _: () = assert!(FT_SHIFT == 9);
             let zero = simd::splat_i16(0);
             let one = simd::splat_i16(FT_QUANT);
 
             for flip in 0..2usize {
                 let pov = stm.index() ^ flip;
-                let pst_input = pst_acc.values.0[pov].as_ptr();
-                let comb_input = combined.0[pov].as_ptr();
+                let input = acc.0[pov].as_ptr();
 
                 for i in (0..half).step_by(2 * simd::I16_LANES) {
-                    // Load PST + threats for left half (two SIMD-width chunks)
-                    let pst_l1 = *pst_input.add(i).cast();
-                    let pst_l2 = *pst_input.add(i + simd::I16_LANES).cast();
-                    let comb_l1 = *comb_input.add(i).cast();
-                    let comb_l2 = *comb_input.add(i + simd::I16_LANES).cast();
-                    let lhs1 = simd::add_i16(pst_l1, comb_l1);
-                    let lhs2 = simd::add_i16(pst_l2, comb_l2);
+                    // Left half (two SIMD-width chunks)
+                    let lhs1 = *input.add(i).cast();
+                    let lhs2 = *input.add(i + simd::I16_LANES).cast();
 
-                    // Load PST + threats for right half
-                    let pst_r1 = *pst_input.add(i + half).cast();
-                    let pst_r2 = *pst_input.add(i + half + simd::I16_LANES).cast();
-                    let comb_r1 = *comb_input.add(i + half).cast();
-                    let comb_r2 = *comb_input.add(i + half + simd::I16_LANES).cast();
-                    let rhs1 = simd::add_i16(pst_r1, comb_r1);
-                    let rhs2 = simd::add_i16(pst_r2, comb_r2);
+                    // Right half
+                    let rhs1 = *input.add(i + half).cast();
+                    let rhs2 = *input.add(i + half + simd::I16_LANES).cast();
 
                     // Asymmetric clamp: left = [0, 255], right = (-∞, 255]
                     let lhs1_clipped = simd::clamp_i16(lhs1, zero, one);
@@ -124,64 +207,56 @@ macro_rules! nnue_kernels {
                     let rhs1_clipped = simd::min_i16(rhs1, one);
                     let rhs2_clipped = simd::min_i16(rhs2, one);
 
-                    // Pairwise product via mulhi trick: (left * right) >> FT_SHIFT (= 9)
-                    // mulhi(left << 7, right) = (left * right * 128) >> 16 = (left * right) >> 9
-                    let shifted1 = simd::shift_left_i16::<7>(lhs1_clipped);
-                    let shifted2 = simd::shift_left_i16::<7>(lhs2_clipped);
-
-                    let product1 = simd::mul_high_i16(shifted1, rhs1_clipped);
-                    let product2 = simd::mul_high_i16(shifted2, rhs2_clipped);
+                    // Pairwise product (left * right) >> FT_SHIFT, by a high-half multiply
+                    let product1 = simd::ft_product(lhs1_clipped, rhs1_clipped);
+                    let product2 = simd::ft_product(lhs2_clipped, rhs2_clipped);
 
                     // Pack i16 → u8 with unsigned saturation (negative products → 0).
                     // PST accumulators are pre-permuted so packus output is linear.
                     let packed = simd::packus(product1, product2);
-                    *output.0.as_mut_ptr().add(i + flip * half).cast() = packed;
+                    *output.add(i + flip * half).cast() = packed;
                 }
             }
-
-            output
         }
 
         // ============================================================
-        // L1: sparse matmul → CReLU+squared
+        // L1: sparse matmul
         // ============================================================
 
         /// L1 sparse inference: process only non-zero input groups.
         ///
-        /// Sparse u8[L1] × i8 weights → i32[L2_SIZE], dequantize, add bias.
-        /// Activation: CReLU+squared = `[clamp(x, 0, 1) ; clamp(x, 0, 1)²]` → f32[2×L2_SIZE].
-        ///
-        /// The two halves feed L2 (full 32 values) and provide the L3 skip connection.
+        /// Sparse u8[L1] × i8 weights (×128) → i32[L1_OUT], plus the bias: the raw
+        /// outputs, unit 2^14, which the skip connection reads before any activation.
         $(#[$tf])?
         #[inline]
         pub unsafe fn propagate_l1(
             params: &network::NNUEParams,
             ft_out: &Aligned<[u8; L1_SIZE]>,
             nnz: &[u16],
-            bucket: usize,
-        ) -> Aligned<[f32; 2 * L2_SIZE]> {
-
+            stack: usize,
+        ) -> Aligned<[i32; L1_OUT]> {
+            const N_VECS: usize = L1_OUT / simd::I32_LANES;
             let packed = ft_out.0.as_ptr() as *const i32;
-            let n_vecs = L2_SIZE / simd::F32_LANES;
-            let mut pre_act = [simd::zeroed_i32(); L2_SIZE / simd::F32_LANES];
+            let mut pre_act = [simd::zeroed_i32(); N_VECS];
 
             // One chain on emulated dpbusd (AVX2 / AVX-512). Three on native
-            // VNNI/`sdot`, whose ~5-cycle latency needs independent accumulators.
+            // VNNI/`sdot`, whose latency needs independent accumulators: two output
+            // registers each on AVX-512, six dpbusd in flight for its two ports.
             // i32 wrapping add is associative: the split does not change eval.
             if simd::DPBUSD_CHAINS == 1 {
                 for &idx16 in nnz {
                     let idx = idx16 as usize;
                     let input = simd::splat_i32(*packed.add(idx));
-                    let w = params.l1_weights.0[bucket][idx].as_ptr();
-                    for j in 0..n_vecs {
-                        let off = j * simd::F32_LANES * 4;
+                    let w = params.l1_weights.0[stack][idx].as_ptr();
+                    for j in 0..N_VECS {
+                        let off = j * simd::I32_LANES * 4;
                         pre_act[j] = simd::dpbusd(pre_act[j], input, *w.add(off).cast());
                     }
                 }
             } else {
-                let mut chain0 = [simd::zeroed_i32(); L2_SIZE / simd::F32_LANES];
-                let mut chain1 = [simd::zeroed_i32(); L2_SIZE / simd::F32_LANES];
-                let mut chain2 = [simd::zeroed_i32(); L2_SIZE / simd::F32_LANES];
+                let mut chain0 = [simd::zeroed_i32(); N_VECS];
+                let mut chain1 = [simd::zeroed_i32(); N_VECS];
+                let mut chain2 = [simd::zeroed_i32(); N_VECS];
 
                 let mut triples = nnz.chunks_exact(3);
                 for triple in &mut triples {
@@ -193,12 +268,12 @@ macro_rules! nnue_kernels {
                     let in1 = simd::splat_i32(*packed.add(idx1));
                     let in2 = simd::splat_i32(*packed.add(idx2));
 
-                    let w0 = params.l1_weights.0[bucket][idx0].as_ptr();
-                    let w1 = params.l1_weights.0[bucket][idx1].as_ptr();
-                    let w2 = params.l1_weights.0[bucket][idx2].as_ptr();
+                    let w0 = params.l1_weights.0[stack][idx0].as_ptr();
+                    let w1 = params.l1_weights.0[stack][idx1].as_ptr();
+                    let w2 = params.l1_weights.0[stack][idx2].as_ptr();
 
-                    for j in 0..n_vecs {
-                        let off = j * simd::F32_LANES * 4;
+                    for j in 0..N_VECS {
+                        let off = j * simd::I32_LANES * 4;
                         chain0[j] = simd::dpbusd(chain0[j], in0, *w0.add(off).cast());
                         chain1[j] = simd::dpbusd(chain1[j], in1, *w1.add(off).cast());
                         chain2[j] = simd::dpbusd(chain2[j], in2, *w2.add(off).cast());
@@ -209,166 +284,179 @@ macro_rules! nnue_kernels {
                 if !rem.is_empty() {
                     let idx = rem[0] as usize;
                     let input = simd::splat_i32(*packed.add(idx));
-                    let w = params.l1_weights.0[bucket][idx].as_ptr();
-                    for j in 0..n_vecs {
-                        let off = j * simd::F32_LANES * 4;
+                    let w = params.l1_weights.0[stack][idx].as_ptr();
+                    for j in 0..N_VECS {
+                        let off = j * simd::I32_LANES * 4;
                         chain0[j] = simd::dpbusd(chain0[j], input, *w.add(off).cast());
                     }
                 }
                 if rem.len() >= 2 {
                     let idx = rem[1] as usize;
                     let input = simd::splat_i32(*packed.add(idx));
-                    let w = params.l1_weights.0[bucket][idx].as_ptr();
-                    for j in 0..n_vecs {
-                        let off = j * simd::F32_LANES * 4;
+                    let w = params.l1_weights.0[stack][idx].as_ptr();
+                    for j in 0..N_VECS {
+                        let off = j * simd::I32_LANES * 4;
                         chain1[j] = simd::dpbusd(chain1[j], input, *w.add(off).cast());
                     }
                 }
 
-                for j in 0..n_vecs {
+                for j in 0..N_VECS {
                     pre_act[j] = simd::add_i32(simd::add_i32(chain0[j], chain1[j]), chain2[j]);
                 }
             }
 
-            // Dequantize + bias + CReLU+squared:
-            // output[j]          = clamp(x, 0, 1)          ← CReLU part
-            // output[j + L2_SIZE] = clamp(x, 0, 1)²         ← squared part
-            let mut output = Aligned([0.0f32; 2 * L2_SIZE]);
-            let zero = simd::zero_f32();
-            let one = simd::splat_f32(1.0);
-            let dequant = simd::splat_f32(L1_NORMALISATION);
-
-            for j in 0..n_vecs {
-                let biases = *params.l1_biases.0[bucket]
-                    .as_ptr()
-                    .add(j * simd::F32_LANES)
-                    .cast();
-                let val = simd::mul_add_f32(simd::convert_to_f32(pre_act[j]), dequant, biases);
-                let clamped = simd::clamp_f32(val, zero, one);
-                // squared = min(val², 1) using raw val (NOT clamped).
-                // For negative val: clamped²=0 is wrong; min(val²,1)>0 is correct.
-                let squared = simd::clamp_f32(simd::mul_f32(val, val), zero, one);
-
-                // CReLU output at j*F32_LANES, squared at L2_SIZE + j*F32_LANES
-                *output.0.as_mut_ptr().add(j * simd::F32_LANES).cast() = clamped;
-                *output.0.as_mut_ptr().add(L2_SIZE + j * simd::F32_LANES).cast() = squared;
+            let mut out = core::mem::MaybeUninit::<Aligned<[i32; L1_OUT]>>::uninit();
+            let dst = out.as_mut_ptr().cast::<i32>();
+            let biases = params.l1_biases.0[stack].as_ptr();
+            for j in 0..N_VECS {
+                let at = j * simd::I32_LANES;
+                *dst.add(at).cast() = simd::add_i32(pre_act[j], *biases.add(at).cast());
             }
-
-            output
+            out.assume_init()
         }
 
         // ============================================================
-        // L2: dense f32 FMA + squared activation
+        // L1 activation: [x², x] → u8
         // ============================================================
 
-        /// L2 dense layer: f32 matmul + bias → squared activation (SIMD splat+FMA).
+        /// The L1 activations: `min(127, x² >> 21)` for every output, then
+        /// `clamp(x >> 7, 0, 127)` for every output, as u8 (unit 128).
         ///
-        /// Input: f32[2×L2_SIZE] (the full CReLU+squared L1 output).
-        /// Weight layout: `[bucket][input=2×L2_SIZE][output=L3_SIZE]`.
-        /// Activation: `clamp(x, 0, 1)²` (identical to SCReLU).
-        ///
-        /// Same const-folded branch as `activate_ft`: the splat+FMA form is
-        /// pointless one element at a time, so one lane means the plain loop.
+        /// The square reads the raw output, negative or not; it is taken on `x`
+        /// clamped to ±2^14 first, where it already saturates, so it fits in i32.
+        $(#[$tf])?
+        #[inline]
+        pub unsafe fn activate_l1(l1: &Aligned<[i32; L1_OUT]>) -> Aligned<[u8; A1_SIZE]> {
+            const N_VECS: usize = L1_OUT / simd::I32_LANES;
+            let zero = simd::zeroed_i32();
+            let max = simd::splat_i32(HIDDEN_MAX);
+            let sqr_lo = simd::splat_i32(-L1_SQR_CLAMP);
+            let sqr_hi = simd::splat_i32(L1_SQR_CLAMP);
+            let mut acts = [simd::zeroed_i32(); 2 * N_VECS];
+            for j in 0..N_VECS {
+                let x = *l1.0.as_ptr().add(j * simd::I32_LANES).cast();
+                let xc = simd::clamp_i32(x, sqr_lo, sqr_hi);
+                let sqr = simd::srai_i32(simd::mullo_i32(xc, xc), L1_SQR_SHIFT);
+                acts[j] = simd::clamp_i32(sqr, zero, max);
+                acts[N_VECS + j] = simd::clamp_i32(simd::srai_i32(x, L1_SHIFT), zero, max);
+            }
+            let mut out = core::mem::MaybeUninit::<Aligned<[u8; A1_SIZE]>>::uninit();
+            let dst = out.as_mut_ptr().cast::<u8>();
+            for k in 0..A1_SIZE / (4 * simd::I32_LANES) {
+                *dst.add(k * 4 * simd::I32_LANES).cast() =
+                    simd::narrow_u8(acts[4 * k], acts[4 * k + 1], acts[4 * k + 2], acts[4 * k + 3]);
+            }
+            out.assume_init()
+        }
+
+        // ============================================================
+        // L2: dense dpbusd → gate
+        // ============================================================
+
+        /// L2 dense layer and its gate: u8[A1_SIZE] × i8 weights (×64) + bias →
+        /// gates `g` (outputs 0..32) and values `v` (32..64), each shifted to unit
+        /// 128, `g` clipped to [0, 127], `v` to [−127, 127]; returns
+        /// `h = (g · g · v) >> 14`, unit 128, signed.
         $(#[$tf])?
         #[inline]
         pub unsafe fn propagate_l2(
             params: &network::NNUEParams,
-            l1_out: &Aligned<[f32; 2 * L2_SIZE]>,
-            bucket: usize,
-        ) -> Aligned<[f32; L3_SIZE]> {
-            let mut output = Aligned([0.0f32; L3_SIZE]);
-
-            if simd::F32_LANES == 1 {
-                for j in 0..L3_SIZE {
-                    let mut sum = params.l2_biases.0[bucket][j];
-                    for i in 0..l1_out.0.len() {
-                        sum += params.l2_weights.0[bucket][i][j] * l1_out.0[i];
-                    }
-                    // L2 activation: SCReLU = clamp(x, 0, 1)²
-                    let clamped = sum.clamp(0.0, 1.0);
-                    output.0[j] = clamped * clamped;
-                }
-                return output;
-            }
-
-            // Init accumulators with biases
-            std::ptr::copy_nonoverlapping(
-                params.l2_biases.0[bucket].as_ptr(),
-                output.0.as_mut_ptr(),
-                L3_SIZE,
-            );
-
-            // Splat+FMA: broadcast each input, FMA across all L3_SIZE outputs
-            for i in 0..l1_out.0.len() {
-                let input = simd::splat_f32(l1_out.0[i]);
-                let w = params.l2_weights.0[bucket][i].as_ptr();
-                for j in (0..L3_SIZE).step_by(simd::F32_LANES) {
-                    let out: *mut _ = output.0.as_mut_ptr().add(j).cast();
-                    *out = simd::mul_add_f32(*w.add(j).cast(), input, *out);
+            a1: &Aligned<[u8; A1_SIZE]>,
+            stack: usize,
+        ) -> Aligned<[i32; GATED]> {
+            const N_VECS: usize = L2_OUT / simd::I32_LANES;
+            const G_VECS: usize = GATED / simd::I32_LANES;
+            let packed = a1.0.as_ptr() as *const i32;
+            // Two accumulator sets over the even and odd input groups: twice the
+            // independent chains for native dpbusd, the same sums.
+            let mut even = [simd::zeroed_i32(); N_VECS];
+            let mut odd = [simd::zeroed_i32(); N_VECS];
+            for g in (0..A1_SIZE / 4).step_by(2) {
+                let in0 = simd::splat_i32(*packed.add(g));
+                let in1 = simd::splat_i32(*packed.add(g + 1));
+                let w0 = params.l2_weights.0[stack][g].as_ptr();
+                let w1 = params.l2_weights.0[stack][g + 1].as_ptr();
+                for j in 0..N_VECS {
+                    let off = j * simd::I32_LANES * 4;
+                    even[j] = simd::dpbusd(even[j], in0, *w0.add(off).cast());
+                    odd[j] = simd::dpbusd(odd[j], in1, *w1.add(off).cast());
                 }
             }
 
-            // L2 activation: SCReLU = clamp(x, 0, 1)²
-            let zero = simd::zero_f32();
-            let one = simd::splat_f32(1.0);
-            for j in (0..L3_SIZE).step_by(simd::F32_LANES) {
-                let out: *mut _ = output.0.as_mut_ptr().add(j).cast();
-                let clamped = simd::clamp_f32(*out, zero, one);
-                *out = simd::mul_f32(clamped, clamped);
+            let biases = params.l2_biases.0[stack].as_ptr();
+            let zero = simd::zeroed_i32();
+            let max = simd::splat_i32(HIDDEN_MAX);
+            let min = simd::splat_i32(-HIDDEN_MAX);
+            let mut out = core::mem::MaybeUninit::<Aligned<[i32; GATED]>>::uninit();
+            let dst = out.as_mut_ptr().cast::<i32>();
+            for j in 0..G_VECS {
+                let gate_at = j * simd::I32_LANES;
+                let value_at = (G_VECS + j) * simd::I32_LANES;
+                let gate = simd::add_i32(
+                    simd::add_i32(even[j], odd[j]),
+                    *biases.add(gate_at).cast(),
+                );
+                let value = simd::add_i32(
+                    simd::add_i32(even[G_VECS + j], odd[G_VECS + j]),
+                    *biases.add(value_at).cast(),
+                );
+                let g = simd::clamp_i32(simd::srai_i32(gate, L2_SHIFT), zero, max);
+                let v = simd::clamp_i32(simd::srai_i32(value, L2_SHIFT), min, max);
+                let h = simd::srai_i32(simd::mullo_i32(simd::mullo_i32(g, g), v), GATE_SHIFT);
+                *dst.add(gate_at).cast() = h;
             }
-
-            output
+            out.assume_init()
         }
 
         // ============================================================
-        // L3: output with L1 skip connection
+        // L3: output
         // ============================================================
 
-        /// L3 output layer: `dot(concat(l2_out, l1_out), l3_weights) + bias` → scalar.
-        ///
-        /// Skip connection: L1 output (f32[2×L2_SIZE]) is concatenated with L2 output
-        /// (f32[L3_SIZE]). Total input: `L3_SIZE + 2×L2_SIZE = 64` floats.
-        /// Weights: `l3_weights[bucket][64]`.
+        /// L3 output layer: `dot(a1, wa) + dot(h, wh) + bias` → i32, unit 2^14.
+        /// The u8 activations go through dpbusd a whole register at a time; the
+        /// signed gated values through i32 products.
         $(#[$tf])?
         #[inline]
         pub unsafe fn propagate_l3(
             params: &network::NNUEParams,
-            l2_out: &Aligned<[f32; L3_SIZE]>,
-            l1_out: &Aligned<[f32; 2 * L2_SIZE]>,
-            bucket: usize,
-        ) -> f32 {
-
-            let l2_ptr = l2_out.0.as_ptr();
-            let l1_ptr = l1_out.0.as_ptr();
-            let weights = params.l3_weights.0[bucket].as_ptr();
-
-            let mut acc = [simd::zero_f32(); simd::HSUM_VECS];
-
-            // First half: l2_out[0..L3_SIZE] × weights[0..L3_SIZE]
-            for (lane, result) in acc.iter_mut().enumerate() {
-                for i in (0..L3_SIZE).step_by(simd::HSUM_VECS * simd::F32_LANES) {
-                    let off = i + lane * simd::F32_LANES;
-                    *result = simd::mul_add_f32(
-                        *weights.add(off).cast(),
-                        *l2_ptr.add(off).cast(),
-                        *result,
-                    );
-                }
+            a1: &Aligned<[u8; A1_SIZE]>,
+            h: &Aligned<[i32; GATED]>,
+            stack: usize,
+        ) -> i32 {
+            let wa = params.l3_weights_a.0[stack].as_ptr();
+            let wh = params.l3_weights_h.0[stack].as_ptr();
+            let mut acc = simd::zeroed_i32();
+            for k in 0..A1_SIZE / (4 * simd::I32_LANES) {
+                let at = k * 4 * simd::I32_LANES;
+                acc = simd::dpbusd(acc, *a1.0.as_ptr().add(at).cast(), *wa.add(at).cast());
             }
-
-            // Second half: l1_out[0..2*L2_SIZE] × weights[L3_SIZE..L3_SIZE+2*L2_SIZE]
-            for (lane, result) in acc.iter_mut().enumerate() {
-                for i in (0..(2 * L2_SIZE)).step_by(simd::HSUM_VECS * simd::F32_LANES) {
-                    let off = i + lane * simd::F32_LANES;
-                    *result = simd::mul_add_f32(
-                        *weights.add(L3_SIZE + off).cast(),
-                        *l1_ptr.add(off).cast(),
-                        *result,
-                    );
-                }
+            let mut acc_h = simd::zeroed_i32();
+            for j in 0..GATED / simd::I32_LANES {
+                let at = j * simd::I32_LANES;
+                acc_h = simd::add_i32(
+                    acc_h,
+                    simd::mullo_i32(*h.0.as_ptr().add(at).cast(), *wh.add(at).cast()),
+                );
             }
+            simd::horizontal_sum_i32(simd::add_i32(acc, acc_h)) + params.l3_biases.0[stack]
+        }
 
-            simd::horizontal_sum(acc) + params.l3_biases.0[bucket]
+        /// Everything after the sparse inputs are known: L1, its activation, L2 and
+        /// its gate, L3, plus the skip `l1[30] − l1[31]`. Unit 2^14.
+        $(#[$tf])?
+        #[inline]
+        pub unsafe fn dense_layers(
+            params: &network::NNUEParams,
+            ft_out: &Aligned<[u8; L1_SIZE]>,
+            nnz: &[u16],
+            stack: usize,
+        ) -> i32 {
+            debug_assert!(stack < crate::nnue::STACKS, "stack {stack}");
+            let l1 = propagate_l1(params, ft_out, nnz, stack);
+            let skip = l1.0[SKIP_POS].wrapping_sub(l1.0[SKIP_NEG]);
+            let a1 = activate_l1(&l1);
+            let h = propagate_l2(params, &a1, stack);
+            propagate_l3(params, &a1, &h, stack).wrapping_add(skip)
         }
 
         // ============================================================
@@ -376,7 +464,7 @@ macro_rules! nnue_kernels {
         // ============================================================
 
         /// Forward pass through the dense layers: FT activation → NNZ extraction
-        /// → sparse L1 → dense L2 → L3 with skip connection.
+        /// → sparse L1 → gated L2 → L3 with the skip. Unit 2^14.
         ///
         /// One composite entry point so the stages inline into each other; only
         /// `find_nnz` sits behind its own seam (its algorithm is chosen on an
@@ -385,12 +473,17 @@ macro_rules! nnue_kernels {
         #[inline]
         pub unsafe fn forward_dense(
             params: &network::NNUEParams,
-            pst_acc: &Accumulator,
-            combined: &Aligned<[[i16; L1_SIZE]; 2]>,
+            acc: &Aligned<[[i16; L1_SIZE]; 2]>,
             stm: Color,
-            bucket: usize,
-        ) -> f32 {
-            let ft_out = activate_ft(pst_acc, combined, stm);
+            stack: usize,
+        ) -> i32 {
+            // Both buffers are written in place, never zeroed nor copied: the
+            // activation fills every byte, `find_nnz` the first `nnz_count` slots.
+            let mut ft_buf = core::mem::MaybeUninit::<Aligned<[u8; L1_SIZE]>>::uninit();
+            activate_ft_into(acc, stm, ft_buf.as_mut_ptr().cast::<u8>());
+            let ft_out = ft_buf.assume_init_ref();
+            let mut nnz_indices =
+                core::mem::MaybeUninit::<[u16; crate::nnue::forward::NNZ_SIZE]>::uninit();
             // The nnz algorithm rides an axis of its own (VBMI2, not the register
             // width); when the build cannot pin it statically, one predicted
             // indirect call fetches it from the resolved table.
@@ -398,190 +491,192 @@ macro_rules! nnue_kernels {
                 not(target_arch = "x86_64"),
                 all(target_feature = "avx512bw", target_feature = "avx512vbmi2")
             ))]
-            let (nnz_indices, nnz_count) = crate::nnue::forward::find_nnz(&ft_out);
+            let nnz_count =
+                crate::nnue::forward::find_nnz(ft_out, nnz_indices.as_mut_ptr().cast::<u16>());
             #[cfg(all(
                 target_arch = "x86_64",
                 not(all(target_feature = "avx512bw", target_feature = "avx512vbmi2"))
             ))]
-            let (nnz_indices, nnz_count) = (crate::cpu::get().find_nnz)(&ft_out);
-            let l1_out = propagate_l1(params, &ft_out, &nnz_indices[..nnz_count], bucket);
-            let l2_out = propagate_l2(params, &l1_out, bucket);
-            propagate_l3(params, &l2_out, &l1_out, bucket)
+            let nnz_count =
+                (crate::cpu::get().find_nnz)(ft_out, nnz_indices.as_mut_ptr().cast::<u16>());
+            #[cfg(feature = "stats")]
+            crate::nnue::forward::tally_nnz(nnz_count);
+            debug_assert!(nnz_count <= L1_SIZE / 4, "nnz count {nnz_count}");
+            dense_layers(
+                params,
+                ft_out,
+                core::slice::from_raw_parts(nnz_indices.as_ptr().cast::<u16>(), nnz_count),
+                stack,
+            )
         }
 
-        // ============================================================
-        // PST accumulator kernels — step_by(I16_LANES) with pointer casts
-        // ============================================================
-
-        /// Normal move: one feature added, one removed.
-        $(#[$tf])?
+        $(
+        /// [`forward_dense`] on an AVX-512 CPU with VBMI2: the activation lists the
+        /// non-zero groups itself, so no pass reads the output back.
+        #[$tf2]
         #[inline]
-        pub unsafe fn acc_add1_sub1(
+        pub unsafe fn forward_dense_vbmi2(
             params: &network::NNUEParams,
-            prev: *const i16,
-            out: *mut i16,
-            add1: usize,
-            sub1: usize,
-        ) {
-            let vadd = params.ft_pst_weights.0[add1].as_ptr();
-            let vsub = params.ft_pst_weights.0[sub1].as_ptr();
-            for i in (0..L1_SIZE).step_by(simd::I16_LANES) {
-                let mut v = *prev.add(i).cast();
-                v = simd::add_i16(v, *vadd.add(i).cast());
-                v = simd::sub_i16(v, *vsub.add(i).cast());
-                *out.add(i).cast() = v;
-            }
+            acc: &Aligned<[[i16; L1_SIZE]; 2]>,
+            stm: Color,
+            stack: usize,
+        ) -> i32 {
+            let mut ft_buf = core::mem::MaybeUninit::<Aligned<[u8; L1_SIZE]>>::uninit();
+            let mut nnz_indices =
+                core::mem::MaybeUninit::<[u16; crate::nnue::forward::NNZ_SIZE]>::uninit();
+            let nnz_count = activate_ft_nnz_into(
+                acc,
+                stm,
+                ft_buf.as_mut_ptr().cast::<u8>(),
+                nnz_indices.as_mut_ptr().cast::<u16>(),
+            );
+            let ft_out = ft_buf.assume_init_ref();
+            #[cfg(feature = "stats")]
+            crate::nnue::forward::tally_nnz(nnz_count);
+            debug_assert!(nnz_count <= L1_SIZE / 4, "nnz count {nnz_count}");
+            dense_layers(
+                params,
+                ft_out,
+                core::slice::from_raw_parts(nnz_indices.as_ptr().cast::<u16>(), nnz_count),
+                stack,
+            )
         }
 
-        /// Capture / EP: one feature added, two removed.
-        $(#[$tf])?
-        #[inline]
-        pub unsafe fn acc_add1_sub2(
-            params: &network::NNUEParams,
-            prev: *const i16,
-            out: *mut i16,
-            add1: usize,
-            sub1: usize,
-            sub2: usize,
-        ) {
-            let vadd = params.ft_pst_weights.0[add1].as_ptr();
-            let vsub1 = params.ft_pst_weights.0[sub1].as_ptr();
-            let vsub2 = params.ft_pst_weights.0[sub2].as_ptr();
-            for i in (0..L1_SIZE).step_by(simd::I16_LANES) {
-                let mut v = *prev.add(i).cast();
-                v = simd::add_i16(v, *vadd.add(i).cast());
-                v = simd::sub_i16(v, *vsub1.add(i).cast());
-                v = simd::sub_i16(v, *vsub2.add(i).cast());
-                *out.add(i).cast() = v;
-            }
-        }
-
-        /// Castling: two features added, two removed.
-        $(#[$tf])?
-        #[inline]
-        pub unsafe fn acc_add2_sub2(
-            params: &network::NNUEParams,
-            prev: *const i16,
-            out: *mut i16,
-            add1: usize,
-            add2: usize,
-            sub1: usize,
-            sub2: usize,
-        ) {
-            let vadd1 = params.ft_pst_weights.0[add1].as_ptr();
-            let vadd2 = params.ft_pst_weights.0[add2].as_ptr();
-            let vsub1 = params.ft_pst_weights.0[sub1].as_ptr();
-            let vsub2 = params.ft_pst_weights.0[sub2].as_ptr();
-            for i in (0..L1_SIZE).step_by(simd::I16_LANES) {
-                let mut v = *prev.add(i).cast();
-                v = simd::add_i16(v, *vadd1.add(i).cast());
-                v = simd::add_i16(v, *vadd2.add(i).cast());
-                v = simd::sub_i16(v, *vsub1.add(i).cast());
-                v = simd::sub_i16(v, *vsub2.add(i).cast());
-                *out.add(i).cast() = v;
-            }
-        }
-
-        // ============================================================
-        // Finny table apply — register-blocked batched add/sub
-        // ============================================================
-
-        /// Apply batched feature additions and subtractions to a Finny cache entry.
+        /// [`activate_ft_into`], plus the indexes of the non-zero 4-byte groups
+        /// written to `nnz` (room for `NNZ_SIZE`, slots past the count clobbered);
+        /// returns their count.
         ///
-        /// Uses register blocking: loads FINNY_REGISTERS SIMD vectors, applies all
-        /// adds/subs, then stores back. This minimizes memory round-trips.
-        $(#[$tf])?
+        /// Each pair of packed registers is narrowed to one word per group
+        /// (`packs_epi32`: non-zero stays non-zero), tested, and the matching
+        /// indexes compressed out of a register (`VPCOMPRESSW`, VBMI2) and stored
+        /// whole. The list is in group order within each 128-bit lane, not sorted:
+        /// the sparse L1 sums in i32, where the order does not matter.
+        #[$tf2]
         #[inline]
-        pub unsafe fn finny_apply(
-            params: &network::NNUEParams,
-            values: *mut i16,
-            adds: &[usize],
-            subs: &[usize],
-        ) {
-            const REGS: usize = crate::nnue::kernels::FINNY_REGISTERS;
-            let mut regs: [_; REGS] = std::mem::zeroed();
+        pub unsafe fn activate_ft_nnz_into(
+            acc: &Aligned<[[i16; L1_SIZE]; 2]>,
+            stm: Color,
+            output: *mut u8,
+            nnz: *mut u16,
+        ) -> usize {
+            use core::arch::x86_64::*;
+            const _: () = assert!(simd::I16_LANES == 32);
+            const _: () = assert!(FT_SHIFT == 9);
+            let half = L1_SIZE / 2;
+            let zero = simd::splat_i16(0);
+            let one = simd::splat_i16(FT_QUANT);
+            // The group of each word of `packs_epi32(a, b)`: per 128-bit lane, four
+            // groups of `a`, then the same four of `b` (16 groups further on).
+            let lane_order = _mm512_set_epi16(
+                31, 30, 29, 28, 15, 14, 13, 12, 27, 26, 25, 24, 11, 10, 9, 8, 23, 22, 21, 20,
+                7, 6, 5, 4, 19, 18, 17, 16, 3, 2, 1, 0,
+            );
+            let mut count = 0usize;
 
-            for offset in (0..L1_SIZE).step_by(REGS * simd::I16_LANES) {
-                let out = values.add(offset);
+            for flip in 0..2usize {
+                let pov = stm.index() ^ flip;
+                let input = acc.0[pov].as_ptr();
+                let mut indexes =
+                    _mm512_add_epi16(lane_order, _mm512_set1_epi16((flip * half / 4) as i16));
 
-                // Load current values into registers
-                for (i, r) in regs.iter_mut().enumerate() {
-                    *r = *out.add(i * simd::I16_LANES).cast();
-                }
-
-                // Apply all additions
-                for &idx in adds {
-                    let w = params.ft_pst_weights.0[idx].as_ptr().add(offset);
-                    for (i, r) in regs.iter_mut().enumerate() {
-                        *r = simd::add_i16(*r, *w.add(i * simd::I16_LANES).cast());
+                for i in (0..half).step_by(4 * simd::I16_LANES) {
+                    let mut packed = [_mm512_setzero_si512(); 2];
+                    for k in 0..2 {
+                        let at = i + 2 * k * simd::I16_LANES;
+                        let lhs1 = simd::clamp_i16(*input.add(at).cast(), zero, one);
+                        let lhs2 =
+                            simd::clamp_i16(*input.add(at + simd::I16_LANES).cast(), zero, one);
+                        let rhs1 = simd::min_i16(*input.add(at + half).cast(), one);
+                        let rhs2 =
+                            simd::min_i16(*input.add(at + half + simd::I16_LANES).cast(), one);
+                        packed[k] = simd::packus(
+                            simd::ft_product(lhs1, rhs1),
+                            simd::ft_product(lhs2, rhs2),
+                        );
+                        *output.add(at + flip * half).cast() = packed[k];
                     }
-                }
 
-                // Apply all subtractions
-                for &idx in subs {
-                    let w = params.ft_pst_weights.0[idx].as_ptr().add(offset);
-                    for (i, r) in regs.iter_mut().enumerate() {
-                        *r = simd::sub_i16(*r, *w.add(i * simd::I16_LANES).cast());
-                    }
-                }
-
-                // Store back
-                for (i, r) in regs.into_iter().enumerate() {
-                    *out.add(i * simd::I16_LANES).cast() = r;
+                    let words = _mm512_packs_epi32(packed[0], packed[1]);
+                    let mask = _mm512_test_epi16_mask(words, words);
+                    debug_assert!(
+                        count + 32 <= crate::nnue::forward::NNZ_SIZE,
+                        "nnz store at {count}"
+                    );
+                    // A register store, not `compressstoreu`: the memory form is
+                    // microcoded on Zen 4.
+                    _mm512_storeu_si512(
+                        nnz.add(count).cast(),
+                        _mm512_maskz_compress_epi16(mask, indexes),
+                    );
+                    count += mask.count_ones() as usize;
+                    indexes = _mm512_add_epi16(indexes, _mm512_set1_epi16(32));
                 }
             }
+            debug_assert!(count <= L1_SIZE / 4, "nnz count {count}");
+            count
         }
+        )?
 
         // ============================================================
         // Threat accumulator batch apply — register-tiled form
         // ============================================================
 
         /// Extract indices of non-zero 4-byte groups from the FT output:
-        /// NNZ_TABLE walk over this backend's `nnz_bitmask` width.
+        /// NNZ_TABLE walk, one lookup per 8 groups.
         ///
         /// This is the portable form (scalar, NEON, wasm128); x86 vector tiers
         /// use the specialized forms in `forward.rs` (SSE stores / VPCOMPRESSW).
+        ///
+        /// Each lookup writes all 8 table slots and advances by the entry's
+        /// count, so no loop length depends on the data; the slots past the
+        /// count land in `NNZ_PAD` or are overwritten by the next lookup.
         $(#[$tf])?
         #[inline]
         pub unsafe fn find_nnz_generic(
             ft_out: &Aligned<[u8; L1_SIZE]>,
-        ) -> ([u16; crate::nnue::forward::NNZ_SIZE], usize) {
+            indexes: *mut u16,
+        ) -> usize {
             use crate::nnue::forward::{NNZ_SIZE, NNZ_TABLE};
 
-            let mut indexes = [0u16; NNZ_SIZE];
+            // Groups per step: at least one table byte, at least one vector.
+            const STEP: usize = if simd::I32_LANES > 8 { simd::I32_LANES } else { 8 };
+            const _: () = assert!(STEP % simd::I32_LANES == 0 && STEP % 8 == 0 && STEP <= 32);
+            const _: () = assert!((L1_SIZE / 4) % STEP == 0);
+
             let mut count = 0;
 
             let mut base: u16 = 0;
             let ptr = ft_out.0.as_ptr() as *const i32;
+            let out = indexes;
 
-            for chunk_start in (0..L1_SIZE / 4).step_by(simd::I32_LANES) {
-                let mask = simd::nnz_bitmask(*ptr.add(chunk_start).cast());
-
-                let mut remaining = mask;
-                let mut offset: u16 = 0;
-                while offset < simd::I32_LANES as u16 {
-                    let slice = (remaining & 0xFF) as usize;
-                    let entry = &NNZ_TABLE[slice];
-                    for k in 0..entry.count {
-                        indexes[count + k] = base + offset + entry.indexes[k];
-                    }
-                    count += entry.count;
-                    remaining >>= 8;
-                    offset += 8;
+            for chunk_start in (0..L1_SIZE / 4).step_by(STEP) {
+                let mut mask: u32 = 0;
+                for v in 0..STEP / simd::I32_LANES {
+                    let bits = simd::nnz_bitmask(*ptr.add(chunk_start + v * simd::I32_LANES).cast());
+                    mask |= u32::from(bits) << (v * simd::I32_LANES);
                 }
 
-                base += simd::I32_LANES as u16;
+                for byte in 0..STEP / 8 {
+                    let entry = &NNZ_TABLE[((mask >> (8 * byte)) & 0xFF) as usize];
+                    debug_assert!(count + 8 <= NNZ_SIZE, "nnz store at {count}");
+                    for k in 0..8 {
+                        *out.add(count + k) = base + entry.indexes[k];
+                    }
+                    count += entry.count;
+                    base += 8;
+                }
             }
 
-            (indexes, count)
+            debug_assert!(count <= L1_SIZE / 4, "nnz count {count}");
+            count
         }
 
         /// Batched threat-row accumulation: keep a tile of the accumulator in
         /// registers and apply every add/sub row against it, then store once.
         ///
-        /// Per element the arithmetic is wrapping i16, all subs then all adds —
-        /// the same order as a row-at-a-time walk, so the search node count is
-        /// unchanged. Tiling only reorders *which* elements are in flight.
+        /// Per element the arithmetic is wrapping i16, so neither the tiling nor
+        /// the pairing of rows (`apply_i8_rows`) can move a lane: the search node
+        /// count is that of a row-at-a-time walk.
         ///
         /// `input_acc`: source accumulator (null = zero-init for full recompute).
         /// `output_acc`: destination accumulator. In-place apply (same pointer
@@ -596,13 +691,18 @@ macro_rules! nnue_kernels {
         pub unsafe fn threat_batch(
             input_acc: *const i16,
             output_acc: *mut i16,
-            weights_base: *const [i8; L1_SIZE],
+            weights_base: *const crate::nnue::network::ThreatRow,
             adds: &[u32],
             subs: &[u32],
         ) {
             debug_assert!(!output_acc.is_null());
             const TILE: usize = crate::nnue::kernels::THREAT_REGISTERS;
             const TILE_ELEMS: usize = TILE * simd::I16_LANES;
+            // Register pairs, as listed to `apply_i8_rows`.
+            #[cfg(not(target_arch = "aarch64"))]
+            const _: () = assert!(TILE == 8);
+            #[cfg(target_arch = "aarch64")]
+            const _: () = assert!(TILE == 16);
 
             for tile in 0..(L1_SIZE / TILE_ELEMS) {
                 let base = tile * TILE_ELEMS;
@@ -613,19 +713,72 @@ macro_rules! nnue_kernels {
                     }
                 }
 
-                for &s in subs {
-                    let w_ptr = (*weights_base.add(s as usize)).as_ptr().add(base);
-                    for (j, r) in regs.iter_mut().enumerate() {
-                        let w = simd::load_i8_as_i16(w_ptr.add(j * simd::I16_LANES));
-                        *r = simd::sub_i16(*r, w);
-                    }
+                #[cfg(not(target_arch = "aarch64"))]
+                {
+                    apply_i8_rows!(simd, regs, weights_base, base, subs, simd::sub_i16, [0, 1, 2, 3]);
+                    apply_i8_rows!(simd, regs, weights_base, base, adds, simd::add_i16, [0, 1, 2, 3]);
                 }
-                for &a in adds {
-                    let w_ptr = (*weights_base.add(a as usize)).as_ptr().add(base);
-                    for (j, r) in regs.iter_mut().enumerate() {
-                        let w = simd::load_i8_as_i16(w_ptr.add(j * simd::I16_LANES));
-                        *r = simd::add_i16(*r, w);
-                    }
+                #[cfg(target_arch = "aarch64")]
+                {
+                    apply_i8_rows!(simd, regs, weights_base, base, subs, simd::sub_i16,
+                                   [0, 1, 2, 3, 4, 5, 6, 7]);
+                    apply_i8_rows!(simd, regs, weights_base, base, adds, simd::add_i16,
+                                   [0, 1, 2, 3, 4, 5, 6, 7]);
+                }
+
+                for (i, r) in regs.into_iter().enumerate() {
+                    *output_acc.add(base + i * simd::I16_LANES).cast() = r;
+                }
+            }
+        }
+
+        /// One tile pass for a whole update of a perspective: the piece-square,
+        /// threat and pawn-pair rows (all i8) a move changes, applied to `input_acc`
+        /// and stored in `output_acc` (the same pointer twice is allowed). The
+        /// accumulator is read and written once.
+        ///
+        /// Wrapping i16 as in `threat_batch`: the order of the rows moves no lane.
+        $(#[$tf])?
+        #[inline]
+        #[allow(clippy::too_many_arguments)]
+        pub unsafe fn combined_batch(
+            input_acc: *const i16,
+            output_acc: *mut i16,
+            psq_base: *const crate::nnue::network::ThreatRow,
+            psq_adds: &[u32],
+            psq_subs: &[u32],
+            weights_base: *const crate::nnue::network::ThreatRow,
+            adds: &[u32],
+            subs: &[u32],
+        ) {
+            debug_assert!(!input_acc.is_null() && !output_acc.is_null());
+            const TILE: usize = crate::nnue::kernels::THREAT_REGISTERS;
+            const TILE_ELEMS: usize = TILE * simd::I16_LANES;
+
+            for tile in 0..(L1_SIZE / TILE_ELEMS) {
+                let base = tile * TILE_ELEMS;
+                let mut regs: [_; TILE] = std::mem::zeroed();
+                for i in 0..TILE {
+                    regs[i] = *input_acc.add(base + i * simd::I16_LANES).cast();
+                }
+
+                #[cfg(not(target_arch = "aarch64"))]
+                {
+                    apply_i8_rows!(simd, regs, psq_base, base, psq_subs, simd::sub_i16, [0, 1, 2, 3]);
+                    apply_i8_rows!(simd, regs, psq_base, base, psq_adds, simd::add_i16, [0, 1, 2, 3]);
+                    apply_i8_rows!(simd, regs, weights_base, base, subs, simd::sub_i16, [0, 1, 2, 3]);
+                    apply_i8_rows!(simd, regs, weights_base, base, adds, simd::add_i16, [0, 1, 2, 3]);
+                }
+                #[cfg(target_arch = "aarch64")]
+                {
+                    apply_i8_rows!(simd, regs, psq_base, base, psq_subs, simd::sub_i16,
+                                   [0, 1, 2, 3, 4, 5, 6, 7]);
+                    apply_i8_rows!(simd, regs, psq_base, base, psq_adds, simd::add_i16,
+                                   [0, 1, 2, 3, 4, 5, 6, 7]);
+                    apply_i8_rows!(simd, regs, weights_base, base, subs, simd::sub_i16,
+                                   [0, 1, 2, 3, 4, 5, 6, 7]);
+                    apply_i8_rows!(simd, regs, weights_base, base, adds, simd::add_i16,
+                                   [0, 1, 2, 3, 4, 5, 6, 7]);
                 }
 
                 for (i, r) in regs.into_iter().enumerate() {
@@ -658,7 +811,7 @@ pub mod threat512 {
     pub unsafe fn threat_batch(
         input_acc: *const i16,
         output_acc: *mut i16,
-        weights_base: *const [i8; L1_SIZE],
+        weights_base: *const crate::nnue::network::ThreatRow,
         adds: &[u32],
         subs: &[u32],
     ) {
@@ -682,20 +835,98 @@ pub mod threat512 {
                 }
             }
 
-            for &s in subs {
-                let w_ptr = (*weights_base.add(s as usize)).as_ptr().add(base);
-                for j in 0..TILE {
-                    let w = simd::load_i8_as_i16(w_ptr.add(j * 32));
-                    regs[j] = simd::sub_i16(regs[j], w);
-                }
+            // Eight register pairs for the 16-ZMM tile.
+            apply_i8_rows!(
+                simd,
+                regs,
+                weights_base,
+                base,
+                subs,
+                simd::sub_i16,
+                [0, 1, 2, 3, 4, 5, 6, 7]
+            );
+            apply_i8_rows!(
+                simd,
+                regs,
+                weights_base,
+                base,
+                adds,
+                simd::add_i16,
+                [0, 1, 2, 3, 4, 5, 6, 7]
+            );
+
+            for i in 0..TILE {
+                _mm512_storeu_si512(output_acc.add(base + i * 32) as *mut __m512i, regs[i]);
             }
-            for &a in adds {
-                let w_ptr = (*weights_base.add(a as usize)).as_ptr().add(base);
-                for j in 0..TILE {
-                    let w = simd::load_i8_as_i16(w_ptr.add(j * 32));
-                    regs[j] = simd::add_i16(regs[j], w);
-                }
+        }
+    }
+
+    /// [`threat_batch`] with the move's piece-square rows (i8) applied in the same
+    /// tile pass: one read and one write of the accumulator per update.
+    #[cfg_attr(
+        not(all(target_feature = "avx512f", target_feature = "avx512bw")),
+        target_feature(enable = "avx512f,avx512bw")
+    )]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn combined_batch(
+        input_acc: *const i16,
+        output_acc: *mut i16,
+        psq_base: *const crate::nnue::network::ThreatRow,
+        psq_adds: &[u32],
+        psq_subs: &[u32],
+        weights_base: *const crate::nnue::network::ThreatRow,
+        adds: &[u32],
+        subs: &[u32],
+    ) {
+        use std::arch::x86_64::*;
+        debug_assert!(!input_acc.is_null() && !output_acc.is_null());
+        const TILE: usize = 16;
+        const TILE_ELEMS: usize = TILE * 32;
+        const _: () = assert!(L1_SIZE % TILE_ELEMS == 0);
+
+        for tile in 0..(L1_SIZE / TILE_ELEMS) {
+            let base = tile * TILE_ELEMS;
+            let mut regs: [__m512i; TILE] = [_mm512_setzero_si512(); TILE];
+            for i in 0..TILE {
+                regs[i] = _mm512_loadu_si512(input_acc.add(base + i * 32) as *const __m512i);
             }
+
+            apply_i8_rows!(
+                simd,
+                regs,
+                psq_base,
+                base,
+                psq_subs,
+                simd::sub_i16,
+                [0, 1, 2, 3, 4, 5, 6, 7]
+            );
+            apply_i8_rows!(
+                simd,
+                regs,
+                psq_base,
+                base,
+                psq_adds,
+                simd::add_i16,
+                [0, 1, 2, 3, 4, 5, 6, 7]
+            );
+            apply_i8_rows!(
+                simd,
+                regs,
+                weights_base,
+                base,
+                subs,
+                simd::sub_i16,
+                [0, 1, 2, 3, 4, 5, 6, 7]
+            );
+            apply_i8_rows!(
+                simd,
+                regs,
+                weights_base,
+                base,
+                adds,
+                simd::add_i16,
+                [0, 1, 2, 3, 4, 5, 6, 7]
+            );
 
             for i in 0..TILE {
                 _mm512_storeu_si512(output_acc.add(base + i * 32) as *mut __m512i, regs[i]);
@@ -710,7 +941,7 @@ pub mod threat512 {
 // backend's features, in which case the attribute is dropped and the kernels
 // inline exactly as a plain per-target build would.
 // (Runtime priority mirrors the historical cascade: AVX-512+VNNI > AVX-512 >
-//  AVX2 > NEON > wasm simd128 > scalar.)
+//  AVX2+AVX-VNNI > AVX2 > NEON > wasm simd128 > scalar.)
 // ============================================================
 
 #[cfg(target_arch = "x86_64")]
@@ -727,6 +958,17 @@ pub mod k_vnni512 {
                 target_feature = "avx512vnni"
             )),
             target_feature(enable = "avx2,fma,avx512f,avx512bw,avx512vnni")
+        )],
+        vbmi2: #[cfg_attr(
+            not(all(
+                target_feature = "avx2",
+                target_feature = "fma",
+                target_feature = "avx512f",
+                target_feature = "avx512bw",
+                target_feature = "avx512vnni",
+                target_feature = "avx512vbmi2"
+            )),
+            target_feature(enable = "avx2,fma,avx512f,avx512bw,avx512vnni,avx512vbmi2")
         )]
     );
 }
@@ -744,6 +986,32 @@ pub mod k_avx512 {
                 target_feature = "avx512bw"
             )),
             target_feature(enable = "avx2,fma,avx512f,avx512bw")
+        )],
+        vbmi2: #[cfg_attr(
+            not(all(
+                target_feature = "avx2",
+                target_feature = "fma",
+                target_feature = "avx512f",
+                target_feature = "avx512bw",
+                target_feature = "avx512vbmi2"
+            )),
+            target_feature(enable = "avx2,fma,avx512f,avx512bw,avx512vbmi2")
+        )]
+    );
+}
+
+#[cfg(target_arch = "x86_64")]
+#[allow(dead_code)]
+pub mod k_avxvnni {
+    nnue_kernels!(
+        crate::nnue::simd::avxvnni,
+        #[cfg_attr(
+            not(all(
+                target_feature = "avx2",
+                target_feature = "fma",
+                target_feature = "avxvnni"
+            )),
+            target_feature(enable = "avx2,fma,avxvnni")
         )]
     );
 }
@@ -784,9 +1052,24 @@ pub mod k_dotprod {
     );
 }
 
+// The scalar kernels of an aarch64 build, for tests: the vector tiers must match
+// them bit for bit.
+#[cfg(all(test, target_arch = "aarch64", target_feature = "neon"))]
+#[allow(dead_code)]
+pub mod k_scalar {
+    nnue_kernels!(crate::nnue::simd::scalar);
+}
+
 #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
 pub mod k_native {
     nnue_kernels!(crate::nnue::simd::wasm128);
+}
+
+// The scalar instance of a simd128 build, so tests can hold it against `k_native`.
+#[cfg(all(test, target_arch = "wasm32", target_feature = "simd128"))]
+#[allow(dead_code)]
+pub mod k_scalar {
+    nnue_kernels!(crate::nnue::simd::scalar);
 }
 
 #[cfg(not(any(
@@ -805,9 +1088,17 @@ pub mod k_native {
 #[cfg(all(
     target_arch = "x86_64",
     target_feature = "avx2",
+    not(target_feature = "avxvnni"),
     not(target_feature = "avx512f")
 ))]
 pub(crate) use k_avx2 as k;
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx2",
+    target_feature = "avxvnni",
+    not(target_feature = "avx512f")
+))]
+pub(crate) use k_avxvnni as k;
 #[cfg(all(
     target_arch = "x86_64",
     target_feature = "avx512f",
@@ -833,12 +1124,15 @@ pub(crate) use k_scalar as k;
 ))]
 pub(crate) use k_vnni512 as k;
 
+// Private: the layout these assume is the build target's, not the resolved tier's.
+// Everything outside this module goes through `dispatch`, which picks the one that
+// matches the weights (a universal build on AVX-512 would otherwise apply AVX2 rows).
 #[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f")))]
-pub(crate) use k::threat_batch;
+use k::{combined_batch, threat_batch};
 /// Threat batch apply for the current build target: the hand-scheduled 16-ZMM
 /// form when AVX-512 is available, the tiled generic form otherwise.
 #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
-pub(crate) use threat512::threat_batch;
+use threat512::{combined_batch, threat_batch};
 
 /// True when the build target already guarantees the whole top-tier feature
 /// set, so the resolver could never pick anything else: the dispatch helpers
@@ -869,26 +1163,16 @@ pub(crate) const STATIC_TOP: bool = false;
 /// `STATIC_TOP` on x86-64.
 #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
 pub mod arm {
-    use super::{k_dotprod, k_neon};
+    use super::{CombinedBatchFn, k_dotprod, k_neon};
     use crate::nnue::L1_SIZE;
-    use crate::nnue::accumulator::Accumulator;
     use crate::nnue::network::{Aligned, NNUEParams};
     use crate::types::Color;
     use std::sync::OnceLock;
 
     pub struct Table {
-        pub forward_dense: unsafe fn(
-            &NNUEParams,
-            &Accumulator,
-            &Aligned<[[i16; L1_SIZE]; 2]>,
-            Color,
-            usize,
-        ) -> f32,
-        pub acc_add1_sub1: unsafe fn(&NNUEParams, *const i16, *mut i16, usize, usize),
-        pub acc_add1_sub2: unsafe fn(&NNUEParams, *const i16, *mut i16, usize, usize, usize),
-        pub acc_add2_sub2: unsafe fn(&NNUEParams, *const i16, *mut i16, usize, usize, usize, usize),
-        pub finny_apply: unsafe fn(&NNUEParams, *mut i16, &[usize], &[usize]),
-        pub threat_batch: unsafe fn(*const i16, *mut i16, *const [i8; L1_SIZE], &[u32], &[u32]),
+        pub forward_dense: unsafe fn(&NNUEParams, &Aligned<[[i16; L1_SIZE]; 2]>, Color, usize) -> i32,
+        pub threat_batch: unsafe fn(*const i16, *mut i16, *const crate::nnue::network::ThreatRow, &[u32], &[u32]),
+        pub combined_batch: CombinedBatchFn,
         pub dotprod: bool,
         #[allow(dead_code)]
         pub forced: bool,
@@ -931,22 +1215,16 @@ pub mod arm {
         if use_dot {
             Table {
                 forward_dense: k_dotprod::forward_dense,
-                acc_add1_sub1: k_dotprod::acc_add1_sub1,
-                acc_add1_sub2: k_dotprod::acc_add1_sub2,
-                acc_add2_sub2: k_dotprod::acc_add2_sub2,
-                finny_apply: k_dotprod::finny_apply,
                 threat_batch: k_dotprod::threat_batch,
+                combined_batch: k_dotprod::combined_batch,
                 dotprod: true,
                 forced,
             }
         } else {
             Table {
                 forward_dense: k_neon::forward_dense,
-                acc_add1_sub1: k_neon::acc_add1_sub1,
-                acc_add1_sub2: k_neon::acc_add1_sub2,
-                acc_add2_sub2: k_neon::acc_add2_sub2,
-                finny_apply: k_neon::finny_apply,
                 threat_batch: k_neon::threat_batch,
+                combined_batch: k_neon::combined_batch,
                 dotprod: false,
                 forced,
             }
@@ -991,164 +1269,42 @@ pub mod arm {
 
 pub(crate) mod dispatch {
     use crate::nnue::L1_SIZE;
-    use crate::nnue::accumulator::Accumulator;
     use crate::nnue::network::{Aligned, NNUEParams};
     use crate::types::Color;
 
-    /// Forward pass through the dense layers, on the resolved tier.
+    /// Forward pass through the dense layers, on the resolved tier: the network's
+    /// output, unit 2^14.
     #[inline(always)]
     pub unsafe fn forward_dense(
         params: &NNUEParams,
-        pst_acc: &Accumulator,
-        combined: &Aligned<[[i16; L1_SIZE]; 2]>,
+        acc: &Aligned<[[i16; L1_SIZE]; 2]>,
         stm: Color,
-        bucket: usize,
-    ) -> f32 {
+        stack: usize,
+    ) -> i32 {
         #[cfg(target_arch = "x86_64")]
         {
+            // A target that pins VBMI2 as well lists the non-zero groups in the activation.
+            #[cfg(all(target_feature = "avx512vnni", target_feature = "avx512vbmi2"))]
+            let top = super::k::forward_dense_vbmi2;
+            #[cfg(not(all(target_feature = "avx512vnni", target_feature = "avx512vbmi2")))]
+            let top = super::k::forward_dense;
             if super::STATIC_TOP {
-                super::k::forward_dense(params, pst_acc, combined, stm, bucket)
+                top(params, acc, stm, stack)
             } else {
-                (crate::cpu::get().forward_dense)(params, pst_acc, combined, stm, bucket)
+                (crate::cpu::get().forward_dense)(params, acc, stm, stack)
             }
         }
         #[cfg(target_arch = "aarch64")]
         {
             if super::STATIC_TOP {
-                super::k::forward_dense(params, pst_acc, combined, stm, bucket)
+                super::k::forward_dense(params, acc, stm, stack)
             } else {
-                (super::arm::get().forward_dense)(params, pst_acc, combined, stm, bucket)
+                (super::arm::get().forward_dense)(params, acc, stm, stack)
             }
         }
         #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
         {
-            super::k::forward_dense(params, pst_acc, combined, stm, bucket)
-        }
-    }
-
-    /// Normal move: one feature added, one removed.
-    #[inline(always)]
-    pub unsafe fn acc_add1_sub1(
-        params: &NNUEParams,
-        prev: *const i16,
-        out: *mut i16,
-        add1: usize,
-        sub1: usize,
-    ) {
-        #[cfg(target_arch = "x86_64")]
-        {
-            if super::STATIC_TOP {
-                super::k::acc_add1_sub1(params, prev, out, add1, sub1)
-            } else {
-                (crate::cpu::get().acc_add1_sub1)(params, prev, out, add1, sub1)
-            }
-        }
-        #[cfg(target_arch = "aarch64")]
-        {
-            if super::STATIC_TOP {
-                super::k::acc_add1_sub1(params, prev, out, add1, sub1)
-            } else {
-                (super::arm::get().acc_add1_sub1)(params, prev, out, add1, sub1)
-            }
-        }
-        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-        {
-            super::k::acc_add1_sub1(params, prev, out, add1, sub1)
-        }
-    }
-
-    /// Capture / EP: one feature added, two removed.
-    #[inline(always)]
-    pub unsafe fn acc_add1_sub2(
-        params: &NNUEParams,
-        prev: *const i16,
-        out: *mut i16,
-        add1: usize,
-        sub1: usize,
-        sub2: usize,
-    ) {
-        #[cfg(target_arch = "x86_64")]
-        {
-            if super::STATIC_TOP {
-                super::k::acc_add1_sub2(params, prev, out, add1, sub1, sub2)
-            } else {
-                (crate::cpu::get().acc_add1_sub2)(params, prev, out, add1, sub1, sub2)
-            }
-        }
-        #[cfg(target_arch = "aarch64")]
-        {
-            if super::STATIC_TOP {
-                super::k::acc_add1_sub2(params, prev, out, add1, sub1, sub2)
-            } else {
-                (super::arm::get().acc_add1_sub2)(params, prev, out, add1, sub1, sub2)
-            }
-        }
-        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-        {
-            super::k::acc_add1_sub2(params, prev, out, add1, sub1, sub2)
-        }
-    }
-
-    /// Castling: two features added, two removed.
-    #[inline(always)]
-    pub unsafe fn acc_add2_sub2(
-        params: &NNUEParams,
-        prev: *const i16,
-        out: *mut i16,
-        add1: usize,
-        add2: usize,
-        sub1: usize,
-        sub2: usize,
-    ) {
-        #[cfg(target_arch = "x86_64")]
-        {
-            if super::STATIC_TOP {
-                super::k::acc_add2_sub2(params, prev, out, add1, add2, sub1, sub2)
-            } else {
-                (crate::cpu::get().acc_add2_sub2)(params, prev, out, add1, add2, sub1, sub2)
-            }
-        }
-        #[cfg(target_arch = "aarch64")]
-        {
-            if super::STATIC_TOP {
-                super::k::acc_add2_sub2(params, prev, out, add1, add2, sub1, sub2)
-            } else {
-                (super::arm::get().acc_add2_sub2)(params, prev, out, add1, add2, sub1, sub2)
-            }
-        }
-        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-        {
-            super::k::acc_add2_sub2(params, prev, out, add1, add2, sub1, sub2)
-        }
-    }
-
-    /// Finny-table register-blocked batch apply.
-    #[inline(always)]
-    pub unsafe fn finny_apply(
-        params: &NNUEParams,
-        values: *mut i16,
-        adds: &[usize],
-        subs: &[usize],
-    ) {
-        #[cfg(target_arch = "x86_64")]
-        {
-            if super::STATIC_TOP {
-                super::k::finny_apply(params, values, adds, subs)
-            } else {
-                (crate::cpu::get().finny_apply)(params, values, adds, subs)
-            }
-        }
-        #[cfg(target_arch = "aarch64")]
-        {
-            if super::STATIC_TOP {
-                super::k::finny_apply(params, values, adds, subs)
-            } else {
-                (super::arm::get().finny_apply)(params, values, adds, subs)
-            }
-        }
-        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-        {
-            super::k::finny_apply(params, values, adds, subs)
+            super::k::forward_dense(params, acc, stm, stack)
         }
     }
 
@@ -1157,7 +1313,7 @@ pub(crate) mod dispatch {
     pub unsafe fn threat_batch(
         input_acc: *const i16,
         output_acc: *mut i16,
-        weights_base: *const [i8; L1_SIZE],
+        weights_base: *const crate::nnue::network::ThreatRow,
         adds: &[u32],
         subs: &[u32],
     ) {
@@ -1180,6 +1336,51 @@ pub(crate) mod dispatch {
         #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
         {
             super::threat_batch(input_acc, output_acc, weights_base, adds, subs)
+        }
+    }
+
+    /// One tile pass applying a move's piece-square, threat and pawn-pair rows.
+    #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn combined_batch(
+        input_acc: *const i16,
+        output_acc: *mut i16,
+        pst_base: *const crate::nnue::network::ThreatRow,
+        pst_adds: &[u32],
+        pst_subs: &[u32],
+        weights_base: *const crate::nnue::network::ThreatRow,
+        adds: &[u32],
+        subs: &[u32],
+    ) {
+        #[cfg(target_arch = "x86_64")]
+        {
+            if super::STATIC_TOP {
+                super::combined_batch(
+                    input_acc, output_acc, pst_base, pst_adds, pst_subs, weights_base, adds, subs,
+                )
+            } else {
+                (crate::cpu::get().combined_batch)(
+                    input_acc, output_acc, pst_base, pst_adds, pst_subs, weights_base, adds, subs,
+                )
+            }
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            if super::STATIC_TOP {
+                super::combined_batch(
+                    input_acc, output_acc, pst_base, pst_adds, pst_subs, weights_base, adds, subs,
+                )
+            } else {
+                (super::arm::get().combined_batch)(
+                    input_acc, output_acc, pst_base, pst_adds, pst_subs, weights_base, adds, subs,
+                )
+            }
+        }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        {
+            super::combined_batch(
+                input_acc, output_acc, pst_base, pst_adds, pst_subs, weights_base, adds, subs,
+            )
         }
     }
 }
@@ -1221,6 +1422,18 @@ mod tests {
     /// the left, kept on the right), values above `FT_QUANT`, products that
     /// saturate the unsigned pack. Kept well inside i16 so the addition in the
     /// reference cannot overflow.
+    /// The single accumulator the kernels read: the two test inputs summed as the
+    /// engine sums its features, wrapping.
+    fn fused(pst: &Accumulator, comb: &Aligned<[[i16; L1_SIZE]; 2]>) -> Aligned<[[i16; L1_SIZE]; 2]> {
+        let mut out = Aligned([[0i16; L1_SIZE]; 2]);
+        for pov in 0..2 {
+            for i in 0..L1_SIZE {
+                out.0[pov][i] = pst.values.0[pov][i].wrapping_add(comb.0[pov][i]);
+            }
+        }
+        out
+    }
+
     fn test_inputs() -> (Accumulator, Aligned<[[i16; L1_SIZE]; 2]>) {
         let mut pst_acc = Accumulator::new();
         let mut combined = Aligned([[0i16; L1_SIZE]; 2]);
@@ -1280,26 +1493,31 @@ mod tests {
         for stm in [Color::White, Color::Black] {
             let want = activate_reference(&lin_pst, &lin_comb, stm);
 
-            let got = unsafe { k_scalar::activate_ft(&lin_pst, &lin_comb, stm) };
+            let got = unsafe { k_scalar::activate_ft(&fused(&lin_pst, &lin_comb), stm) };
             assert_activation_matches("scalar", &got, &want);
 
             if std::arch::is_x86_feature_detected!("avx2")
                 && std::arch::is_x86_feature_detected!("fma")
             {
                 let (pst, comb) = inputs_permuted_for(PermKind::Avx2);
-                let got = unsafe { k_avx2::activate_ft(&pst, &comb, stm) };
+                let got = unsafe { k_avx2::activate_ft(&fused(&pst, &comb), stm) };
                 assert_activation_matches("avx2", &got, &want);
+
+                if std::arch::is_x86_feature_detected!("avxvnni") {
+                    let got = unsafe { k_avxvnni::activate_ft(&fused(&pst, &comb), stm) };
+                    assert_activation_matches("avxvnni", &got, &want);
+                }
             }
 
             if std::arch::is_x86_feature_detected!("avx512f")
                 && std::arch::is_x86_feature_detected!("avx512bw")
             {
                 let (pst, comb) = inputs_permuted_for(PermKind::File512);
-                let got = unsafe { k_avx512::activate_ft(&pst, &comb, stm) };
+                let got = unsafe { k_avx512::activate_ft(&fused(&pst, &comb), stm) };
                 assert_activation_matches("avx512", &got, &want);
 
                 if std::arch::is_x86_feature_detected!("avx512vnni") {
-                    let got = unsafe { k_vnni512::activate_ft(&pst, &comb, stm) };
+                    let got = unsafe { k_vnni512::activate_ft(&fused(&pst, &comb), stm) };
                     assert_activation_matches("vnni512", &got, &want);
                 }
             }
@@ -1307,164 +1525,438 @@ mod tests {
     }
 
     #[test]
-    fn the_three_nnz_forms_agree() {
-        // A mix of empty, sparse and dense 4-byte groups.
-        let mut ft_out = Aligned([0u8; L1_SIZE]);
-        let mut state = 0x9E3779B97F4A7C15u64;
-        for i in 0..L1_SIZE {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            ft_out.0[i] = if state % 5 == 0 {
-                (state >> 32) as u8
-            } else {
-                0
-            };
+    fn the_activation_lists_the_same_groups_as_the_separate_pass() {
+        if !(std::arch::is_x86_feature_detected!("avx512bw")
+            && std::arch::is_x86_feature_detected!("avx512vbmi2")
+            && std::arch::is_x86_feature_detected!("fma"))
+        {
+            return;
+        }
+        type ActivateNnzFn = unsafe fn(&Aligned<[[i16; L1_SIZE]; 2]>, Color, *mut u8, *mut u16) -> usize;
+        let mut forms: Vec<(&str, ActivateNnzFn)> = vec![("avx512", k_avx512::activate_ft_nnz_into)];
+        if std::arch::is_x86_feature_detected!("avx512vnni") {
+            forms.push(("vnni512", k_vnni512::activate_ft_nnz_into));
         }
 
-        let (want_idx, want_n) = unsafe { k_scalar::find_nnz_generic(&ft_out) };
+        // The usual inputs, then sparse ones: one live pair in a few groups,
+        // first and last of a register and of a perspective included.
+        let (pst, comb) = inputs_permuted_for(PermKind::File512);
+        let mut cases = vec![("dense", fused(&pst, &comb))];
+        for live in [vec![], vec![0], vec![3, 64, 127, 128, 511], (0..512).step_by(5).collect()] {
+            let mut acc = Aligned([[-7i16; L1_SIZE]; 2]);
+            for pov in 0..2 {
+                for &i in &live {
+                    let i = (i + 37 * pov) % (L1_SIZE / 2);
+                    acc.0[pov][i] = 200;
+                    acc.0[pov][i + L1_SIZE / 2] = 150;
+                }
+                linear_to(PermKind::File512, &mut acc.0[pov]);
+            }
+            cases.push(("sparse", acc));
+        }
 
-        if std::arch::is_x86_feature_detected!("avx2") {
-            let (idx, n) = unsafe { crate::nnue::forward::find_nnz_avx2(&ft_out) };
-            assert_eq!(n, want_n, "avx2 nnz count");
-            assert_eq!(idx[..n], want_idx[..want_n], "avx2 nnz indices");
+        for (case, acc) in &cases {
+            for stm in [Color::White, Color::Black] {
+                let want_out = unsafe { k_avx512::activate_ft(acc, stm) };
+                let mut want = [0u16; crate::nnue::forward::NNZ_SIZE];
+                let n = unsafe { crate::nnue::forward::find_nnz_compress512(&want_out, want.as_mut_ptr()) };
+                for (form, f) in &forms {
+                    let mut out = Aligned([0u8; L1_SIZE]);
+                    let mut got = [0u16; crate::nnue::forward::NNZ_SIZE];
+                    let count = unsafe { f(acc, stm, out.0.as_mut_ptr(), got.as_mut_ptr()) };
+                    assert_activation_matches(form, &out, &want_out.0);
+                    let mut got = got[..count].to_vec();
+                    got.sort_unstable();
+                    assert_eq!(got, want[..n], "{form} nnz ({case}, {stm:?})");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_three_nnz_forms_agree() {
+        // The generic form at 8 and 16 lanes too: it must handle vectors wider
+        // than one table byte, though no x86 build selects it.
+        let mut forms: Vec<(&str, super::nnz_cases::NnzFn)> =
+            vec![("scalar", k_scalar::find_nnz_generic)];
+        if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma")
+        {
+            forms.push(("avx2", crate::nnue::forward::find_nnz_avx2));
+            forms.push(("avx2 generic", k_avx2::find_nnz_generic));
+        }
+        if std::arch::is_x86_feature_detected!("avx512f")
+            && std::arch::is_x86_feature_detected!("avx512bw")
+            && std::arch::is_x86_feature_detected!("fma")
+        {
+            forms.push(("avx512 generic", k_avx512::find_nnz_generic));
         }
         if std::arch::is_x86_feature_detected!("avx512bw")
             && std::arch::is_x86_feature_detected!("avx512vbmi2")
         {
-            let (idx, n) = unsafe { crate::nnue::forward::find_nnz_compress512(&ft_out) };
-            assert_eq!(n, want_n, "compress512 nnz count");
-            assert_eq!(idx[..n], want_idx[..want_n], "compress512 nnz indices");
+            forms.push(("compress512", crate::nnue::forward::find_nnz_compress512));
+        }
+        super::nnz_cases::assert_forms(&forms);
+    }
+
+    #[test]
+    fn threat_batch_forms_agree_on_synthetic_weights() {
+        type BatchFn = unsafe fn(*const i16, *mut i16, *const crate::nnue::network::ThreatRow, &[u32], &[u32]);
+        let avx2 = std::arch::is_x86_feature_detected!("avx2");
+        let avx512 = std::arch::is_x86_feature_detected!("avx512f")
+            && std::arch::is_x86_feature_detected!("avx512bw");
+        // Each kernel with the accumulator layout of the tier that runs it; the
+        // weight rows are in logical order for all of them.
+        let mut forms: Vec<(&str, BatchFn, PermKind)> =
+            vec![("scalar", k_scalar::threat_batch, PermKind::Linear)];
+        if avx2 {
+            forms.push(("avx2", k_avx2::threat_batch, PermKind::Avx2));
+        }
+        if avx512 {
+            forms.push(("threat512", threat512::threat_batch, PermKind::File512));
+            forms.push(("avx512 tile", k_avx512::threat_batch, PermKind::File512));
+        }
+
+        for case in threat_cases::cases() {
+            let want = threat_cases::elementwise(&case);
+            for &(form, f, kind) in &forms {
+                let mut want_t = want;
+                linear_to(kind, &mut want_t);
+                let start_t = case.start.map(|mut v| {
+                    linear_to(kind, &mut v);
+                    Aligned(v)
+                });
+                let src = start_t.as_ref().map_or(std::ptr::null(), |v| v.0.as_ptr());
+
+                let mut out = Aligned([0i16; L1_SIZE]);
+                unsafe {
+                    f(
+                        src,
+                        out.0.as_mut_ptr(),
+                        case.rows.as_ptr(),
+                        &case.adds,
+                        &case.subs,
+                    )
+                };
+                assert_eq!(out.0, want_t, "{form} threat batch ({})", case.name);
+
+                if let Some(mut acc) = start_t {
+                    let p = acc.0.as_mut_ptr();
+                    unsafe { f(p, p, case.rows.as_ptr(), &case.adds, &case.subs) };
+                    assert_eq!(
+                        acc.0, want_t,
+                        "{form} threat batch in place ({})",
+                        case.name
+                    );
+                }
+            }
         }
     }
 
-    /// Element-wise wrapping i16: all subs, then all adds. This is the old
-    /// row-loop contract; the tiled kernels must match it bit for bit, or the
-    /// bench node count moves.
-    fn threat_batch_elementwise(
-        input: Option<&[i16; L1_SIZE]>,
-        weights: &[[i8; L1_SIZE]],
-        adds: &[u32],
-        subs: &[u32],
-    ) -> [i16; L1_SIZE] {
-        let mut out = match input {
-            Some(v) => *v,
-            None => [0i16; L1_SIZE],
-        };
-        for &s in subs {
-            let row = &weights[s as usize];
-            for i in 0..L1_SIZE {
-                out[i] = out[i].wrapping_sub(row[i] as i16);
+    #[test]
+    fn combined_batch_forms_agree_on_synthetic_weights() {
+        let avx2 = std::arch::is_x86_feature_detected!("avx2");
+        let avx512 = std::arch::is_x86_feature_detected!("avx512f")
+            && std::arch::is_x86_feature_detected!("avx512bw");
+        // As for `threat_batch`: each kernel with its tier's accumulator layout, every
+        // i8 row (piece squares included) in logical order.
+        let mut forms: Vec<(&str, super::CombinedBatchFn, PermKind)> =
+            vec![("scalar", k_scalar::combined_batch, PermKind::Linear)];
+        if avx2 {
+            forms.push(("avx2", k_avx2::combined_batch, PermKind::Avx2));
+        }
+        if avx512 {
+            forms.push(("threat512", threat512::combined_batch, PermKind::File512));
+            forms.push(("avx512 tile", k_avx512::combined_batch, PermKind::File512));
+        }
+
+        let psq = threat_cases::psq_rows();
+        let rows = threat_cases::rows_of(&psq);
+        for case in threat_cases::cases() {
+            let Some(start) = case.start else { continue };
+            for (adds, subs) in threat_cases::psq_sets() {
+                let want = threat_cases::combined_elementwise(&case, &psq, &adds, &subs);
+                for &(form, f, kind) in &forms {
+                    let mut want_t = want;
+                    linear_to(kind, &mut want_t);
+                    let mut acc = Aligned(start);
+                    linear_to(kind, &mut acc.0);
+                    let p = acc.0.as_mut_ptr();
+                    unsafe {
+                        f(p, p, rows.as_ptr(), &adds, &subs, case.rows.as_ptr(), &case.adds, &case.subs)
+                    };
+                    assert_eq!(acc.0, want_t, "{form} combined batch ({}, psq {adds:?}/{subs:?})", case.name);
+                }
             }
         }
-        for &a in adds {
-            let row = &weights[a as usize];
-            for i in 0..L1_SIZE {
-                out[i] = out[i].wrapping_add(row[i] as i16);
+    }
+
+    #[test]
+    fn every_tier_computes_the_dense_layers_of_the_reference() {
+        let mut forms: Vec<(&str, super::dense_cases::DenseFn)> =
+            vec![("scalar", k_scalar::dense_layers)];
+        if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma")
+        {
+            forms.push(("avx2", k_avx2::dense_layers));
+            if std::arch::is_x86_feature_detected!("avxvnni") {
+                forms.push(("avxvnni", k_avxvnni::dense_layers));
+            }
+        }
+        if std::arch::is_x86_feature_detected!("avx512f")
+            && std::arch::is_x86_feature_detected!("avx512bw")
+        {
+            forms.push(("avx512", k_avx512::dense_layers));
+            if std::arch::is_x86_feature_detected!("avx512vnni") {
+                forms.push(("vnni512", k_vnni512::dense_layers));
+            }
+        }
+        super::dense_cases::assert_reference(&forms);
+    }
+}
+
+/// FT outputs for the nnz extraction and their group-by-group oracle, shared by
+/// the tests of every architecture.
+#[cfg(test)]
+mod nnz_cases {
+    use crate::nnue::L1_SIZE;
+    use crate::nnue::forward::NNZ_SIZE;
+    use crate::nnue::network::Aligned;
+
+    pub type NnzFn = unsafe fn(&Aligned<[u8; L1_SIZE]>, *mut u16) -> usize;
+
+    /// Empty, full, and three densities of non-zero bytes. Bytes stay below
+    /// 128, as the activation's do, so "some byte is non-zero" and "the group
+    /// read as an i32 is positive" (the vector compare) are the same test.
+    fn outputs() -> Vec<(String, Aligned<[u8; L1_SIZE]>)> {
+        let mut out = vec![
+            ("empty".to_string(), Aligned([0u8; L1_SIZE])),
+            ("full".to_string(), Aligned([1u8; L1_SIZE])),
+        ];
+        let mut state = 0x9E3779B97F4A7C15u64;
+        for one_in in [2u64, 5, 23] {
+            let mut ft = Aligned([0u8; L1_SIZE]);
+            for b in ft.0.iter_mut() {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                if state % one_in == 0 {
+                    *b = ((state >> 32) as u8 & 0x7F).max(1);
+                }
+            }
+            out.push((format!("1 byte in {one_in}"), ft));
+        }
+        out
+    }
+
+    /// Indices of the 4-byte groups holding a non-zero byte, in order.
+    fn oracle(ft: &Aligned<[u8; L1_SIZE]>) -> Vec<u16> {
+        ft.0.chunks_exact(4)
+            .enumerate()
+            .filter(|(_, g)| g.iter().any(|&b| b != 0))
+            .map(|(i, _)| i as u16)
+            .collect()
+    }
+
+    pub fn assert_forms(forms: &[(&str, NnzFn)]) {
+        for (case, ft) in outputs() {
+            let want = oracle(&ft);
+            for &(form, f) in forms {
+                let mut idx = [0u16; NNZ_SIZE];
+                let n = unsafe { f(&ft, idx.as_mut_ptr()) };
+                assert_eq!(&idx[..n], &want[..], "{form} nnz ({case})");
+            }
+        }
+    }
+}
+
+/// Synthetic threat-batch cases and their element-wise oracle, shared by the
+/// tests of every architecture.
+#[cfg(test)]
+mod threat_cases {
+    use crate::nnue::L1_SIZE;
+
+    pub struct Case {
+        pub name: &'static str,
+        /// Logical order; `None` = the kernel starts from zero (null input).
+        pub start: Option<[i16; L1_SIZE]>,
+        /// Logical order, as `repermute_ft` holds threat rows on every tier.
+        pub weights: Vec<[i8; L1_SIZE]>,
+        /// The same weights as the kernels read them, one padded row each.
+        pub rows: Vec<crate::nnue::network::ThreatRow>,
+        pub adds: Vec<u32>,
+        pub subs: Vec<u32>,
+    }
+
+    /// Element-wise wrapping i16, one row at a time: the contract the tiled,
+    /// paired kernels must meet bit for bit, or the bench node count moves.
+    pub fn elementwise(case: &Case) -> [i16; L1_SIZE] {
+        let mut out = case.start.unwrap_or([0i16; L1_SIZE]);
+        for &s in &case.subs {
+            for (o, &w) in out.iter_mut().zip(&case.weights[s as usize]) {
+                *o = o.wrapping_sub(w as i16);
+            }
+        }
+        for &a in &case.adds {
+            for (o, &w) in out.iter_mut().zip(&case.weights[a as usize]) {
+                *o = o.wrapping_add(w as i16);
             }
         }
         out
     }
 
-    #[test]
-    fn threat_batch_forms_agree_on_synthetic_weights() {
-        // Synthetic weight rows: no dependence on a loaded network.
-        const ROWS: usize = 8;
-        let mut weights = vec![[0i8; L1_SIZE]; ROWS];
-        for (r, row) in weights.iter_mut().enumerate() {
-            for (i, w) in row.iter_mut().enumerate() {
-                *w = (((r * 251 + i * 31) % 199) as i32 - 99) as i8;
+    /// Piece-square rows for `combined_batch`, logical order, the whole i8 range.
+    pub fn psq_rows() -> Vec<[i8; L1_SIZE]> {
+        (0..5)
+            .map(|r| std::array::from_fn(|i| ((r * 7919 + i * 131) % 256) as u8 as i8))
+            .collect()
+    }
+
+    /// The rows as the kernels read them.
+    pub fn rows_of(weights: &[[i8; L1_SIZE]]) -> Vec<crate::nnue::network::ThreatRow> {
+        weights.iter().map(|w| crate::nnue::network::ThreatRow::new(*w)).collect()
+    }
+
+    /// The piece-square rows a move adds and removes: one each, two each, none,
+    /// castling-like.
+    pub fn psq_sets() -> Vec<(Vec<u32>, Vec<u32>)> {
+        vec![
+            (vec![0], vec![1]),
+            (vec![2, 3], vec![4, 0]),
+            (vec![], vec![]),
+            (vec![1], vec![2, 3]),
+        ]
+    }
+
+    /// [`elementwise`] with piece-square rows on top: the contract of
+    /// `combined_batch`.
+    pub fn combined_elementwise(
+        case: &Case,
+        psq: &[[i8; L1_SIZE]],
+        adds: &[u32],
+        subs: &[u32],
+    ) -> [i16; L1_SIZE] {
+        let mut out = elementwise(case);
+        for &s in subs {
+            for (o, &w) in out.iter_mut().zip(&psq[s as usize]) {
+                *o = o.wrapping_sub(w as i16);
             }
         }
-        let mut input = Aligned([0i16; L1_SIZE]);
-        for i in 0..L1_SIZE {
-            input.0[i] = ((i as i32 * 97) % 1601 - 800) as i16;
+        for &a in adds {
+            for (o, &w) in out.iter_mut().zip(&psq[a as usize]) {
+                *o = o.wrapping_add(w as i16);
+            }
         }
-        // Values that wrap i16: the tiled walk must not reorder subs vs adds
-        // on a lane, or these diverge from the element-wise oracle.
-        let mut wrap_input = Aligned([0i16; L1_SIZE]);
-        for i in 0..L1_SIZE {
-            wrap_input.0[i] = if i % 2 == 0 { 30_000 } else { -30_000 };
-        }
-        let wrap_weights: Vec<[i8; L1_SIZE]> = (0..ROWS)
-            .map(|r| {
-                let mut row = [0i8; L1_SIZE];
-                for (i, w) in row.iter_mut().enumerate() {
-                    *w = if (r + i) % 2 == 0 { 127 } else { -128 };
-                }
-                row
-            })
-            .collect();
+        out
+    }
 
-        let cases: &[(
-            &str,
-            &Aligned<[i16; L1_SIZE]>,
-            &[[i8; L1_SIZE]],
-            &[u32],
-            &[u32],
-        )] = &[
-            ("copy", &input, &weights, &[0, 3, 6], &[1, 5]),
-            ("from_zero_pattern", &input, &weights, &[0, 3, 6], &[1, 5]),
-            ("empty", &input, &weights, &[], &[]),
-            ("adds_only", &input, &weights, &[2, 7], &[]),
-            ("subs_only", &input, &weights, &[], &[4, 1, 0]),
-            (
+    /// Pairs, an odd row out on either side, empty lists, a null input, the
+    /// extreme pair sums (127 + 127, -128 + -128) and i16 wrap-around.
+    pub fn cases() -> Vec<Case> {
+        const ROWS: usize = 8;
+        let weights: Vec<[i8; L1_SIZE]> = (0..ROWS)
+            .map(|r| std::array::from_fn(|i| (((r * 251 + i * 31) % 199) as i32 - 99) as i8))
+            .collect();
+        let input: [i16; L1_SIZE] = std::array::from_fn(|i| ((i as i32 * 97) % 1601 - 800) as i16);
+        let extremes: Vec<[i8; L1_SIZE]> = (0..ROWS)
+            .map(|r| std::array::from_fn(|i| if (r + i) % 2 == 0 { 127 } else { -128 }))
+            .collect();
+        let wrap_input: [i16; L1_SIZE] =
+            std::array::from_fn(|i| if i % 2 == 0 { 30_000 } else { -30_000 });
+
+        let case = |name, start, weights: &Vec<[i8; L1_SIZE]>, adds: &[u32], subs: &[u32]| Case {
+            name,
+            start,
+            weights: weights.clone(),
+            rows: rows_of(weights),
+            adds: adds.to_vec(),
+            subs: subs.to_vec(),
+        };
+        vec![
+            case("copy", Some(input), &weights, &[0, 3, 6], &[1, 5]),
+            case("from_zero", None, &weights, &[0, 3, 6], &[1, 5]),
+            case("empty", Some(input), &weights, &[], &[]),
+            case("adds_only", Some(input), &weights, &[2, 7], &[]),
+            case("subs_only", Some(input), &weights, &[], &[4, 1, 0]),
+            case("one_each", Some(input), &weights, &[5], &[2]),
+            case("same_row_twice", Some(input), &weights, &[3, 3], &[6]),
+            case("extremes", Some(input), &extremes, &[0, 2], &[1, 3]),
+            case(
                 "wrap",
-                &wrap_input,
-                &wrap_weights,
+                Some(wrap_input),
+                &extremes,
                 &[0, 1, 2, 3],
                 &[4, 5, 6, 7],
             ),
-        ];
+        ]
+    }
+}
 
-        type BatchFn = unsafe fn(*const i16, *mut i16, *const [i8; L1_SIZE], &[u32], &[u32]);
-        let run = |f: BatchFn, src: *const i16, w: &[[i8; L1_SIZE]], adds: &[u32], subs: &[u32]| {
-            let mut out = Aligned([0i16; L1_SIZE]);
-            unsafe { f(src, out.0.as_mut_ptr(), w.as_ptr(), adds, subs) };
-            out
-        };
-        let run_in_place = |f: BatchFn,
-                            start: &[i16; L1_SIZE],
-                            w: &[[i8; L1_SIZE]],
-                            adds: &[u32],
-                            subs: &[u32]| {
-            let mut acc = Aligned(*start);
-            unsafe {
-                f(acc.0.as_ptr(), acc.0.as_mut_ptr(), w.as_ptr(), adds, subs);
+/// The integer dense layers of every tier against the plain reference of
+/// `forward.rs`, on random weights and inputs, shared by the tests of every
+/// architecture: all of them must compute the same integers, so that every build
+/// evaluates every position the same.
+#[cfg(test)]
+mod dense_cases {
+    use crate::nnue::network::{Aligned, NNUEParams};
+    use crate::nnue::{L1_SIZE, STACKS};
+
+    pub type DenseFn = unsafe fn(&NNUEParams, &Aligned<[u8; L1_SIZE]>, &[u16], usize) -> i32;
+
+    struct XorShift(u64);
+
+    impl XorShift {
+        fn bits(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        fn int(&mut self, lo: i32, hi: i32) -> i32 {
+            lo + (self.bits() % (hi - lo + 1) as u64) as i32
+        }
+    }
+
+    /// Random weights in their exported ranges; biases wide enough that every clamp
+    /// and saturation of the activations is crossed.
+    pub fn random_params(seed: u64) -> Box<NNUEParams> {
+        let mut rng = XorShift(seed);
+        let mut params = NNUEParams::zeroed_box();
+        for s in 0..STACKS {
+            for group in params.l1_weights.0[s].iter_mut() {
+                group.iter_mut().for_each(|w| *w = rng.int(-127, 127) as i8);
             }
-            acc
-        };
+            params.l1_biases.0[s].iter_mut().for_each(|b| *b = rng.int(-40_000, 40_000));
+            for group in params.l2_weights.0[s].iter_mut() {
+                group.iter_mut().for_each(|w| *w = rng.int(-127, 127) as i8);
+            }
+            params.l2_biases.0[s].iter_mut().for_each(|b| *b = rng.int(-20_000, 20_000));
+            params.l3_weights_a.0[s].iter_mut().for_each(|w| *w = rng.int(-127, 127) as i8);
+            params.l3_weights_h.0[s].iter_mut().for_each(|w| *w = rng.int(-127, 127));
+            params.l3_biases.0[s] = rng.int(-20_000, 20_000);
+        }
+        params.meta.0[0] = crate::nnue::NETWORK_SCALE;
+        params
+    }
 
-        for (name, start, w, adds, subs) in cases {
-            let from_null = *name == "from_zero_pattern";
-            let want = threat_batch_elementwise(
-                if from_null { None } else { Some(&start.0) },
-                w,
-                adds,
-                subs,
-            );
-            let src = if from_null {
-                std::ptr::null()
-            } else {
-                start.0.as_ptr()
-            };
-
-            let got = run(k_scalar::threat_batch, src, w, adds, subs);
-            assert_eq!(got.0, want, "scalar threat batch ({name})");
-
-            if std::arch::is_x86_feature_detected!("avx2") {
-                let got = run(k_avx2::threat_batch, src, w, adds, subs);
-                assert_eq!(got.0, want, "avx2 threat batch ({name})");
-                if !from_null {
-                    let got = run_in_place(k_avx2::threat_batch, &start.0, w, adds, subs);
-                    assert_eq!(got.0, want, "avx2 threat batch in-place ({name})");
+    pub fn assert_reference(forms: &[(&str, DenseFn)]) {
+        let mut rng = XorShift(0x9E37_79B9_7F4A_7C15);
+        let params = random_params(0x2545_F491_4F6C_DD1D);
+        for round in 0..300 {
+            // FT output: products in 0..=127, about half the bytes zero.
+            let mut ft_out = Aligned([0u8; L1_SIZE]);
+            for x in ft_out.0.iter_mut() {
+                let v = (rng.bits() >> 57) as u8;
+                *x = if v < 64 { 0 } else { v };
+            }
+            let nnz: Vec<u16> = (0..(L1_SIZE / 4) as u16)
+                .filter(|&g| ft_out.0[4 * g as usize..4 * g as usize + 4].iter().any(|&b| b != 0))
+                .collect();
+            for stack in 0..STACKS {
+                let want = crate::nnue::forward::dense_reference(&params, &ft_out, stack);
+                for &(name, f) in forms {
+                    let got = unsafe { f(&params, &ft_out, &nnz, stack) };
+                    assert_eq!(got, want, "{name}: round {round}, stack {stack}");
                 }
-            }
-            if std::arch::is_x86_feature_detected!("avx512f")
-                && std::arch::is_x86_feature_detected!("avx512bw")
-            {
-                let got = run(threat512::threat_batch, src, w, adds, subs);
-                assert_eq!(got.0, want, "threat512 batch ({name})");
             }
         }
     }
@@ -1477,6 +1969,18 @@ mod tests_aarch64 {
     use crate::nnue::network::Aligned;
     use crate::nnue::{FT_QUANT, FT_SHIFT, L1_SIZE};
     use crate::types::Color;
+
+    /// The single accumulator the kernels read: the two test inputs summed as the
+    /// engine sums its features, wrapping.
+    fn fused(pst: &Accumulator, comb: &Aligned<[[i16; L1_SIZE]; 2]>) -> Aligned<[[i16; L1_SIZE]; 2]> {
+        let mut out = Aligned([[0i16; L1_SIZE]; 2]);
+        for pov in 0..2 {
+            for i in 0..L1_SIZE {
+                out.0[pov][i] = pst.values.0[pov][i].wrapping_add(comb.0[pov][i]);
+            }
+        }
+        out
+    }
 
     fn test_inputs() -> (Accumulator, Aligned<[[i16; L1_SIZE]; 2]>) {
         let mut pst_acc = Accumulator::new();
@@ -1516,7 +2020,7 @@ mod tests_aarch64 {
         let (pst, comb) = test_inputs();
         for stm in [Color::White, Color::Black] {
             let want = activate_reference(&pst, &comb, stm);
-            let got = unsafe { k_neon::activate_ft(&pst, &comb, stm) };
+            let got = unsafe { k_neon::activate_ft(&fused(&pst, &comb), stm) };
             if let Some(i) = (0..L1_SIZE).find(|&i| got.0[i] != want[i]) {
                 panic!(
                     "neon activation disagrees at {i}: got {}, want {}",
@@ -1524,7 +2028,7 @@ mod tests_aarch64 {
                 );
             }
             if std::arch::is_aarch64_feature_detected!("dotprod") {
-                let got = unsafe { k_dotprod::activate_ft(&pst, &comb, stm) };
+                let got = unsafe { k_dotprod::activate_ft(&fused(&pst, &comb), stm) };
                 if let Some(i) = (0..L1_SIZE).find(|&i| got.0[i] != want[i]) {
                     panic!(
                         "dotprod activation disagrees at {i}: got {}, want {}",
@@ -1536,41 +2040,105 @@ mod tests_aarch64 {
     }
 
     #[test]
-    fn neon_and_dotprod_threat_batch_agree() {
-        if !std::arch::is_aarch64_feature_detected!("dotprod") {
-            return;
+    fn neon_and_dotprod_threat_batch_match_the_elementwise_walk() {
+        type BatchFn = unsafe fn(*const i16, *mut i16, *const crate::nnue::network::ThreatRow, &[u32], &[u32]);
+        let mut forms: Vec<(&str, BatchFn)> = vec![("neon", k_neon::threat_batch)];
+        if std::arch::is_aarch64_feature_detected!("dotprod") {
+            forms.push(("dotprod", k_dotprod::threat_batch));
         }
-        const ROWS: usize = 8;
-        let mut weights = vec![[0i8; L1_SIZE]; ROWS];
-        for (r, row) in weights.iter_mut().enumerate() {
-            for (i, w) in row.iter_mut().enumerate() {
-                *w = (((r * 251 + i * 31) % 199) as i32 - 99) as i8;
+        for case in super::threat_cases::cases() {
+            let want = super::threat_cases::elementwise(&case);
+            for &(form, f) in &forms {
+                let start = case.start.map(Aligned);
+                let src = start.as_ref().map_or(std::ptr::null(), |v| v.0.as_ptr());
+                let mut out = Aligned([0i16; L1_SIZE]);
+                unsafe {
+                    f(
+                        src,
+                        out.0.as_mut_ptr(),
+                        case.rows.as_ptr(),
+                        &case.adds,
+                        &case.subs,
+                    )
+                };
+                assert_eq!(out.0, want, "{form} threat batch ({})", case.name);
+
+                if let Some(mut acc) = start {
+                    let p = acc.0.as_mut_ptr();
+                    unsafe { f(p, p, case.rows.as_ptr(), &case.adds, &case.subs) };
+                    assert_eq!(acc.0, want, "{form} threat batch in place ({})", case.name);
+                }
             }
         }
-        let mut input = Aligned([0i16; L1_SIZE]);
-        for i in 0..L1_SIZE {
-            input.0[i] = ((i as i32 * 97) % 1601 - 800) as i16;
+    }
+
+    #[test]
+    fn neon_and_dotprod_combined_batch_match_the_elementwise_walk() {
+        let mut forms: Vec<(&str, super::CombinedBatchFn)> = vec![("neon", k_neon::combined_batch)];
+        if std::arch::is_aarch64_feature_detected!("dotprod") {
+            forms.push(("dotprod", k_dotprod::combined_batch));
         }
-        let adds: [u32; 3] = [0, 3, 6];
-        let subs: [u32; 2] = [1, 5];
-        let mut neon_out = Aligned([0i16; L1_SIZE]);
-        let mut dot_out = Aligned([0i16; L1_SIZE]);
-        unsafe {
-            k_neon::threat_batch(
-                input.0.as_ptr(),
-                neon_out.0.as_mut_ptr(),
-                weights.as_ptr(),
-                &adds,
-                &subs,
-            );
-            k_dotprod::threat_batch(
-                input.0.as_ptr(),
-                dot_out.0.as_mut_ptr(),
-                weights.as_ptr(),
-                &adds,
-                &subs,
-            );
+        let psq = super::threat_cases::psq_rows();
+        let rows = super::threat_cases::rows_of(&psq);
+        for case in super::threat_cases::cases() {
+            let Some(start) = case.start else { continue };
+            for (adds, subs) in super::threat_cases::psq_sets() {
+                let want = super::threat_cases::combined_elementwise(&case, &psq, &adds, &subs);
+                for &(form, f) in &forms {
+                    let mut acc = Aligned(start);
+                    let p = acc.0.as_mut_ptr();
+                    unsafe {
+                        f(p, p, rows.as_ptr(), &adds, &subs, case.rows.as_ptr(), &case.adds, &case.subs)
+                    };
+                    assert_eq!(acc.0, want, "{form} combined batch ({}, psq {adds:?}/{subs:?})", case.name);
+                }
+            }
         }
-        assert_eq!(neon_out.0, dot_out.0);
+    }
+
+    #[test]
+    fn neon_and_scalar_nnz_match_the_group_walk() {
+        let mut forms: Vec<(&str, super::nnz_cases::NnzFn)> = vec![
+            ("neon", k_neon::find_nnz_generic),
+            ("scalar", k_scalar::find_nnz_generic),
+        ];
+        if std::arch::is_aarch64_feature_detected!("dotprod") {
+            forms.push(("dotprod", k_dotprod::find_nnz_generic));
+        }
+        super::nnz_cases::assert_forms(&forms);
+    }
+
+    #[test]
+    fn neon_and_dotprod_compute_the_dense_layers_of_the_reference() {
+        let mut forms: Vec<(&str, super::dense_cases::DenseFn)> =
+            vec![("neon", k_neon::dense_layers), ("scalar", k_scalar::dense_layers)];
+        if std::arch::is_aarch64_feature_detected!("dotprod") {
+            forms.push(("dotprod", k_dotprod::dense_layers));
+        }
+        super::dense_cases::assert_reference(&forms);
+    }
+}
+
+// simd128 against the scalar build of the same module: the dense layers are integers,
+// so they must agree bit for bit, and a rung of the web build is the same opponent with
+// and without SIMD.
+#[cfg(all(test, target_arch = "wasm32", target_feature = "simd128"))]
+mod tests_wasm {
+    use super::*;
+
+    #[test]
+    fn simd128_and_scalar_nnz_match_the_group_walk() {
+        super::nnz_cases::assert_forms(&[
+            ("simd128", k_native::find_nnz_generic),
+            ("scalar", k_scalar::find_nnz_generic),
+        ]);
+    }
+
+    #[test]
+    fn dense_layers_match_the_reference() {
+        super::dense_cases::assert_reference(&[
+            ("simd128", k_native::dense_layers),
+            ("scalar", k_scalar::dense_layers),
+        ]);
     }
 }

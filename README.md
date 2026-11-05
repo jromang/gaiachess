@@ -102,7 +102,7 @@ on a laptop as on a server.
 
 ### Evaluation
 
-- **NNUE**: GaiaNet-T2b (12 king buckets × 768 PST inputs, plus 4,560 pawn pairs and 59,808 filtered piece-interaction threat features → 1024 → paired SCReLU → 16 → 32 → 1), 8 material-based output buckets and a PSQT head, 87 MB, trained with an in-house trainer built on [Bullet](https://github.com/jw1912/bullet)
+- **NNUE**: GaiaNet-T7 (32 king buckets × enemy-queen presence × 704 PST inputs, plus 4,560 pawn pairs and 59,808 filtered piece-interaction threat features → 1024 → sparse 32 → gated 64 → 1), 32 output stacks by piece count and queens, integer from end to end, 113 MB, trained with an in-house trainer built on [Bullet](https://github.com/jw1912/bullet)
 - **SIMD**: runtime dispatch AVX-512+VNNI / AVX-512 / AVX2 / scalar — one binary, resolved from CPUID at startup (NEON on ARM)
 - **Movegen**: per-piece PEXT (BMI2) / AVX2 BLSMSK / magic on x86, Hyperbola Quintessence (`rbit`) on ARM64; setwise AVX-512 Kogge-Stone / scalar — runtime-elected too, with PEXT skipped on the AMD generations that microcode it
 
@@ -214,7 +214,7 @@ libc. Windows and macOS need nothing extra.
 # Download the default network, the one named by DEFAULT_NET in defaults.conf
 # (all networks: https://huggingface.co/jromanghf/gaiachess-networks)
 curl -L -o nets/gaianet.bin \
-  "https://huggingface.co/jromanghf/gaiachess-networks/resolve/main/gaianet-t2b-t6.bin"
+  "https://huggingface.co/jromanghf/gaiachess-networks/resolve/main/gaianet-t7.bin"
 
 # Build with the network embedded
 MODEL=nets/gaianet.bin RUSTFLAGS="-C target-cpu=native" cargo build --release --features nnue

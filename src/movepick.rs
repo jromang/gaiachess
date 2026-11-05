@@ -5,7 +5,7 @@
 //! → quiets (butterfly + continuation history) → bad captures.
 //! QSearch mode yields only the TT move and good captures.
 
-use crate::bitboard::{bishop_attacks, knight_attacks, pawn_attacks, queen_attacks, rook_attacks};
+use crate::bitboard::{both_attacks, knight_attacks, pawn_attacks};
 use crate::eval;
 use crate::history::{ButterflyHistory, CaptureHistory, ContinuationHistory, PawnHistory};
 use crate::movegen;
@@ -486,12 +486,13 @@ impl MovePicker {
                     // (movepicker check bonus for quiet checking moves)
                     let their_king = pos.king_sq(stm.flip());
                     let occ = pos.occupied();
+                    let (diagonal, straight) = both_attacks(their_king, occ);
                     let check_sqs: [u64; 6] = [
                         pawn_attacks(their_king, stm.flip()), // PieceType::Pawn = 0
                         knight_attacks(their_king),           // PieceType::Knight = 1
-                        bishop_attacks(their_king, occ),      // PieceType::Bishop = 2
-                        rook_attacks(their_king, occ),        // PieceType::Rook = 3
-                        queen_attacks(their_king, occ),       // PieceType::Queen = 4
+                        diagonal,                             // PieceType::Bishop = 2
+                        straight,                             // PieceType::Rook = 3
+                        diagonal | straight,                  // PieceType::Queen = 4
                         0u64, // PieceType::King = 5 (no direct check)
                     ];
 

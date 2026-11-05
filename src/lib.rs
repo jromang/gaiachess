@@ -61,6 +61,7 @@ pub mod relabel;
 pub mod shm;
 pub mod tb;
 pub mod threads;
+pub mod workers;
 #[cfg_attr(not(feature = "tree"), allow(dead_code))]
 pub mod tree;
 pub mod uci;

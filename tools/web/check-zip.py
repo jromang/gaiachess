@@ -28,6 +28,9 @@ EXPECTED = {
     "favicon32.png",
     # gl.js is miniquad's, under MIT: its notice has to travel with it.
     "LICENSE-miniquad-MIT",
+    # The page's licence, and those of the crates compiled into the modules.
+    "LICENSE",
+    "THIRD-PARTY-LICENSES.txt",
 }
 
 # A module that failed to link is still a file. Both are over a megabyte when whole.

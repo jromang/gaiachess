@@ -30,9 +30,7 @@
 
 use std::mem::MaybeUninit;
 
-use crate::bitboard::{
-    between_bb, bishop_attacks, knight_attacks, line_bb, pawn_attacks, pop_lsb, rook_attacks,
-};
+use crate::bitboard::{between_bb, both_attacks, knight_attacks, line_bb, pawn_attacks, pop_lsb};
 use crate::position::Position;
 use crate::types::{
     Color, MT_CASTLING, MT_EN_PASSANT, MT_NORMAL, MT_PROMOTION, Piece, PieceType, Square,
@@ -371,9 +369,10 @@ impl BitBoard {
     fn lines(&self, sq: Square) -> Lines {
         let p = &self.pieces;
         let queens = p[Piece::WHITE_QUEEN.index()] | p[Piece::BLACK_QUEEN.index()];
+        let (bishop, rook) = both_attacks(sq, self.occ);
         Lines {
-            bishop: bishop_attacks(sq, self.occ),
-            rook: rook_attacks(sq, self.occ),
+            bishop,
+            rook,
             diagonal_sliders: p[Piece::WHITE_BISHOP.index()] | p[Piece::BLACK_BISHOP.index()] | queens,
             straight_sliders: p[Piece::WHITE_ROOK.index()] | p[Piece::BLACK_ROOK.index()] | queens,
             kings: p[Piece::WHITE_KING.index()] | p[Piece::BLACK_KING.index()],
@@ -1203,7 +1202,7 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
-    use crate::bitboard::king_attacks;
+    use crate::bitboard::{bishop_attacks, king_attacks, rook_attacks};
     use crate::movegen::generate_legal_moves;
     use crate::types::{ArrayBuf, MAX_MOVES, Move};
 
@@ -1244,6 +1243,7 @@ mod tests {
                 pos.piece_on(mv.to_sq())
             },
             old_occ: pos.occupied(),
+            queen_flip: [false; 2],
         }
     }
 

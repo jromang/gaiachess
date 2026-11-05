@@ -178,6 +178,21 @@ mod tests {
         );
     }
 
+    // Chess960: lifting the castling rook can open its rank to an enemy slider behind
+    // it. Queen a1, rook b1, king d1: the rook is pinned, and castling would leave the
+    // king on c1 facing the queen; nothing else attacks the king's path, so only the
+    // pin can tell. Generation and `is_pseudo_legal` already refuse a pinned castling
+    // rook; `is_legal` holds the rule as well, so its answer never rests on its caller.
+    #[test]
+    fn castling_with_the_rook_pinned_along_its_rank() {
+        let castle = Move::new_with_type(Square::D1, Square::B1, MT_CASTLING);
+        let free = Position::from_fen("4k3/8/8/8/8/8/8/1R1K4 w B - 0 1").unwrap();
+        let pinned = Position::from_fen("4k3/8/8/8/8/8/8/qR1K4 w B - 0 1").unwrap();
+        assert!(movegen::is_legal(&free, castle), "free rook");
+        assert!(!movegen::is_legal(&pinned, castle), "rook pinned by a1");
+        assert!(!movegen::is_playable_table_move(&pinned, castle));
+    }
+
     #[test]
     fn castle_king_already_on_g() {
         let mut pos = Position::from_fen("4k3/8/8/8/8/8/8/6KR w K - 0 1").unwrap();

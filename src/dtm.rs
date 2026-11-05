@@ -123,8 +123,8 @@ fn load(blob: &[u8]) -> Option<Prober> {
     Some(prober)
 }
 
-/// The image's name: which blob, in which layout. The sharing layer adds the user
-/// and the executable.
+/// The image's name: which blob, in which layout. The sharing layer adds the
+/// executable, and the user on Linux (Windows keeps names to the session).
 fn image_name(blob: &[u8]) -> String {
     format!(
         "gaiatb-{:016x}-i{IMAGE_FORMAT}",
@@ -241,6 +241,11 @@ fn probe_with(prober: &Prober, pos: &Position, ply: i32) -> Option<i32> {
 
     let dtm = prober.probe_dtm(&white, &black, wk, bk, &pieces[..np], stm_white)?;
     let dtm = dtm as i32;
+    // +1 would be a win in no half-move at all. No table holds it, so a damaged one
+    // does, and its answer is none: read as a distance it is a mate against us.
+    if dtm == 1 {
+        return None;
+    }
     // A mate the 50-move rule may forbid is not proved by a distance-to-mate table: it
     // can still be won through a capture or a pawn move the DTM line does not make,
     // but only a search can say so. Declined, as Nalimov declines it, rather than
@@ -251,6 +256,36 @@ fn probe_with(prober: &Prober, pos: &Position, ply: i32) -> Option<i32> {
         return None;
     }
     Some(stored_dtm_to_score(dtm, ply))
+}
+
+/// A blob's tables loaded into a private store and probed at `positions`, for the
+/// fuzz targets under `fuzz/`; `None` when the blob is refused.
+#[cfg(fuzzing)]
+pub fn fuzz_load_and_probe(
+    blob: &[u8],
+    positions: &[Position],
+    ply: i32,
+) -> Option<Vec<Option<i32>>> {
+    let dir = read_directory(blob)?;
+    let prober = Prober::private(blob, &dir)?;
+    Some(positions.iter().map(|pos| probe_with(&prober, pos, ply)).collect())
+}
+
+/// A shared image's header as [`read_header`] reads it — the table offsets and the
+/// bytes used — for the fuzz targets under `fuzz/`.
+#[cfg(fuzzing)]
+pub fn fuzz_read_header(
+    head: &[u8],
+    tables: usize,
+    capacity: usize,
+) -> Result<(Vec<(usize, usize)>, usize), String> {
+    read_header(head, tables, capacity).map(|layout| (layout.offsets, layout.used))
+}
+
+/// The length of a shared image's header for `tables` tables.
+#[cfg(fuzzing)]
+pub fn fuzz_image_header_len(tables: usize) -> usize {
+    image_header_len(tables)
 }
 
 /// Map a stored DTM to a negamax score at `ply`.
@@ -448,6 +483,7 @@ fn is_on_diagonal(sq: u8) -> bool {
 }
 
 fn canonicalize_king(sq: u8) -> (u8, u8) {
+    debug_assert!(sq < 64, "canonicalize_king: square {sq}");
     let mut f = (sq & 7) as i8;
     let mut r = (sq >> 3) as i8;
     let mut t = 0u8;
@@ -467,6 +503,7 @@ fn canonicalize_king(sq: u8) -> (u8, u8) {
 }
 
 fn canonicalize_king_pawnful(sq: u8) -> (u8, u8) {
+    debug_assert!(sq < 64, "canonicalize_king_pawnful: square {sq}");
     let f = (sq & 7) as i8;
     let r = (sq >> 3) as i8;
     if f > 3 {
@@ -478,6 +515,7 @@ fn canonicalize_king_pawnful(sq: u8) -> (u8, u8) {
 
 #[inline]
 fn apply_transform(sq: u8, t: u8) -> u8 {
+    debug_assert!(sq < 64 && t < 8, "apply_transform: square {sq}, transform {t}");
     let mut f = (sq & 7) as i8;
     let mut r = (sq >> 3) as i8;
     if t & 1 != 0 {
@@ -616,6 +654,8 @@ const MAP_PAWNS: [u8; 64] = {
 
 #[inline]
 fn unpack_value(data: &[u8], index: usize, bits: u8) -> u8 {
+    // `Entry::is_well_formed` admits 1 to 8 bits: the mask and the value fit a byte.
+    debug_assert!((1..=8).contains(&bits), "unpack_value: {bits} bits");
     let bit_off = index as u64 * bits as u64;
     let byte_idx = (bit_off / 8) as usize;
     let bit_idx = (bit_off % 8) as u32;
@@ -626,6 +666,8 @@ fn unpack_value(data: &[u8], index: usize, bits: u8) -> u8 {
 
 #[inline]
 fn packed_to_dtm(packed: u8, max_dtm: u16) -> i16 {
+    // 2·max_dtm < 2^bits ≤ 256 (`Entry::is_well_formed`): the cast keeps it whole.
+    debug_assert!(max_dtm <= 127, "packed_to_dtm: max_dtm {max_dtm}");
     packed as i16 - max_dtm as i16
 }
 
@@ -793,6 +835,7 @@ fn encode(
         let mut bp_mapped = [0usize; 8];
         for i in 0..num_black_pawns {
             let sq = cpieces[num_white_pawns + i];
+            debug_assert!((8..56).contains(&sq), "encode: black pawn on {sq}");
             let mut pi = (sq - 8) as usize;
             for &excl in &cpieces[..num_white_pawns] {
                 if (8..56).contains(&excl) && excl < sq {
@@ -847,8 +890,9 @@ fn encode(
         piece_offset += group_size;
     }
 
-    debug_assert!(idx < per_stm_size);
-    Some(idx)
+    // A directory whose per-side count is below the encoding's would send the index
+    // past the table's section; refused rather than read from the next.
+    (idx < per_stm_size).then_some(idx)
 }
 
 #[inline]
@@ -914,8 +958,9 @@ struct Layout {
     used: usize,
 }
 
-/// Reads the blob's header and directory. `None` if the blob is not one of ours
-/// or a table's frames run past its end.
+/// Reads the blob's header and directory. `None` if the blob is not one of ours,
+/// a table's frames run past its end, or the tables would need more store than
+/// [`STORE_CAPACITY_MAX`].
 fn read_directory(blob: &[u8]) -> Option<Vec<Entry>> {
     if blob.len() < HEADER_SIZE || blob[0..4] != BLOB_MAGIC || blob[4] != BLOB_VERSION {
         return None;
@@ -934,7 +979,10 @@ fn read_directory(blob: &[u8]) -> Option<Vec<Entry>> {
             let mut sig = [0u8; SIG_LEN];
             sig.copy_from_slice(&buf[0..8]);
             let flags = buf[8];
-            let comp_off = u64::from_le_bytes(buf[20..28].try_into().ok()?) as usize;
+            // Refused rather than cut short where `usize` is 32 bits (the browser): a
+            // truncated offset could land inside the blob, on another table's frames.
+            let comp_off =
+                usize::try_from(u64::from_le_bytes(buf[20..28].try_into().ok()?)).ok()?;
             let comp_sz = u32::from_le_bytes(buf[28..32].try_into().ok()?) as usize;
 
             let frames = if flags & FLAG_SINGLE_VALUE == 0 && comp_sz > 0 {
@@ -959,7 +1007,8 @@ fn read_directory(blob: &[u8]) -> Option<Vec<Entry>> {
             };
             entry.is_well_formed().then_some(entry)
         })
-        .collect()
+        .collect::<Option<Vec<Entry>>>()
+        .filter(|dir| predicted_store(dir) <= STORE_CAPACITY_MAX)
 }
 
 impl Entry {
@@ -1037,18 +1086,34 @@ fn check_layout(dir: &[Entry], layout: &Layout) -> Result<(), String> {
 /// sections run past `per_stm` — pawnful tables may carry en-passant sub-ranges —
 /// so that such a blob still loads rather than overflowing its store.
 fn store_capacity(dir: &[Entry]) -> usize {
-    let mut total = 0usize;
-    for e in dir {
-        if e.flags & FLAG_SINGLE_VALUE != 0 {
-            continue;
-        }
-        let (per_stm, bits) = (e.per_stm as usize, e.bits as usize);
-        total += if e.flags & FLAG_SPLIT_STM != 0 {
-            2 * (per_stm * bits).div_ceil(8)
-        } else {
-            (2 * per_stm * bits).div_ceil(8)
-        };
-    }
+    let bytes = predicted_store(dir);
+    debug_assert!(
+        bytes <= STORE_CAPACITY_MAX,
+        "read_directory admitted a {bytes}-byte store"
+    );
+    bytes as usize
+}
+
+/// The most store a directory may ask for, about 1.7 times what the embedded tables
+/// decode to. A directory predicting more is damaged: a per-side count that no three-
+/// or four-piece table has would otherwise be handed gigabytes of zeroes before a
+/// single frame says it is wrong.
+const STORE_CAPACITY_MAX: u64 = 1 << 28;
+
+/// [`store_capacity`] before it is checked, counted in `u64` so that no directory can
+/// wrap it — four billion entries of eight bits overflow a 32-bit `usize`.
+fn predicted_store(dir: &[Entry]) -> u64 {
+    let total: u64 = dir
+        .iter()
+        .filter_map(|e| {
+            let section = e.section_bytes()?;
+            Some(if e.flags & FLAG_SPLIT_STM != 0 {
+                2 * section
+            } else {
+                section
+            })
+        })
+        .sum();
     total + total / 64 + (64 << 10)
 }
 
@@ -1235,11 +1300,6 @@ impl Prober {
             &table.non_pawn_groups,
             table.per_stm_size as usize,
         )?;
-        // A directory whose per-side count is below the encoding's would send the
-        // index past the table's section; refused rather than read from the next.
-        if idx >= table.per_stm_size as usize {
-            return None;
-        }
 
         // For FLAG_SPLIT_STM tables, WTM and BTM sections are decompressed
         // separately and byte-aligned independently. We index into each section
@@ -1427,6 +1487,12 @@ mod tests {
         let at = entry_at(last) + 12;
         let per_stm = u32::from_le_bytes(long[at..at + 4].try_into().unwrap());
         long[at..at + 4].copy_from_slice(&(per_stm * 2).to_le_bytes());
+        // A per-side count no table has: refused from the directory alone, before the
+        // store it predicts (2.7 GB) is allocated. Found by the `gaiatb` fuzz target.
+        let mut huge = BLOB.to_vec();
+        huge[at..at + 4].copy_from_slice(&1_350_077_193u32.to_le_bytes());
+        assert!(read_directory(&huge).is_none(), "a 2.7 GB store");
+
         let long_dir = read_directory(&long).expect("the directory itself is well formed");
         assert!(Prober::private(&long, &long_dir).is_none(), "private copy");
         #[cfg(target_os = "linux")]
@@ -1468,6 +1534,51 @@ mod tests {
         write_header(&mut head, 3, Some(&layout));
         head[0] ^= 1;
         assert!(read_header(&head, 3, 100).is_err(), "not our magic");
+    }
+
+    /// A damaged table that stores +1, a win in no half-move that no table holds,
+    /// answers nothing rather than a mate against the side to move. The blob is the
+    /// three-man cut the `gaiatb` fuzz target damaged (`tests/fuzz/gaiatb/`).
+    #[test]
+    fn a_stored_win_in_no_move_is_no_answer() {
+        let blob =
+            include_bytes!("../tests/fuzz/gaiatb/4b4fde1fa5f55f988b5e89d39542fde382115c93");
+        let dir = read_directory(blob).expect("the directory reads");
+        let prober = Prober::private(blob, &dir).expect("the frames decode");
+        let mut found = 0;
+        for fen in [
+            "8/8/8/4k3/8/8/8/KQ6 w - - 0 1",
+            "8/8/8/4k3/8/8/8/KQ6 b - - 0 1",
+            "k7/8/8/8/8/8/8/1R4K1 w - - 0 1",
+            "8/8/3k4/8/8/8/4P3/4K3 w - - 0 1",
+            "8/8/3k4/8/8/8/4P3/4K3 b - - 0 1",
+            "4k3/4p3/8/8/8/8/8/3K4 w - - 0 1",
+        ] {
+            let pos = Position::from_fen(fen).unwrap();
+            let (white, black, wk, bk, pieces, np) = extract_for_probe(&pos);
+            let stm_white = pos.side_to_move == Color::White;
+            let raw = prober.probe_dtm(&white, &black, wk, bk, &pieces[..np], stm_white);
+            if raw == Some(1) {
+                found += 1;
+                assert_eq!(probe_with(&prober, &pos, 0), None, "{fen}");
+            }
+        }
+        assert!(found > 0, "the damaged table no longer stores +1 at these positions");
+    }
+
+    /// A per-side count below the encoding's sends no index past the table: the probe
+    /// answers nothing, and the other tables still do. The `gaiatb` fuzz target zeroed
+    /// KQvK's count in the three-man cut (`tests/fuzz/gaiatb/`).
+    #[test]
+    fn an_index_past_the_per_side_count_is_no_answer() {
+        let blob =
+            include_bytes!("../tests/fuzz/gaiatb/712498d8a0a1b78db00942020db71ed27c8a4929");
+        let dir = read_directory(blob).expect("the directory reads");
+        let prober = Prober::private(blob, &dir).expect("the frames decode");
+        let queen = Position::from_fen("8/8/8/4k3/8/8/8/KQ6 w - - 0 1").unwrap();
+        assert_eq!(probe_with(&prober, &queen, 0), None);
+        let rook = Position::from_fen("k7/8/8/8/8/8/8/1R4K1 w - - 0 1").unwrap();
+        assert!(probe_with(&prober, &rook, 0).is_some(), "KRvK still answers");
     }
 
     /// A first asker builds the image, a second receives it, and both read what a

@@ -29,9 +29,15 @@
 
 VARIANTS_PESTO=()
 
+# LLVM backend options for every x86-64 release binary (#216, measured on the
+# PGO universal build, Zen 5): -x86-cmov-converter=false keeps the cmovs LLVM
+# would otherwise turn back into branches, +0.50 % NPS at 1 thread and +1.05 %
+# at 8. The profile-driven ext-tsp block placement lost 0.54 % and stays off.
+X86_LLVM_ARGS="-C llvm-args=-x86-cmov-converter=false"
+
 VARIANTS_NNUE=(
-    "universal|x86-64-v3|--cfg gaia_dist|nnue,syzygy,nalimov,gaiatb,online-tb"
-    "compat|x86-64|--cfg gaia_dist|nnue,syzygy,nalimov,gaiatb,online-tb"
+    "universal|x86-64-v3|--cfg gaia_dist $X86_LLVM_ARGS|nnue,syzygy,nalimov,gaiatb,online-tb"
+    "compat|x86-64|--cfg gaia_dist $X86_LLVM_ARGS|nnue,syzygy,nalimov,gaiatb,online-tb"
 )
 
 # All x86-64 variants concatenated
@@ -198,6 +204,11 @@ native_path() {
 #   never   — never emulate (the previous behaviour).
 PGO_SDE="${PGO_SDE:-auto}"
 
+# PGO_SKIP=1 builds without profiles: the variant's own target-cpu and flags,
+# but one build instead of two and no profiling run. For a binary that is to be
+# tried, not shipped.
+PGO_SKIP="${PGO_SKIP:-0}"
+
 # Search depth for the profiling bench run. Empty = the binary's own default.
 # Emulation is only ~8x slower than native (measured on Zen 5 with SDE 10.8),
 # so the emulated run can afford a deep search: depth 13 costs ~22 s of emulated
@@ -272,8 +283,10 @@ variant_is_dispatch() {
 # GitHub runner pool is a lottery — see the SDE note above). So:
 #   - native bench runs pinned to the tiers every x86-64 runner has
 #     (GAIA_SIMD=avx2, both attack paths; plus scalar for the compat baseline);
-#   - the 512-bit tiers natively when this machine resolves them, under Intel
-#     SDE otherwise — under PGO_SDE=require they may never be silently skipped.
+#   - the AVX-VNNI and 512-bit tiers natively when this machine resolves them,
+#     under Intel SDE otherwise — under PGO_SDE=require they may never be
+#     silently skipped. Elsewhere a machine with neither (Zen 4 without SDE)
+#     leaves the AVX-VNNI kernels unprofiled rather than the whole binary.
 # All profraw files land in the same directory and are merged together.
 collect_profiles_dispatch() {
     local bin="$1" pgo_dir="$2"
@@ -295,7 +308,7 @@ collect_profiles_dispatch() {
         fi
     done
 
-    for tier in avx512 vnni512; do
+    for tier in avxvnni avx512 vnni512; do
         # The binary clamps GAIA_SIMD to what the CPU offers; ask it what a
         # forced run would actually exercise before choosing native vs SDE.
         if GAIA_SIMD="$tier" "$bin" info 2>/dev/null | grep -qE "^SIMD: +$tier "; then
@@ -308,6 +321,10 @@ collect_profiles_dispatch() {
             continue
         fi
         if [ "$PGO_SDE" = "never" ] || [ -z "$sde" ]; then
+            if [ "$tier" = avxvnni ] && [ "$PGO_SDE" != "require" ]; then
+                echo "  no way to profile the avxvnni tier of '$V_SUFFIX' here: its kernels stay unprofiled" >&2
+                continue
+            fi
             echo "  no way to profile the $tier tier of '$V_SUFFIX' on this machine" >&2
             degrade_or_fail; return
         fi
@@ -501,6 +518,12 @@ build_pgo_native() {
     # Never let a previous variant's binary survive into this one: if a build
     # fails, we must notice it instead of publishing a stale duplicate.
     rm -f "$NATIVE_BIN"
+
+    if [ "$PGO_SKIP" = 1 ]; then
+        echo "--- PGO_SKIP=1: optimized build without profiles ---"
+        build_nopgo_native "${base_flags[@]}"
+        return
+    fi
 
     # Step 1: Instrumented build
     echo "--- Step 1/4: Instrumented build ($V_CPU) ---"

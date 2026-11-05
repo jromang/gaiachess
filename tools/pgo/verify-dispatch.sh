@@ -40,6 +40,30 @@ if [ -z "$s" ]; then
     exit 1
 fi
 
+SDE="$(find_sde || true)"
+
+# The AVX-VNNI tier, natively or under Intel SDE: the AVX2 kernels with the
+# native dot product, which is exact, so it must count the AVX2 tier's nodes.
+if GAIA_SIMD=avxvnni "$U" info 2>/dev/null | grep -qE "^SIMD: +avxvnni "; then
+    n=$(nodes env GAIA_SIMD=avxvnni "$U" bench --depth "$DEPTH")
+    m=$(nodes env GAIA_SIMD=avxvnni "$C" bench --depth "$DEPTH")
+    echo "  avxvnni tier (native): universal=$n compat=$m"
+elif [ -n "$SDE" ]; then
+    n=$(nodes env GAIA_SIMD=avxvnni "$SDE" -future -- "$U" bench --depth "$DEPTH")
+    m=$(nodes env GAIA_SIMD=avxvnni "$SDE" -future -- "$C" bench --depth "$DEPTH")
+    echo "  avxvnni tier (SDE): universal=$n compat=$m"
+elif [ "${PGO_SDE:-auto}" = "require" ]; then
+    echo "ERROR: Intel SDE is required to verify the AVX-VNNI tier here" >&2
+    exit 1
+else
+    n="$a"; m="$a"
+    echo "  no Intel SDE and no native AVX-VNNI: skipping that tier's check"
+fi
+if [ -z "$n" ] || [ "$n" != "$m" ] || [ "$n" != "$a" ]; then
+    echo "ERROR: avxvnni-tier node counts disagree with each other or with the avx2 tier" >&2
+    exit 1
+fi
+
 # The AVX-512 tier: natively when this machine resolves it (the binary is
 # asked, same trick as the PGO profiling), under Intel SDE otherwise.
 if GAIA_SIMD=vnni512 "$U" info 2>/dev/null | grep -qE "^SIMD: +vnni512 "; then
@@ -47,7 +71,6 @@ if GAIA_SIMD=vnni512 "$U" info 2>/dev/null | grep -qE "^SIMD: +vnni512 "; then
     w=$(nodes env GAIA_SIMD=vnni512 "$C" bench --depth "$DEPTH")
     echo "  vnni512 tier (native): universal=$v compat=$w"
 else
-    SDE="$(find_sde || true)"
     if [ -z "$SDE" ]; then
         if [ "${PGO_SDE:-auto}" = "require" ]; then
             echo "ERROR: Intel SDE is required to verify the AVX-512 tiers here" >&2

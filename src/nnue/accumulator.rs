@@ -4,16 +4,16 @@
 #![allow(clippy::needless_range_loop)]
 //! NNUE accumulator: dual-perspective i16 vector with incremental updates.
 //!
-//! **PST Accumulator** (`Accumulator`): HalfKA piece-square features (i16 weights).
-//! Incremental push/pop via `AccDelta`. Finny table cache (13 king buckets)
-//! avoids full refresh when king stays in the same bucket.
+//! One array per perspective holds the whole feature transformer sum: the bias, the
+//! K32Q2 piece-square features, the pawn pairs and the threats (all i8 weights). An
+//! update reads and writes it once, the activation reads one array.
 //!
-//! Aux features (pawn pairs + pairwise threats) are maintained incrementally
-//! in `ThreatAccumulator` (`threats.rs`).
+//! The Finny table (`FinnyTable`) caches the bias plus the piece-square part per king
+//! square and opponent queen; the pawn pairs have their own cache in `threats.rs`.
 //!
-//! Lazily updated: `Network::ensure_updated()` walks back to the nearest
-//! accurate ancestor and applies deltas forward. Null moves mark inaccurate
-//! (stale accumulator bug prevention — see MEMORY.md).
+//! Lazily updated: `Network::ensure_all_updated()` walks back to the nearest
+//! accurate ancestor and applies the recorded moves forward. Null moves mark
+//! inaccurate (stale accumulator bug prevention — see MEMORY.md).
 
 use crate::bitboard;
 use crate::position::Position;
@@ -21,8 +21,9 @@ use crate::types::*;
 
 use super::features;
 use super::kernels::dispatch;
+use super::move_threats::MoveThreats;
 use super::network::{self, Aligned, NNUEParams};
-use super::{INPUT_BUCKETS, L1_SIZE, OUTPUT_BUCKETS};
+use super::{L1_SIZE, PSQ_PER_BLOCK, QUEEN_STATES};
 
 // ============================================================
 // Delta info — stored per ply for lazy incremental updates
@@ -38,6 +39,9 @@ pub struct AccDelta {
     /// Pre-move occupancy, captured in `push()` before `make_move()`.
     /// Avoids reconstructing old_occ from new_occ + move info in threat updates.
     pub old_occ: u64,
+    /// Per perspective, whether the move makes the opponent's queen appear or
+    /// disappear: the perspective's piece-square block changes.
+    pub queen_flip: [bool; 2],
 }
 
 impl Default for AccDelta {
@@ -47,38 +51,48 @@ impl Default for AccDelta {
             moved_piece: Piece::NONE,
             captured_piece: Piece::NONE,
             old_occ: 0,
+            queen_flip: [false; 2],
         }
     }
+}
+
+/// Whether the opponent of `perspective` has a queen in `pieces`.
+#[inline(always)]
+pub(super) fn opponent_queen(pieces: &[u64; 12], perspective: Color) -> bool {
+    pieces[Piece::new(PieceType::Queen, !perspective).index()] != 0
 }
 
 // ============================================================
 // Finny table — accumulator refresh cache
 // ============================================================
 //
-// Finny Tables (introduced by Finn Eggers). When lazy incremental updates
-// hit a king-bucket boundary (king moved to a different bucket), a full
-// refresh from scratch is expensive. Instead, we cache the FT output and
-// piece bitboards per (perspective, mirrored, bucket) slot. On refresh, we
-// diff cached vs current bitboards and apply only the changed features —
+// Finny Tables (introduced by Finn Eggers). When a move changes the piece-square
+// block of a perspective (its king moved, the opponent's queen appeared or
+// disappeared), a full refresh from scratch is expensive. Instead, we cache the FT
+// output and piece bitboards per (perspective, king square, opponent queen) slot. On
+// refresh, we diff cached vs current bitboards and apply only the changed features —
 // typically much cheaper than a full recomputation.
 //
-// Dimensions: [perspective:2][mirrored:2][bucket:INPUT_BUCKETS] (~40KB/thread).
+// Dimensions: [perspective:2][king square:64][opponent queen:2] (~560KB/thread, of
+// which a search touches the few king squares it visits).
 //
 // Reference: CPW — NNUE § Accumulator Refresh Table (Finny Tables)
 
-/// Cached accumulator values for one (perspective, mirrored, bucket) slot.
+/// Cached accumulator values for one (perspective, king square, opponent queen) slot.
 ///
 /// Stores the FT output and the piece bitboards that produced it.
-/// On a bucket-crossing refresh, we diff cached vs current bitboards
+/// On a block-changing refresh, we diff cached vs current bitboards
 /// and apply only the changed features.
 #[derive(Clone)]
 pub struct FinnyEntry {
     /// Cached FT output values for one perspective.
     pub values: Aligned<[i16; L1_SIZE]>,
-    /// Cached PSQT head sums for one perspective (no bias: empty board = 0).
-    pub psqt: [i32; OUTPUT_BUCKETS],
     /// Piece bitboards at time of caching. Indexed by raw piece (0..12).
     pub pieces: [u64; 12],
+    /// Piece on each square at time of caching (`Piece::NONE` when empty): the
+    /// piece whose feature a refresh removes from a square, read without a search
+    /// through the bitboards.
+    pub board: [Piece; 64],
 }
 
 impl FinnyEntry {
@@ -86,27 +100,44 @@ impl FinnyEntry {
         FinnyEntry {
             // Initialize with FT biases so first use = delta from empty board
             values: network::params().ft_biases.clone(),
-            psqt: [0i32; OUTPUT_BUCKETS],
             pieces: [0u64; 12],
+            board: [Piece::NONE; 64],
         }
     }
 }
 
+/// Entries in a Finny table: perspective, king square, opponent queen.
+const FINNY_ENTRIES: usize = 2 * 64 * QUEEN_STATES;
+
 /// Per-thread accumulator refresh table (Finny tables).
 ///
-/// Dimensions: `[perspective: 2][mirrored: 2][bucket: INPUT_BUCKETS]`.
-/// ~40KB per thread (36 entries x ~1.1KB each).
+/// Dimensions: `[perspective: 2][king square: 64][opponent queen: 2]`, held flat and
+/// on the heap: built in place, a nested array of 560 KB would pass through the stack.
 pub struct FinnyTable {
-    entries: Box<[[[FinnyEntry; INPUT_BUCKETS]; 2]; 2]>,
+    entries: Box<[FinnyEntry]>,
     /// Network generation at time of initialization (for EvalFile reload detection).
     generation: u64,
 }
 
+/// Where an entry sits in the Finny table: perspective, king square, opponent queen.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) struct FinnyKey {
+    pov: usize,
+    king: usize,
+    queen: usize,
+}
+
+impl FinnyKey {
+    #[inline(always)]
+    fn index(self) -> usize {
+        debug_assert!(self.pov < 2 && self.king < 64 && self.queen < QUEEN_STATES);
+        (self.pov * 64 + self.king) * QUEEN_STATES + self.queen
+    }
+}
+
 impl FinnyTable {
     pub fn new() -> Self {
-        let entries = Box::new(std::array::from_fn(|_| {
-            std::array::from_fn(|_| std::array::from_fn(|_| FinnyEntry::new()))
-        }));
+        let entries = (0..FINNY_ENTRIES).map(|_| FinnyEntry::new()).collect();
         FinnyTable {
             entries,
             generation: network::generation(),
@@ -115,12 +146,8 @@ impl FinnyTable {
 
     /// Reset all entries (e.g., after network reload).
     pub fn reset(&mut self) {
-        for pov in self.entries.iter_mut() {
-            for mirror in pov.iter_mut() {
-                for entry in mirror.iter_mut() {
-                    *entry = FinnyEntry::new();
-                }
-            }
+        for entry in self.entries.iter_mut() {
+            *entry = FinnyEntry::new();
         }
         self.generation = network::generation();
     }
@@ -131,6 +158,111 @@ impl FinnyTable {
         if self.generation != current {
             self.reset();
         }
+    }
+
+    /// The entry of `perspective` for its king on `king_sq` and the opponent queen of
+    /// `pieces`, brought to the position given by `pieces` and `board`: diffed against
+    /// what the entry last held, only the changed features applied. Returns where it
+    /// sits, for [`FinnyTable::entry`].
+    pub(super) fn bring_to(
+        &mut self,
+        params: &NNUEParams,
+        pieces: &[u64; 12],
+        board: &[Piece; 64],
+        king_sq: Square,
+        perspective: Color,
+    ) -> FinnyKey {
+        self.check_generation();
+        #[cfg(feature = "stats")]
+        super::threats::tally::add(super::threats::tally::PST_REFRESHES, 1);
+
+        let pov = perspective.index();
+        let queen = opponent_queen(pieces, perspective);
+        let flip = features::flip_mask(king_sq, perspective);
+        let block_base = features::block(king_sq, perspective, queen) * PSQ_PER_BLOCK;
+        let key = FinnyKey {
+            pov,
+            king: king_sq.index(),
+            queen: queen as usize,
+        };
+        let entry = &mut self.entries[key.index()];
+
+        // Collect adds/subs by diffing cached vs current bitboards. One pass over the
+        // twelve pairs gives the squares that gain a feature (their current piece is
+        // new there) and those that lose one (their cached piece is gone); the pieces
+        // come from the two mailboxes. Two loops of one turn per changed square, where
+        // twelve pieces with two loops each made 24 loops of unpredictable length.
+        let mut add_sqs = 0u64;
+        let mut sub_sqs = 0u64;
+        for pc in 0..12 {
+            let cached = entry.pieces[pc];
+            let current = pieces[pc];
+            add_sqs |= current & !cached;
+            sub_sqs |= cached & !current;
+        }
+
+        // Feature of `piece` on `sq` from this perspective: the block, then the plane
+        // (the side's pawn to queen, the other side's, both kings), the oriented square.
+        let feature = |piece: Piece, sq: usize| -> u32 {
+            debug_assert!(piece != Piece::NONE && sq < 64);
+            let p = piece.0 as usize;
+            let (enemy, pt) = (((p & 1) ^ pov) == 1, p >> 1);
+            let plane = if pt == 5 { features::KING_PLANE } else { enemy as usize * 5 + pt };
+            let idx = block_base + plane * 64 + (sq ^ flip as usize);
+            debug_assert_eq!(
+                idx,
+                features::feature_index(
+                    piece.color(),
+                    piece.piece_type(),
+                    Square(sq as u8),
+                    king_sq,
+                    perspective,
+                    queen
+                )
+            );
+            idx as u32
+        };
+
+        let mut adds = [0u32; 32];
+        let mut subs = [0u32; 32];
+        let mut n_adds = 0usize;
+        let mut n_subs = 0usize;
+        while add_sqs != 0 {
+            let sq = bitboard::pop_lsb(&mut add_sqs).index();
+            debug_assert!(n_adds < 32);
+            adds[n_adds] = feature(board[sq], sq);
+            n_adds += 1;
+        }
+        while sub_sqs != 0 {
+            let sq = bitboard::pop_lsb(&mut sub_sqs).index();
+            debug_assert!(n_subs < 32);
+            subs[n_subs] = feature(entry.board[sq], sq);
+            n_subs += 1;
+        }
+
+        // The piece-square rows are i8 like the threats: the same tiled kernel.
+        let values = entry.values.0.as_mut_ptr();
+        unsafe {
+            dispatch::threat_batch(
+                values,
+                values,
+                params.ft_psq_weights.0.as_ptr(),
+                &adds[..n_adds],
+                &subs[..n_subs],
+            )
+        };
+
+        // Update cache bitboards
+        entry.pieces = *pieces;
+        entry.board = *board;
+
+        key
+    }
+
+    /// The entry at `key`.
+    #[inline]
+    pub(super) fn entry(&self, key: FinnyKey) -> &FinnyEntry {
+        &self.entries[key.index()]
     }
 }
 
@@ -150,23 +282,70 @@ impl Clone for FinnyTable {
 /// Dual-perspective accumulator (one i16[L1_SIZE] per perspective).
 #[derive(Clone)]
 pub struct Accumulator {
-    /// Feature transformer output: `[white_pov][L1_SIZE]`, `[black_pov][L1_SIZE]`.
+    /// Feature transformer output: `[white_pov][L1_SIZE]`, `[black_pov][L1_SIZE]`:
+    /// the bias, the piece-square features, the pawn pairs and the threats.
     pub values: Aligned<[[i16; L1_SIZE]; 2]>,
-    /// PSQT head sums over PST features: `[pov][bucket]`, i32 ×PSQT_QUANT.
-    pub psqt: [[i32; OUTPUT_BUCKETS]; 2],
     /// Whether each perspective is up-to-date.
     pub accurate: [bool; 2],
     /// Delta from the previous ply (how we got here).
     pub delta: AccDelta,
+    /// The attacks the move into this ply created and destroyed, recorded when it
+    /// was played.
+    pub(super) moved: MoveThreats,
+}
+
+/// The piece-square features a move changes for one perspective: at most two added
+/// and two removed (castling moves two pieces, a capture takes one more off).
+pub(super) struct PsqChanges {
+    adds: [u32; 2],
+    subs: [u32; 2],
+    n_adds: usize,
+    n_subs: usize,
+}
+
+impl PsqChanges {
+    #[inline]
+    fn new() -> Self {
+        PsqChanges {
+            adds: [0; 2],
+            subs: [0; 2],
+            n_adds: 0,
+            n_subs: 0,
+        }
+    }
+
+    #[inline]
+    fn add(&mut self, f: usize) {
+        debug_assert!(self.n_adds < 2 && f < super::PSQ_SIZE);
+        self.adds[self.n_adds] = f as u32;
+        self.n_adds += 1;
+    }
+
+    #[inline]
+    fn sub(&mut self, f: usize) {
+        debug_assert!(self.n_subs < 2 && f < super::PSQ_SIZE);
+        self.subs[self.n_subs] = f as u32;
+        self.n_subs += 1;
+    }
+
+    #[inline]
+    pub(super) fn adds(&self) -> &[u32] {
+        &self.adds[..self.n_adds]
+    }
+
+    #[inline]
+    pub(super) fn subs(&self) -> &[u32] {
+        &self.subs[..self.n_subs]
+    }
 }
 
 impl Accumulator {
     pub fn new() -> Self {
         Accumulator {
             values: Aligned([[0i16; L1_SIZE]; 2]),
-            psqt: [[0i32; OUTPUT_BUCKETS]; 2],
             accurate: [false; 2],
             delta: AccDelta::default(),
+            moved: MoveThreats::new(),
         }
     }
 
@@ -174,315 +353,116 @@ impl Accumulator {
     // Full refresh — recompute from scratch
     // ============================================================
 
-    /// Recompute the accumulator for `perspective` from scratch using the current position.
+    /// Recompute the piece-square part for `perspective` from scratch using the current
+    /// position: the FT bias plus a weight row for every piece on the board, no pawn
+    /// pairs, no threats.
     ///
-    /// Starts from the FT bias and adds weight columns for every piece on the board.
     /// Reference implementation for tests: plain element-wise loops, no kernel involved,
     /// so it is one of the two sides every incremental-vs-refresh comparison stands on.
-    #[allow(dead_code)] // Used in tests only
+    /// The rows are in logical order and the accumulator in the tier's (the order
+    /// `packus` undoes): each column takes the weight of the neuron it holds.
+    #[cfg(test)]
     pub fn refresh(&mut self, pos: &Position, perspective: Color) {
+        self.refresh_with_params(network::params(), pos, perspective);
+    }
+
+    /// [`Accumulator::refresh`] with the weights `params`.
+    #[cfg(any(test, debug_assertions))]
+    pub fn refresh_with_params(&mut self, params: &NNUEParams, pos: &Position, perspective: Color) {
         let pov = perspective.index();
         let king_sq = pos.king_sq(perspective);
-        let params = network::params();
+        let queen = opponent_queen(&pos.pieces, perspective);
 
-        // Collect all active feature indices first
-        let mut feat_indices = [0usize; 32];
-        let mut n_features = 0;
-
+        let column = network::memory_to_logical();
+        let acc = &mut self.values.0[pov];
+        *acc = params.ft_biases.0;
         for pc in 0..12u8 {
-            let piece_color = if pc & 1 == 0 {
-                Color::White
-            } else {
-                Color::Black
-            };
-            let piece_type = match pc >> 1 {
-                0 => PieceType::Pawn,
-                1 => PieceType::Knight,
-                2 => PieceType::Bishop,
-                3 => PieceType::Rook,
-                4 => PieceType::Queen,
-                _ => PieceType::King,
-            };
-
+            let piece = Piece(pc);
             let mut bb = pos.pieces[pc as usize];
             while bb != 0 {
                 let sq = bitboard::pop_lsb(&mut bb);
-                feat_indices[n_features] =
-                    features::feature_index(piece_color, piece_type, sq, king_sq, perspective);
-                n_features += 1;
+                let f = features::feature_index(
+                    piece.color(),
+                    piece.piece_type(),
+                    sq,
+                    king_sq,
+                    perspective,
+                    queen,
+                );
+                let w = &params.ft_psq_weights.0[f].w;
+                for i in 0..L1_SIZE {
+                    acc[i] = acc[i].wrapping_add(w[column[i] as usize] as i16);
+                }
             }
         }
-
-        let acc = &mut self.values.0[pov];
-        *acc = params.ft_biases.0;
-        for f in 0..n_features {
-            let w = &params.ft_pst_weights.0[feat_indices[f]];
-            for i in 0..L1_SIZE {
-                acc[i] = acc[i].wrapping_add(w[i]);
-            }
-        }
-
-        let mut psqt = [0i32; OUTPUT_BUCKETS];
-        for f in 0..n_features {
-            let w = &params.psqt_pst_weights.0[feat_indices[f]];
-            for b in 0..OUTPUT_BUCKETS {
-                psqt[b] += w[b];
-            }
-        }
-        self.psqt[pov] = psqt;
-
         self.accurate[pov] = true;
     }
 
     // ============================================================
-    // Incremental update — apply delta from previous ply
+    // Incremental update — the features the move into this ply changed
     // ============================================================
 
-    /// Incrementally update this accumulator from `prev` for the given `perspective`.
+    /// The piece-square features the move into this ply changed for `perspective`.
     ///
-    /// Uses the stored delta (move, moved_piece, captured_piece) to compute which
-    /// feature indices to add and subtract.
-    ///
-    /// NOTE: `pos` is the position AFTER all moves up to `self` have been applied.
-    /// When called from `ensure_updated()` for intermediate plies in the delta
-    /// chain, `pos` is the leaf position (not the intermediate one). This is fine
-    /// because `pos` is only used for `king_sq(perspective)`, which is stable as
-    /// long as `find_update_source()` verified no king-bucket-crossing occurred.
-    pub fn update_from(
-        &mut self,
-        params: &NNUEParams,
-        prev: &Accumulator,
-        pos: &Position,
-        perspective: Color,
-    ) {
-        let pov = perspective.index();
+    /// NOTE: `pos` is the position the update ends at, not the one at this ply. It
+    /// only gives the king square of `perspective` and whether its opponent has a
+    /// queen, which name the same block all along a chain: a move that changes them is
+    /// a refresh.
+    pub(super) fn psq_changes(&self, pos: &Position, perspective: Color) -> PsqChanges {
         let delta = &self.delta;
         let mv = delta.mv;
-
-        // Null move: no features changed — copy parent values.
-        // This handler is reached when `push_null()` set `delta = AccDelta::default()`
-        // (mv = Move::NONE). The copy is deferred to here (lazy) rather than done
-        // eagerly in `push_null()`, which avoids cloning stale accumulator data when
-        // the parent's eval was TT-reused and `ensure_updated()` never ran.
-        if mv == Move::NONE {
-            self.values.0[pov] = prev.values.0[pov];
-            self.psqt[pov] = prev.psqt[pov];
-            self.accurate[pov] = true;
-            return;
-        }
-
+        debug_assert!(mv != Move::NONE, "psq_changes: null move");
         let king_sq = pos.king_sq(perspective);
+        let queen = opponent_queen(&pos.pieces, perspective);
         let piece = delta.moved_piece;
         let captured = delta.captured_piece;
-
-        // Figure out what piece type ends up on the destination
         let mt = mv.move_type();
         let from = mv.from_sq();
         let to = mv.to_sq();
         let piece_color = piece.color();
         let piece_type = piece.piece_type();
+        let feature = |color: Color, pt: PieceType, sq: Square| {
+            features::feature_index(color, pt, sq, king_sq, perspective, queen)
+        };
 
+        let mut ch = PsqChanges::new();
         match mt {
             MT_CASTLING => {
                 // Encoded as king-captures-rook: `to` is the rook origin.
-                let rook_from = to;
-                let king_to = mv.castle_king_to();
-                let rook_to = mv.castle_rook_to();
-                let sub1 = features::feature_index(
-                    piece_color,
-                    PieceType::King,
-                    from,
-                    king_sq,
-                    perspective,
-                );
-                let sub2 = features::feature_index(
-                    piece_color,
-                    PieceType::Rook,
-                    rook_from,
-                    king_sq,
-                    perspective,
-                );
-                let add1 = features::feature_index(
-                    piece_color,
-                    PieceType::King,
-                    king_to,
-                    king_sq,
-                    perspective,
-                );
-                let add2 = features::feature_index(
-                    piece_color,
-                    PieceType::Rook,
-                    rook_to,
-                    king_sq,
-                    perspective,
-                );
-                self.apply_add2_sub2(params, prev, pov, add1, add2, sub1, sub2);
+                ch.sub(feature(piece_color, PieceType::King, from));
+                ch.sub(feature(piece_color, PieceType::Rook, to));
+                ch.add(feature(piece_color, PieceType::King, mv.castle_king_to()));
+                ch.add(feature(piece_color, PieceType::Rook, mv.castle_rook_to()));
             }
             MT_EN_PASSANT => {
-                // Pawn moves, captured pawn removed from different square
+                // Pawn moves, captured pawn removed from a different square
                 let cap_sq = Square(to.0 ^ 8); // captured pawn is one rank behind
-                let sub1 = features::feature_index(
-                    piece_color,
-                    PieceType::Pawn,
-                    from,
-                    king_sq,
-                    perspective,
-                );
-                let sub2 = features::feature_index(
-                    !piece_color,
-                    PieceType::Pawn,
-                    cap_sq,
-                    king_sq,
-                    perspective,
-                );
-                let add1 =
-                    features::feature_index(piece_color, PieceType::Pawn, to, king_sq, perspective);
-                self.apply_add1_sub2(params, prev, pov, add1, sub1, sub2);
+                ch.sub(feature(piece_color, PieceType::Pawn, from));
+                ch.sub(feature(!piece_color, PieceType::Pawn, cap_sq));
+                ch.add(feature(piece_color, PieceType::Pawn, to));
             }
             MT_PROMOTION => {
-                let promo_type = mv.promo_type();
-                let sub1 = features::feature_index(
-                    piece_color,
-                    PieceType::Pawn,
-                    from,
-                    king_sq,
-                    perspective,
-                );
-                let add1 =
-                    features::feature_index(piece_color, promo_type, to, king_sq, perspective);
-
+                ch.sub(feature(piece_color, PieceType::Pawn, from));
                 if captured != Piece::NONE {
-                    // Promotion-capture
-                    let sub2 = features::feature_index(
-                        captured.color(),
-                        captured.piece_type(),
-                        to,
-                        king_sq,
-                        perspective,
-                    );
-                    self.apply_add1_sub2(params, prev, pov, add1, sub1, sub2);
-                } else {
-                    // Promotion without capture
-                    self.apply_add1_sub1(params, prev, pov, add1, sub1);
+                    ch.sub(feature(captured.color(), captured.piece_type(), to));
                 }
+                ch.add(feature(piece_color, mv.promo_type(), to));
             }
             _ => {
                 // Normal move or normal capture
-                let sub1 =
-                    features::feature_index(piece_color, piece_type, from, king_sq, perspective);
-                let add1 =
-                    features::feature_index(piece_color, piece_type, to, king_sq, perspective);
-
+                ch.sub(feature(piece_color, piece_type, from));
                 if captured != Piece::NONE {
-                    let sub2 = features::feature_index(
-                        captured.color(),
-                        captured.piece_type(),
-                        to,
-                        king_sq,
-                        perspective,
-                    );
-                    self.apply_add1_sub2(params, prev, pov, add1, sub1, sub2);
-                } else {
-                    self.apply_add1_sub1(params, prev, pov, add1, sub1);
+                    ch.sub(feature(captured.color(), captured.piece_type(), to));
                 }
+                ch.add(feature(piece_color, piece_type, to));
             }
         }
-
-        self.accurate[pov] = true;
+        ch
     }
 
-    // ============================================================
-    // Kernel entry points — the loops live in `nnue::kernels`
-    // (the 8-wide PSQT head sums stay scalar, not worth a kernel)
-    // ============================================================
-
-    /// Update the PSQT head sums from `prev` for a set of added/removed features.
-    #[inline]
-    fn psqt_apply(
-        &mut self,
-        params: &NNUEParams,
-        prev: &Accumulator,
-        pov: usize,
-        adds: &[usize],
-        subs: &[usize],
-    ) {
-        let mut psqt = prev.psqt[pov];
-        for &a in adds {
-            let w = &params.psqt_pst_weights.0[a];
-            for b in 0..OUTPUT_BUCKETS {
-                psqt[b] += w[b];
-            }
-        }
-        for &s in subs {
-            let w = &params.psqt_pst_weights.0[s];
-            for b in 0..OUTPUT_BUCKETS {
-                psqt[b] -= w[b];
-            }
-        }
-        self.psqt[pov] = psqt;
-    }
-
-    /// Normal move: one feature added, one removed.
-    #[inline]
-    fn apply_add1_sub1(
-        &mut self,
-        params: &NNUEParams,
-        prev: &Accumulator,
-        pov: usize,
-        add1: usize,
-        sub1: usize,
-    ) {
-        let vacc = self.values.0[pov].as_mut_ptr();
-        let vprev = prev.values.0[pov].as_ptr();
-        unsafe { dispatch::acc_add1_sub1(params, vprev, vacc, add1, sub1) };
-        self.psqt_apply(params, prev, pov, &[add1], &[sub1]);
-    }
-
-    /// Capture / EP: one feature added, two removed.
-    #[inline]
-    fn apply_add1_sub2(
-        &mut self,
-        params: &NNUEParams,
-        prev: &Accumulator,
-        pov: usize,
-        add1: usize,
-        sub1: usize,
-        sub2: usize,
-    ) {
-        let vacc = self.values.0[pov].as_mut_ptr();
-        let vprev = prev.values.0[pov].as_ptr();
-        unsafe { dispatch::acc_add1_sub2(params, vprev, vacc, add1, sub1, sub2) };
-        self.psqt_apply(params, prev, pov, &[add1], &[sub1, sub2]);
-    }
-
-    /// Castling: two features added, two removed.
-    #[inline]
-    fn apply_add2_sub2(
-        &mut self,
-        params: &NNUEParams,
-        prev: &Accumulator,
-        pov: usize,
-        add1: usize,
-        add2: usize,
-        sub1: usize,
-        sub2: usize,
-    ) {
-        let vacc = self.values.0[pov].as_mut_ptr();
-        let vprev = prev.values.0[pov].as_ptr();
-        unsafe { dispatch::acc_add2_sub2(params, vprev, vacc, add1, add2, sub1, sub2) };
-        self.psqt_apply(params, prev, pov, &[add1, add2], &[sub1, sub2]);
-    }
-
-    // ============================================================
-    // Finny table refresh — diff-based accumulator recomputation
-    // ============================================================
-
-    /// Refresh the accumulator using the Finny table cache.
-    ///
-    /// Instead of recomputing from scratch (bias + all 32 pieces), this diffs
-    /// the cached piece bitboards against the current position and applies only
-    /// the changed features. First use initializes the cache (equivalent to a
-    /// full refresh). Subsequent uses with the same bucket are much faster.
+    /// Bring the piece-square part of `perspective` to `pos` through `cache`, without
+    /// the pawn pairs and threats: the Finny table on its own, for its tests.
+    #[cfg(test)]
     pub fn refresh_with_cache(
         &mut self,
         params: &NNUEParams,
@@ -490,139 +470,12 @@ impl Accumulator {
         perspective: Color,
         cache: &mut FinnyTable,
     ) {
-        cache.check_generation();
-
         let pov = perspective.index();
-        let king_sq = pos.king_sq(perspective);
-        let mirrored = (king_sq.file() >= 4) as usize;
-        let flip = features::flip_mask(king_sq, perspective);
-        let king_idx = (king_sq.0 ^ flip) as usize;
-        let bucket = features::KING_BUCKETS[king_idx];
-        let entry = &mut cache.entries[pov][mirrored][bucket];
-
-        // Collect adds/subs by diffing cached vs current bitboards
-        let mut adds = [0usize; 32];
-        let mut subs = [0usize; 32];
-        let mut n_adds = 0usize;
-        let mut n_subs = 0usize;
-
-        for pc in 0..12u8 {
-            let piece_color = if pc & 1 == 0 {
-                Color::White
-            } else {
-                Color::Black
-            };
-            let piece_type = match pc >> 1 {
-                0 => PieceType::Pawn,
-                1 => PieceType::Knight,
-                2 => PieceType::Bishop,
-                3 => PieceType::Rook,
-                4 => PieceType::Queen,
-                _ => PieceType::King,
-            };
-
-            let cached = entry.pieces[pc as usize];
-            let current = pos.pieces[pc as usize];
-
-            let mut to_add = current & !cached;
-            while to_add != 0 {
-                let sq = bitboard::pop_lsb(&mut to_add);
-                debug_assert!(n_adds < 32);
-                adds[n_adds] =
-                    features::feature_index(piece_color, piece_type, sq, king_sq, perspective);
-                n_adds += 1;
-            }
-
-            let mut to_sub = cached & !current;
-            while to_sub != 0 {
-                let sq = bitboard::pop_lsb(&mut to_sub);
-                debug_assert!(n_subs < 32);
-                subs[n_subs] =
-                    features::feature_index(piece_color, piece_type, sq, king_sq, perspective);
-                n_subs += 1;
-            }
-        }
-
-        // Apply delta with SIMD register blocking
-        unsafe {
-            dispatch::finny_apply(
-                params,
-                entry.values.0.as_mut_ptr(),
-                &adds[..n_adds],
-                &subs[..n_subs],
-            )
-        };
-
-        // PSQT head: same diff, scalar (8 i32 per feature)
-        for &a in &adds[..n_adds] {
-            let w = &params.psqt_pst_weights.0[a];
-            for b in 0..OUTPUT_BUCKETS {
-                entry.psqt[b] += w[b];
-            }
-        }
-        for &s in &subs[..n_subs] {
-            let w = &params.psqt_pst_weights.0[s];
-            for b in 0..OUTPUT_BUCKETS {
-                entry.psqt[b] -= w[b];
-            }
-        }
-
-        // Update cache bitboards
-        entry.pieces = pos.pieces;
-
-        // Copy cached values to current accumulator
+        let key = cache.bring_to(params, &pos.pieces, &pos.board, pos.king_sq(perspective), perspective);
+        let entry = cache.entry(key);
         self.values.0[pov] = entry.values.0;
-        self.psqt[pov] = entry.psqt;
         self.accurate[pov] = true;
     }
-}
-
-// ============================================================
-// Helpers
-// ============================================================
-
-/// Check whether we can incrementally update from an ancestor ply,
-/// or if a full refresh is needed.
-///
-/// Returns `Some(ancestor_index)` if we can delta from that ancestor,
-/// or `None` if a full refresh is required (king changed bucket/mirroring).
-///
-/// SAFETY INVARIANT for null moves: null-move plies have
-/// `moved_piece = Piece::NONE` (piece_type = 6), which is NOT `PieceType::King`
-/// (= 5). This means the king-bucket-crossing check below correctly skips
-/// null-move plies. Do NOT change `AccDelta::default()` to use `Piece::King`
-/// or any king piece — it would incorrectly trigger a full refresh.
-pub fn find_update_source(
-    accumulators: &[Accumulator],
-    current: usize,
-    perspective: Color,
-) -> Option<usize> {
-    for i in (0..current).rev() {
-        if accumulators[i].accurate[perspective.index()] {
-            // Check all intermediate plies for king moves that change bucket
-            let mut can_update = true;
-            for j in (i + 1)..=current {
-                let delta = &accumulators[j].delta;
-                if delta.moved_piece.piece_type() == PieceType::King
-                    && delta.moved_piece.color() == perspective
-                {
-                    let from = delta.mv.from_sq();
-                    // Castling encodes `to` as the rook origin: ask where the king lands.
-                    let to = delta.mv.lands_on();
-                    if features::needs_refresh(from, to, perspective) {
-                        can_update = false;
-                        break;
-                    }
-                }
-            }
-            if can_update {
-                return Some(i);
-            } else {
-                return None;
-            }
-        }
-    }
-    None
 }
 
 #[cfg(test)]
@@ -656,30 +509,6 @@ mod tests {
         assert_eq!(ooo.castle_king_to(), Square::C1);
         assert_eq!(ooo.castle_rook_to(), Square::D1);
     }
-
-    /// Whether an ancestor accumulator survives a king move is decided by where the
-    /// king lands. Castling records the rook's origin as its `to`, so reading that
-    /// square asks about a square the king never occupies: here it would compare
-    /// g1 against h1 and refresh, though the king does not move at all.
-    #[test]
-    fn a_king_that_stays_put_castling_keeps_its_ancestor() {
-        let mut accs = [Accumulator::new(), Accumulator::new()];
-        accs[0].accurate = [true, true];
-        accs[1].accurate = [false, false];
-        accs[1].delta = AccDelta {
-            // FRC O-O with the king already on g1: only the rook travels, h1 → f1.
-            mv: Move::new_with_type(Square::G1, Square::H1, MT_CASTLING),
-            moved_piece: Piece::WHITE_KING,
-            captured_piece: Piece::NONE,
-            old_occ: 0,
-        };
-        assert_eq!(find_update_source(&accs, 1, Color::White), Some(0));
-
-        // And a king that does cross the mirror still forces the refresh.
-        accs[1].delta.mv = Move::new(Square::E1, Square::D1);
-        assert_eq!(find_update_source(&accs, 1, Color::White), None);
-    }
-
     // ============================================================
     // Finny table tests
     // ============================================================
@@ -707,10 +536,6 @@ mod tests {
                     acc_ref.values.0[pov][i], acc_finny.values.0[pov][i],
                 );
             }
-            assert_eq!(
-                acc_ref.psqt[pov], acc_finny.psqt[pov],
-                "{label}: {perspective:?} psqt mismatch",
-            );
         }
     }
 
@@ -772,15 +597,11 @@ mod tests {
                 acc2.values.0[0][i], acc_ref.values.0[0][i],
             );
         }
-        assert_eq!(
-            acc2.psqt[0], acc_ref.psqt[0],
-            "Warm cache: White psqt mismatch"
-        );
     }
 
     #[test]
     fn test_finny_king_midline_crossing() {
-        // King on e1 (file 4, mirrored=1) vs king on d1 (file 3, mirrored=0).
+        // King on e1 (mirrored) vs king on d1 (not mirrored).
         // These use different Finny entries. Both must be correct.
         let pos_e1 = Position::from_fen("4k3/8/8/8/8/8/8/4K3 w - - 0 1").unwrap();
         let pos_d1 = Position::from_fen("4k3/8/8/8/8/8/8/3K4 w - - 0 1").unwrap();
@@ -815,7 +636,7 @@ mod tests {
 
     #[test]
     fn test_finny_multiple_positions_same_bucket() {
-        // Several positions with white king on e1 (same bucket/mirror).
+        // Several positions with white king on e1 (same king square).
         // Cache should accumulate deltas correctly across multiple uses.
         let fens = [
             "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",

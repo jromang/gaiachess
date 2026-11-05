@@ -166,6 +166,32 @@ define_stats! {
     lazy_evals: u64;
     /// Nodes where the TT-cached eval was reused instead of evaluating.
     tt_eval_reused: u64;
+    /// NNUE forward passes, and the non-zero 4-byte input groups their sparse L1
+    /// read: the ratio is what reordering the feature transformer can shrink.
+    nnz_evals: u64;
+    nnz_groups: u64;
+    /// Full threat recomputes by cause: [root, no known threats within
+    /// `THREAT_CHAIN_MAX` plies, a king crossing the centre on the way].
+    threat_full: [u64; 3];
+    /// Plies whose threats were brought up to date from their parent.
+    threat_applied: u64;
+    /// Threat rows the full recomputes summed.
+    threat_full_rows: u64;
+    /// Pawn-pair rows the full recomputes took from the per-thread cache, the rows a
+    /// sum from scratch would have read instead, and the perspectives whose cached
+    /// pawns were already the current ones.
+    pawn_rows: u64;
+    pawn_rows_scratch: u64;
+    pawn_cache_hits: u64;
+    /// Accumulator vectors (one perspective, 2 KB) copied without a change: PST
+    /// across a null move, out of a refreshed Finny entry, threats across a null move
+    /// and through an empty batch; with the PST updates and threat batches around them.
+    acc_pst_null: u64;
+    acc_pst_updates: u64;
+    acc_pst_refreshes: u64;
+    acc_threat_null: u64;
+    acc_threat_empty: u64;
+    acc_threat_batches: u64;
 
     /// TT probes in the main search.
     tt_probes: u64;
@@ -375,10 +401,51 @@ impl SearchStats {
         // Eval
         let _ = writeln!(
             out,
-            "eval         calls {}  lazy {:.1}%  tt reuse {}",
+            "eval         calls {}  lazy {:.1}%  tt reuse {}  l1 groups {:.2}/{}",
             self.eval_calls,
             pct(self.lazy_evals, self.eval_calls),
-            self.tt_eval_reused
+            self.tt_eval_reused,
+            if self.nnz_evals > 0 {
+                self.nnz_groups as f64 / self.nnz_evals as f64
+            } else {
+                0.0
+            },
+            crate::nnue::L1_SIZE / 4
+        );
+
+        let full: u64 = self.threat_full.iter().sum();
+        let per_full = |n: u64| if full > 0 { n as f64 / full as f64 } else { 0.0 };
+        let _ = writeln!(
+            out,
+            "threats      applied {}  full {} (root {}, chain {}, king {})  rows/full {:.1}",
+            self.threat_applied,
+            full,
+            self.threat_full[0],
+            self.threat_full[1],
+            self.threat_full[2],
+            per_full(self.threat_full_rows)
+        );
+        let _ = writeln!(
+            out,
+            "pawn pairs   rows/full {:.1} (from scratch {:.1})  cache hits {:.1}%",
+            per_full(self.pawn_rows),
+            per_full(self.pawn_rows_scratch),
+            pct(self.pawn_cache_hits, 2 * full)
+        );
+        let copies =
+            self.acc_pst_null + self.acc_pst_refreshes + self.acc_threat_null + self.acc_threat_empty;
+        let _ = writeln!(
+            out,
+            "acc copies   pst null {} of {} updates  refresh {}  threat null {}  empty {} of {} batches ({:.1}%)  per eval {:.3} ({:.2} KB)",
+            self.acc_pst_null,
+            self.acc_pst_updates,
+            self.acc_pst_refreshes,
+            self.acc_threat_null,
+            self.acc_threat_empty,
+            self.acc_threat_batches,
+            pct(self.acc_threat_empty, self.acc_threat_batches),
+            if self.nnz_evals > 0 { copies as f64 / self.nnz_evals as f64 } else { 0.0 },
+            if self.nnz_evals > 0 { 2.0 * copies as f64 / self.nnz_evals as f64 } else { 0.0 },
         );
 
         // Aspiration + re-searches

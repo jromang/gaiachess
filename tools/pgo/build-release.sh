@@ -3,11 +3,13 @@
 # Builds all variants (PeSTO + NNUE) with PGO.
 # Profiles on native Linux, cross-compiles Windows with the same profiles.
 #
-# Usage: ./tools/pgo/build-release.sh [--linux-only|--windows-only] [net.nnue] [extra-features]
+# Usage: ./tools/pgo/build-release.sh [--linux-only|--windows-only|--console-only] [net.nnue] [extra-features]
 # Examples:
 #   ./tools/pgo/build-release.sh                           # Linux + Windows
 #   ./tools/pgo/build-release.sh --linux-only              # Linux only
+#   ./tools/pgo/build-release.sh --console-only            # Windows console engine only
 #   ./tools/pgo/build-release.sh nets/gen1.nnue spsa       # Custom net + SPSA
+#   PGO_SKIP=1 ./tools/pgo/build-release.sh                # Same variants, no PGO
 #
 # Output: individual binaries in the output directory (OUTPUT_DIR)
 #   Linux:   OUTPUT_DIR/gaiachess-linux-{suffix}
@@ -24,10 +26,14 @@ set -euo pipefail
 # triple (see build-common.sh). --linux-only / --windows-only are kept as
 # assertions — they state which platform the caller believes it is on, and fail
 # loudly when that is wrong, rather than silently building the other one.
+# --console-only builds the Windows console engine alone (see below), and leaves
+# the other binaries already in the output directory where they are.
 EXPECT_PLATFORM=""
+CONSOLE_ONLY=0
 case "${1:-}" in
     --linux-only)   EXPECT_PLATFORM=linux;   shift ;;
     --windows-only) EXPECT_PLATFORM=windows; shift ;;
+    --console-only) EXPECT_PLATFORM=windows; CONSOLE_ONLY=1; shift ;;
 esac
 
 cd "$(dirname "$0")/../.."
@@ -51,11 +57,17 @@ if [ -n "$EXPECT_PLATFORM" ] && [ "$EXPECT_PLATFORM" != "$PLATFORM" ]; then
     exit 1
 fi
 
+if [ "$CONSOLE_ONLY" = 1 ]; then
+    VARIANTS_ALL=()
+fi
+
 PGO_DIR="${PGO_DIR:-${TMPDIR:-/tmp}/gaiachess-pgo-release}"
 
 # --- Checks ---
 
-LLVM_PROFDATA=$(find_llvm_profdata) || exit 1
+if [ "$PGO_SKIP" != 1 ]; then
+    LLVM_PROFDATA=$(find_llvm_profdata) || exit 1
+fi
 VERSION=$(read_cargo_version)
 
 # Check NNUE network
@@ -69,7 +81,11 @@ fi
 # different jobs that may share an output directory.
 OUTPUT_DIR="${OUTPUT_DIR:-$ROOT_DIR/var/output/gaiachess-${VERSION}}"
 mkdir -p "$OUTPUT_DIR"
-rm -f "$OUTPUT_DIR"/gaiachess-${PLATFORM}-*
+if [ "$CONSOLE_ONLY" = 1 ]; then
+    rm -f "$OUTPUT_DIR/gaiachess-${PLATFORM}-console${EXE_SUFFIX}"
+else
+    rm -f "$OUTPUT_DIR"/gaiachess-${PLATFORM}-*
+fi
 
 # Add extra features if requested
 augment_features() {
@@ -85,8 +101,15 @@ echo "=== GaiaChess Release Build ==="
 echo "  Version:    $VERSION"
 echo "  Network:    $NET"
 echo "  Platform:   $PLATFORM (native, $HOST_TARGET)"
-echo "  Variants:   ${#VARIANTS_ALL[@]} (${#VARIANTS_PESTO[@]} PeSTO + ${#VARIANTS_NNUE[@]} NNUE)"
+if [ "$CONSOLE_ONLY" = 1 ]; then
+    echo "  Variants:   console only"
+else
+    echo "  Variants:   ${#VARIANTS_ALL[@]} (${#VARIANTS_PESTO[@]} PeSTO + ${#VARIANTS_NNUE[@]} NNUE)"
+fi
 echo "  PGO_SDE:    $PGO_SDE"
+if [ "$PGO_SKIP" = 1 ]; then
+    echo "  PGO:        skipped (PGO_SKIP=1)"
+fi
 echo
 
 TOTAL=${#VARIANTS_ALL[@]}
@@ -122,7 +145,7 @@ done
 # anyone on a pre-2013 CPU running Fritz is on their own.
 if [ "$PLATFORM" = windows ]; then
     console_features=$(augment_features "nnue,syzygy,nalimov,gaiatb,online-tb")
-    console_variant="console|x86-64-v3|--cfg gaia_dist|$console_features"
+    console_variant="console|x86-64-v3|--cfg gaia_dist $X86_LLVM_ARGS|$console_features"
 
     echo
     echo "============================================================"

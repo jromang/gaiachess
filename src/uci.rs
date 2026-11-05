@@ -337,6 +337,8 @@ fn waits_for_the_search(tokens: &[&str]) -> bool {
 pub struct UciSession {
     pos: Position,
     pool: ThreadPool,
+    /// UCI option `Ponder`: the host may ponder, so every move is budgeted for it
+    /// (see [`SearchLimits::ponder_allowed`]).
     ponder_enabled: bool,
     chess960: bool,
     /// `go` commands handled so far: the same count the stdin reader keeps in
@@ -351,7 +353,7 @@ impl UciSession {
         UciSession {
             pos: Position::from_fen(STARTPOS).expect("startpos"),
             pool: ThreadPool::new(1, 16),
-            ponder_enabled: true,
+            ponder_enabled: false,
             chess960: false,
             go_count: 0,
             searched_level: crate::skill::FULL_STRENGTH,
@@ -447,7 +449,8 @@ impl UciSession {
                 if crate::online_tb::is_enabled() {
                     crate::online_tb::ensure_worker_running();
                 }
-                let (limits, search_moves) = parse_go(rest, &self.pos);
+                let (mut limits, search_moves) = parse_go(rest, &self.pos);
+                limits.ponder_allowed = self.ponder_enabled;
                 let infinite = limits.infinite;
                 // Armed: STOP already says whether this search was stopped before it
                 // began, and must not be lowered again.
@@ -460,9 +463,9 @@ impl UciSession {
                 if !best.is_ok() {
                     // No legal move (mate or stalemate). The protocol's nullmove is 0000.
                     out!("bestmove 0000");
-                } else if self.ponder_enabled
-                    && let Some(pm) = ponder_move
-                {
+                } else if let Some(pm) = ponder_move {
+                    // Named whether or not the host allows pondering: the option only
+                    // says how the clock is to be budgeted.
                     out!(
                         "bestmove {} ponder {}",
                         best.to_uci_960(self.chess960),
@@ -562,7 +565,7 @@ impl UciSession {
             crate::threads::MAX_THREADS
         );
         out!("option name EvalFile type string default <internal>");
-        out!("option name Ponder type check default true");
+        out!("option name Ponder type check default false");
         out!("option name OwnBook type check default true");
         out!("option name MultiPV type spin default 1 min 1 max 256");
         #[cfg(not(target_arch = "wasm32"))]
@@ -664,6 +667,18 @@ pub fn uci_loop(rx: mpsc::Receiver<String>, first: Option<String>) {
             break;
         }
     }
+}
+
+/// [`parse_position`] for the fuzz targets under `fuzz/`.
+#[cfg(fuzzing)]
+pub fn fuzz_parse_position(tokens: &[&str], pos: &mut Position, chess960: bool) {
+    parse_position(tokens, pos, chess960);
+}
+
+/// [`parse_go`] for the fuzz targets under `fuzz/`.
+#[cfg(fuzzing)]
+pub fn fuzz_parse_go(tokens: &[&str], pos: &Position) -> (SearchLimits, Vec<Move>) {
+    parse_go(tokens, pos)
 }
 
 /// Parse `position [startpos|fen ...] [moves ...]`.
@@ -828,6 +843,14 @@ const GO_KEYWORDS: &[&str] = &[
     "infinite",
 ];
 
+/// After the tables were reallocated: how many got large pages, where the platform
+/// can tell (Windows).
+fn report_large_pages() {
+    if let Some(line) = crate::largemem::summary() {
+        out!("info string {line}");
+    }
+}
+
 /// Parse `setoption name <N...> [value <V...>]`.
 /// Supports multi-word option names (e.g. "Move Overhead") and button options
 /// with no value (`setoption name Clear Hash`).
@@ -861,18 +884,21 @@ fn parse_setoption(
         "hash" => {
             if let Ok(mb) = value.parse::<usize>() {
                 pool.resize_hash(mb.clamp(1, 1_048_576));
+                report_large_pages();
             }
         }
         "threads" => {
             if let Ok(n) = value.parse::<usize>() {
                 pool.resize_threads(n.clamp(1, crate::threads::MAX_THREADS));
                 out!("info string {}", pool.numa_summary());
+                report_large_pages();
             }
         }
         "numapolicy" => match crate::numa::NumaPolicy::parse(&value) {
             Some(policy) => {
                 pool.set_numa_policy(policy);
                 out!("info string {}", pool.numa_summary());
+                report_large_pages();
             }
             None => {
                 out!("info string NumaPolicy: invalid value '{value}', keeping the previous one")
@@ -939,17 +965,15 @@ fn parse_setoption(
                     pool.clear();
                 }
                 out!("info string Using default evaluation");
+            } else if crate::nnue::network::is_loaded_from(&value) {
+                // A match runner sends every option again before each game: the
+                // network in service is that file, unchanged, and so are the table and
+                // the caches it filled.
+                out!("info string NNUE network from {value} already in use");
             } else {
-                use crate::nnue::integrity::Provenance;
                 match crate::nnue::network::load_from_file(&value) {
-                    Ok(Provenance::Verified) => {
+                    Ok(()) => {
                         out!("info string Loaded NNUE network from {value} (integrity verified)");
-                        pool.clear();
-                    }
-                    Ok(Provenance::Legacy) => {
-                        out!(
-                            "info string Loaded NNUE network from {value} (legacy, no integrity footer)"
-                        );
                         pool.clear();
                     }
                     Err(e) => {
@@ -964,9 +988,13 @@ fn parse_setoption(
                 if value == "<empty>" {
                     crate::tb::free();
                 } else {
+                    // A match runner sends the option again before every game: the same
+                    // path with no table added or removed keeps the tables mapped.
+                    if !crate::tb::is_loaded_from(&value) {
+                        crate::tb::init(&value);
+                    }
                     // Said every time, found or not: a wrong path is otherwise silent,
                     // and the GUI's user would play on believing the tables are there.
-                    crate::tb::init(&value);
                     let (wdl, dtz) = crate::tb::file_counts();
                     out!(
                         "info string Found {wdl} WDL and {dtz} DTZ tablebase files (up to {}-man).",
@@ -982,6 +1010,13 @@ fn parse_setoption(
             {
                 if value == "<empty>" {
                     crate::nalimov::free();
+                } else if crate::nalimov::is_loaded_from(&value) {
+                    // Sent again before every game by a match runner: the prober and its
+                    // cache of decompressed blocks stay.
+                    out!(
+                        "info string Nalimov tablebases from {value} already in use ({}-piece)",
+                        crate::nalimov::max_pieces()
+                    );
                 } else if !crate::nalimov::init(&value) {
                     out!("info string Failed to load Nalimov tablebases from {value}");
                 } else {
@@ -1128,8 +1163,8 @@ fn print_eval(pos: &Position) {
             out!("NNUE eval:  N/A (in check)");
         }
         let pieces = pos.occupied().count_ones();
-        let bucket = nnue::output_bucket(pos);
-        out!("Output bucket: {} (pieces: {})", bucket, pieces);
+        let stack = nnue::stack(pos);
+        out!("Layer stack: {} (pieces: {})", stack, pieces);
     } else {
         out!("NNUE: no network loaded");
     }
@@ -1267,6 +1302,28 @@ mod tests {
         );
         assert!(text.contains("Failed to load network"), "{text}");
         assert_eq!(crate::tb::max_pieces(), 0);
+    }
+
+    /// A match runner sends `SyzygyPath` again before every game: the same path keeps the
+    /// tables in service, until a table is added to or removed from one of its
+    /// directories (#229).
+    #[cfg(feature = "syzygy")]
+    #[test]
+    fn the_same_tablebase_path_is_scanned_again_only_once_it_changed() {
+        let _guard = lock_transcript();
+        let dir = std::env::temp_dir().join(format!("gaia-tb-stamp-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.to_str().unwrap().to_owned();
+        crate::tb::init(&path);
+        assert!(crate::tb::is_loaded_from(&path));
+        assert!(!crate::tb::is_loaded_from("/nonexistent/gaiachess/syzygy"));
+        // A directory's time has a granularity: the new table lands after it ticks.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(dir.join("KQvK.rtbw"), b"").unwrap();
+        assert!(!crate::tb::is_loaded_from(&path), "a table was added since");
+        crate::tb::free();
+        assert!(!crate::tb::is_loaded_from(&path), "nothing in service");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// `go perft N` counts the move tree, as perft harnesses expect, instead of starting
@@ -2096,9 +2153,11 @@ mod tests {
         let _guard = lock_transcript();
         // David's queen endgames exposed this protocol bug: if the node limit landed
         // during an aspiration re-search, the old engine left a transient bound as the
-        // last line before bestmove.  This position/budget deterministically interrupts
-        // such a re-search, so the penultimate search line must be a bound while the
-        // final snapshot must restore the last completed PV.
+        // last line before bestmove.  This position/budget interrupts such a re-search,
+        // so the penultimate search line must be a bound while the final snapshot must
+        // restore the last completed PV. Where the budget lands depends on the tree: if
+        // a fail-high of the unfinished iteration stands at the front, the snapshot
+        // reports that move with the bound its fail-high line published.
         let text = transcript(
             "final-info",
             &[
@@ -2125,7 +2184,7 @@ mod tests {
             "final info did not contain a score and a complete PV: {text}"
         );
         assert!(
-            !final_info.contains("lowerbound") && !final_info.contains("upperbound"),
+            !final_info.contains("upperbound"),
             "final info repeated a transient aspiration bound: {text}"
         );
 
@@ -2167,10 +2226,38 @@ mod tests {
             .map(|line| depth_of(line))
             .max()
             .expect("an exact iteration");
-        assert_eq!(
-            depth_of(final_info),
-            deepest_exact,
-            "final info is not the deepest completed iteration: {text}"
-        );
+        if final_info.contains("lowerbound") {
+            // Stopped while a fail-high of the unfinished iteration stands at the
+            // front: the move it proved better is played, one iteration past the last
+            // completed one, with the very bound its fail-high line published.
+            let score_of = |line: &str| -> Option<(String, String)> {
+                let mut rest = line.split(" score ").nth(1)?.split_whitespace();
+                Some((rest.next()?.to_string(), rest.next()?.to_string()))
+            };
+            let pv_head = |line: &str| {
+                line.split(" pv ")
+                    .nth(1)
+                    .and_then(|pv| pv.split_whitespace().next())
+                    .map(str::to_string)
+            };
+            assert_eq!(
+                depth_of(final_info),
+                deepest_exact + 1,
+                "final lower bound is not from the iteration in progress: {text}"
+            );
+            assert!(
+                search_info.iter().any(|line| line.contains("lowerbound")
+                    && depth_of(line) == depth_of(final_info)
+                    && score_of(line) == score_of(final_info)
+                    && pv_head(line) == pv_head(final_info)),
+                "final lower bound was never published by a fail-high: {text}"
+            );
+        } else {
+            assert_eq!(
+                depth_of(final_info),
+                deepest_exact,
+                "final info is not the deepest completed iteration: {text}"
+            );
+        }
     }
 }

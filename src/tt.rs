@@ -5,12 +5,16 @@
 //! each plus 2 bytes padding. Indexed via Lemire fast-modulo reduction.
 //! Replacement policy: same-key or empty first, then lowest quality (depth - 4*age).
 //!
-//! Thread-safe for Lazy SMP: `probe(&self)` and `store(&self)` write through raw
-//! pointers into the shared table. Concurrent writes may race, but the 16-bit
-//! verification key detects most corruptions. This is the standard lockless TT
-//! approach used by all modern chess engines.
+//! Thread-safe for Lazy SMP: every thread reads and writes the shared table at once,
+//! without a lock. Each field of an entry is an atomic, read and written `Relaxed`,
+//! one field at a time: the semantics of the usual lockless table (a field written
+//! separately, nothing spilling onto a neighbour), with defined behaviour where
+//! ordinary racing accesses would not have any in Rust. An entry read while another
+//! thread writes it can mix two writes; the 16-bit verification key and the checks of
+//! its readers catch that. On x86 and ARM a `Relaxed` access of this size is the
+//! plain load or store it replaces.
 
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicI8, AtomicI16, AtomicU8, AtomicU16, Ordering};
 
 use crate::largemem::LargeMem;
 
@@ -34,7 +38,7 @@ pub enum Bound {
     Upper = 3, // fail-low
 }
 
-/// Internal TT entry (10 bytes, packed).
+/// A copy of a TT entry (10 bytes), read out of the table or about to be written.
 #[derive(Clone, Copy)]
 #[repr(C)]
 struct TTEntry {
@@ -47,16 +51,6 @@ struct TTEntry {
 }
 
 impl TTEntry {
-    #[cfg(test)]
-    const EMPTY: TTEntry = TTEntry {
-        key: 0,
-        mv: 0,
-        score: 0,
-        eval: 0,
-        depth: 0,
-        flags: 0,
-    };
-
     #[inline]
     fn bound(&self) -> Bound {
         match self.flags & 3 {
@@ -83,11 +77,48 @@ impl TTEntry {
     }
 }
 
+/// An entry as it lives in the shared table: the layout of [`TTEntry`], each field an
+/// atomic of the same size. All zeros is the empty entry.
+#[repr(C)]
+struct AtomicEntry {
+    key: AtomicU16,
+    mv: AtomicU16,
+    score: AtomicI16,
+    eval: AtomicI16,
+    depth: AtomicI8,
+    flags: AtomicU8,
+}
+
+impl AtomicEntry {
+    #[cfg(test)]
+    const EMPTY: AtomicEntry = AtomicEntry {
+        key: AtomicU16::new(0),
+        mv: AtomicU16::new(0),
+        score: AtomicI16::new(0),
+        eval: AtomicI16::new(0),
+        depth: AtomicI8::new(0),
+        flags: AtomicU8::new(0),
+    };
+
+    /// A copy of the entry, field by field. Fields written by another thread in the
+    /// meantime may come from different writes.
+    #[inline]
+    fn load(&self) -> TTEntry {
+        TTEntry {
+            key: self.key.load(Ordering::Relaxed),
+            mv: self.mv.load(Ordering::Relaxed),
+            score: self.score.load(Ordering::Relaxed),
+            eval: self.eval.load(Ordering::Relaxed),
+            depth: self.depth.load(Ordering::Relaxed),
+            flags: self.flags.load(Ordering::Relaxed),
+        }
+    }
+}
+
 /// A 32-byte aligned cluster of 3 TT entries (30 bytes + 2 padding).
-#[derive(Clone, Copy)]
 #[repr(C, align(32))]
 struct Cluster {
-    entries: [TTEntry; 3],
+    entries: [AtomicEntry; 3],
     _padding: [u8; 2],
 }
 
@@ -95,7 +126,7 @@ impl Cluster {
     /// The empty cluster: all zero bytes, which is what fresh table memory holds.
     #[cfg(test)]
     const EMPTY: Cluster = Cluster {
-        entries: [TTEntry::EMPTY; 3],
+        entries: [AtomicEntry::EMPTY; 3],
         _padding: [0; 2],
     };
 }
@@ -104,6 +135,10 @@ impl Cluster {
 const _: () = assert!(
     std::mem::size_of::<TTEntry>() == 10,
     "TTEntry must be 10 bytes"
+);
+const _: () = assert!(
+    std::mem::size_of::<AtomicEntry>() == 10 && std::mem::align_of::<AtomicEntry>() == 2,
+    "AtomicEntry must have the layout of TTEntry"
 );
 const _: () = assert!(
     std::mem::size_of::<Cluster>() == 32,
@@ -135,13 +170,16 @@ pub struct TTHit {
 
 /// The transposition table.
 ///
-/// Thread-safe for Lazy SMP via interior mutability: multiple threads may read and
-/// write concurrently; the 16-bit key detects most corruptions from data races.
+/// Thread-safe for Lazy SMP: every field is an atomic, so threads read and write it
+/// concurrently with defined behaviour; the 16-bit key rejects most entries mixed by
+/// two writes.
 ///
 /// The clusters live on large pages, straight from the operating system: a fresh
 /// table is all zeros, which is the empty cluster, and each page is placed on the
 /// memory node of the thread that first writes it. The thread pool clears a new table
-/// in parallel so that every node holds its share.
+/// in parallel so that every node holds its share. Windows large pages are the
+/// exception: committed at allocation, the whole table lands on the node of the
+/// thread that sized it, and the clear moves nothing.
 pub struct TT {
     mem: LargeMem,
     /// Clusters in `mem`.
@@ -149,9 +187,9 @@ pub struct TT {
     age: AtomicU8,
 }
 
-// SAFETY: Concurrent reads/writes to TT clusters are intentionally racy.
-// The 16-bit verification key catches most corruption. This is the standard
-// lockless TT approach used by all modern chess engines.
+// SAFETY: during a search the clusters are only reached through shared references to
+// their atomic fields. The only non-atomic writes are the clears (`clear_part`, the
+// fresh allocation), made while no search runs.
 unsafe impl Sync for TT {}
 
 /// Clusters in a table of `mb` megabytes.
@@ -265,14 +303,24 @@ impl TT {
     pub fn probe(&self, key: u64, ply: i32, halfmove_clock: u8) -> Option<TTHit> {
         debug_assert!((0..256).contains(&ply), "TT probe: ply {} OOB", ply);
         // SAFETY: Racy reads are acceptable; key16 verification catches corruption.
+        // SAFETY: within the table; the fields are atomics, shared freely.
         let cluster = unsafe { &*self.cluster_ptr(self.index(key)) };
         let verify = verification_key(key);
 
-        for entry in &cluster.entries {
+        for slot in &cluster.entries {
+            // The key first: most slots belong to another position, and each field
+            // read is an atomic load the compiler cannot merge with its neighbours.
+            if slot.key.load(Ordering::Relaxed) != verify {
+                continue;
+            }
+            // Then one copy, read once: another thread may be writing this slot, and
+            // the fields of a hit must at least come from a single read of each.
+            let entry = slot.load();
             if entry.key == verify && !entry.is_empty() {
+                let bound = entry.bound();
                 // An eval-only entry has no score: SCORE_NONE must come back as it went
                 // in, not through the mate adjustment that would make it a won score.
-                let score = if entry.bound() == Bound::None {
+                let score = if bound == Bound::None {
                     SCORE_NONE
                 } else {
                     score_from_tt(entry.score as i32, ply, halfmove_clock)
@@ -282,7 +330,7 @@ impl TT {
                     score,
                     eval: entry.eval as i32,
                     depth: entry.depth as i32,
-                    bound: entry.bound(),
+                    bound,
                     pv: entry.pv(),
                 });
             }
@@ -331,32 +379,36 @@ impl TT {
             mv.to_sq().0
         );
         let idx = self.index(key);
-        // SAFETY: Racy writes are acceptable; key16 verification catches corruption.
-        let cluster = unsafe { &mut *self.cluster_ptr(idx) };
+        // SAFETY: within the table; the fields are atomics, shared freely.
+        let cluster = unsafe { &*self.cluster_ptr(idx) };
         let verify = verification_key(key);
         let tt_age = self.age.load(Ordering::Relaxed);
 
-        // Find the best replacement slot
+        // Find the best replacement slot, reading only what the choice needs.
         let mut replace_idx = 0usize;
         let mut lowest_quality = i32::MAX;
 
-        for (i, entry) in cluster.entries.iter().enumerate() {
+        for (i, slot) in cluster.entries.iter().enumerate() {
+            let key = slot.key.load(Ordering::Relaxed);
+            let depth = slot.depth.load(Ordering::Relaxed);
             // Exact key match or empty slot: use immediately
-            if entry.key == verify || entry.is_empty() {
+            if key == verify || (depth == 0 && key == 0) {
                 replace_idx = i;
                 break;
             }
 
             // Otherwise pick the lowest-quality entry
-            let relative_age = ((AGE_CYCLE + tt_age - entry.age()) & AGE_MASK) as i32;
-            let quality = entry.depth as i32 - AGE_WEIGHT * relative_age;
+            let age = slot.flags.load(Ordering::Relaxed) >> 3;
+            let relative_age = ((AGE_CYCLE + tt_age - age) & AGE_MASK) as i32;
+            let quality = depth as i32 - AGE_WEIGHT * relative_age;
             if quality < lowest_quality {
                 lowest_quality = quality;
                 replace_idx = i;
             }
         }
 
-        let entry = &mut cluster.entries[replace_idx];
+        let slot = &cluster.entries[replace_idx];
+        let entry = slot.load();
 
         // An evaluation alone adds nothing to an entry of the same position, which
         // already holds one beside its score.
@@ -366,7 +418,7 @@ impl TT {
 
         // Preserve existing move if we don't have a new one and key matches
         if mv != Move::NONE || entry.key != verify {
-            entry.mv = mv.0;
+            slot.mv.store(mv.0, Ordering::Relaxed);
         }
 
         // Only overwrite data if the new entry is valuable enough.
@@ -376,18 +428,21 @@ impl TT {
             || depth + 2 * (pv as i32) > entry.depth as i32 - 4
             || entry.age() != tt_age
         {
-            entry.key = verify;
-            entry.score = if score == SCORE_NONE {
+            slot.key.store(verify, Ordering::Relaxed);
+            let stored = if score == SCORE_NONE {
                 SCORE_NONE as i16
             } else {
                 score_to_tt(score, ply) as i16
             };
+            slot.score.store(stored, Ordering::Relaxed);
             // Saturated: an evaluation, or SCORE_NONE, always fits; nothing wraps.
-            entry.eval = eval.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+            let eval = eval.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+            slot.eval.store(eval, Ordering::Relaxed);
             // Saturated, never wrapped: 128 read back as -128 would be the
             // shallowest entry in the table instead of the deepest.
-            entry.depth = depth.clamp(i8::MIN as i32, i8::MAX as i32) as i8;
-            entry.flags = (bound as u8) | ((pv as u8) << 2) | (tt_age << 3);
+            slot.depth.store(depth.clamp(i8::MIN as i32, i8::MAX as i32) as i8, Ordering::Relaxed);
+            let flags = (bound as u8) | ((pv as u8) << 2) | (tt_age << 3);
+            slot.flags.store(flags, Ordering::Relaxed);
         } else if entry.depth >= 5
             && entry.bound() != Bound::Exact
             && is_decisive(entry.score as i32)
@@ -396,7 +451,7 @@ impl TT {
             // turning shallower writes away loses a ply each time, so that a proof
             // found nearer the root, or a shorter mate, can take its place instead
             // of being refused for ever by the depth of a stale bound.
-            entry.depth -= 1;
+            slot.depth.store(entry.depth - 1, Ordering::Relaxed);
         }
     }
 
@@ -406,9 +461,10 @@ impl TT {
         let age = self.age.load(Ordering::Relaxed);
         let mut used = 0;
         for i in 0..sample {
-            // SAFETY: Read-only sampling, racy reads acceptable.
+            // SAFETY: within the table; the fields are atomics, shared freely.
             let cluster = unsafe { &*self.cluster_ptr(i) };
-            for entry in &cluster.entries {
+            for slot in &cluster.entries {
+                let entry = slot.load();
                 if !entry.is_empty() && entry.age() == age {
                     used += 1;
                 }
@@ -447,20 +503,34 @@ fn score_to_tt(score: i32, ply: i32) -> i32 {
         "score_to_tt: score {} too large",
         score
     );
-    if score >= SCORE_TB_WIN_IN_MAX {
+    let stored = if score >= SCORE_TB_WIN_IN_MAX {
         score + ply
     } else if score <= -SCORE_TB_WIN_IN_MAX {
         score - ply
     } else {
         score
-    }
+    };
+    // A mate is never nearer the root than the node that stores it: relative to the
+    // node it is at most SCORE_MATE, which keeps it clear of SCORE_NONE (32 002).
+    debug_assert!(
+        stored.abs() <= SCORE_MATE,
+        "score_to_tt: {score} at ply {ply} stores as {stored}"
+    );
+    stored
 }
 
 /// Adjust score from TT retrieval: convert mate/TB-from-position to mate/TB-from-root.
 /// Also downgrades unreachable mate/TB scores when the halfmove clock is too high
 /// ([Graph History Interaction](https://www.chessprogramming.org/Graph_History_Interaction) fix).
+///
+/// SCORE_NONE comes back unchanged. The table is written without locks, so a probe can
+/// meet the score of an eval-only entry under the bound of the entry it replaced; taken
+/// through the mate adjustment, 32 002 would read as a won score beyond any mate.
 #[inline]
 fn score_from_tt(score: i32, ply: i32, halfmove_clock: u8) -> i32 {
+    if score == SCORE_NONE {
+        return SCORE_NONE;
+    }
     let moves_left = 100 - halfmove_clock as i32;
     if score >= SCORE_TB_WIN_IN_MAX {
         // Downgrade potentially false mate score (GHI fix)
@@ -557,8 +627,10 @@ mod tests {
         let key: u64 = 0xAAAA_BBBB_CCCC_DDDD;
         let mv = Move::new(Square::E2, Square::E4);
 
-        // Store a mate-in-3 score at ply 5
-        let mate_score = SCORE_MATE - 3;
+        // Store, at ply 5, a mate delivered 3 plies further: ply 8 from the root.
+        // (A mate nearer the root than the node itself cannot happen, and would be
+        // stored as SCORE_MATE + 2 = SCORE_NONE.)
+        let mate_score = SCORE_MATE - 8;
         tt.store(key, 10, 0, mate_score, Bound::Exact, mv, 5, false);
 
         // Probe at ply 5 should give back the original score
@@ -687,6 +759,68 @@ mod tests {
             assert_eq!(hit.mv, Move::NONE);
             assert!(hit.pv);
         }
+    }
+
+    /// SCORE_NONE survives the conversion at every ply and halfmove clock.
+    #[test]
+    fn no_score_stays_no_score() {
+        for ply in 0..256 {
+            for hmc in 0..=100u8 {
+                assert_eq!(score_from_tt(SCORE_NONE, ply, hmc), SCORE_NONE);
+            }
+        }
+    }
+
+    /// A slot caught halfway through a write: the key and SCORE_NONE of an eval-only
+    /// entry under the lower bound of the entry it replaces. The probe must not turn
+    /// that score into a won one.
+    #[test]
+    fn a_torn_entry_never_reads_as_a_win() {
+        let tt = TT::new(1);
+        let key: u64 = 0xDEAD_0007;
+        tt.store(key, 9, 40, 75, Bound::Lower, Move::NONE, 0, false);
+        // SAFETY: within the table; the slot is written as a racing store would.
+        let cluster = unsafe { &*tt.cluster_ptr(tt.index(key)) };
+        let slot = cluster
+            .entries
+            .iter()
+            .find(|e| e.load().key == verification_key(key))
+            .expect("stored");
+        slot.score.store(SCORE_NONE as i16, Ordering::Relaxed);
+        for ply in [0, 5, 60] {
+            let hit = tt.probe(key, ply, 0).expect("still found");
+            assert_eq!(hit.bound, Bound::Lower);
+            assert_eq!(hit.score, SCORE_NONE, "ply {ply}");
+        }
+    }
+
+    /// Four threads storing and probing one small table at once: every hit they read,
+    /// whatever writes it mixes, keeps the invariants its readers rely on.
+    #[test]
+    fn concurrent_stores_and_probes_keep_entries_readable() {
+        let tt = TT::new(1);
+        std::thread::scope(|s| {
+            for t in 0..4u64 {
+                let tt = &tt;
+                s.spawn(move || {
+                    let mut x = 0x9E37_79B9_7F4A_7C15u64 ^ (t << 32);
+                    for i in 0..200_000 {
+                        x ^= x << 13;
+                        x ^= x >> 7;
+                        x ^= x << 17;
+                        // Few keys, so that the threads keep meeting in the same slots.
+                        let key = x % 4096;
+                        if i % 3 == 0 {
+                            tt.store(key, (x % 20) as i32, 50, (x % 600) as i32 - 300, Bound::Lower, Move::NONE, 3, false);
+                        } else if let Some(hit) = tt.probe(key, 3, 0) {
+                            assert!(hit.score == SCORE_NONE || hit.score.abs() <= SCORE_MATE);
+                            assert!((-128..128).contains(&hit.depth));
+                        }
+                    }
+                });
+            }
+        });
+        assert!(tt.hashfull() > 0);
     }
 
     /// An eval-only write never replaces a searched entry of the same key.

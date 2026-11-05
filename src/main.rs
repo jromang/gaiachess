@@ -175,6 +175,40 @@ enum Cmd {
         fen: String,
     },
 
+    /// Reorder the feature transformer so the sparse L1 skips more of it (evaluation unchanged)
+    #[bpaf(command)]
+    Ftperm {
+        /// Network to reorder (.bin)
+        #[bpaf(short('i'), long, argument("PATH"))]
+        input: std::path::PathBuf,
+        /// Where to write the reordered network
+        #[bpaf(short('o'), long, argument("PATH"))]
+        output: std::path::PathBuf,
+        /// Positions to learn from, one FEN or EPD per line; each is sampled with its children
+        #[bpaf(short('e'), long, argument("PATH"))]
+        epd: std::path::PathBuf,
+        /// At most this many positions of the file, evenly spread (0 = all)
+        #[bpaf(short('n'), long, fallback(0usize), display_fallback)]
+        positions: usize,
+        /// At most this many passes of pair swaps
+        #[bpaf(long, fallback(200usize), display_fallback)]
+        passes: usize,
+        /// Threads for the search of the order (0 = all cores)
+        #[bpaf(short('t'), long, fallback(0usize), display_fallback)]
+        threads: usize,
+    },
+
+    /// Evaluation throughput: every legal move of each position played and evaluated
+    #[bpaf(command)]
+    Evalbench {
+        /// Positions, one FEN or EPD per line
+        #[bpaf(short('e'), long, argument("PATH"))]
+        epd: std::path::PathBuf,
+        /// Passes over the file
+        #[bpaf(short('r'), long, fallback(3usize), display_fallback)]
+        rounds: usize,
+    },
+
     /// Display build configuration
     #[bpaf(command)]
     Info,
@@ -601,6 +635,25 @@ fn real_main(cmd: Cmd, stdin: ProbedStdin) {
             let pos = position::Position::from_fen(&fen).expect("invalid FEN");
             nnue::threats::dump_features(&pos);
         }
+        Cmd::Ftperm {
+            input,
+            output,
+            epd,
+            positions,
+            passes,
+            threads,
+        } => {
+            let threads = if threads == 0 {
+                std::thread::available_parallelism().map_or(1, |n| n.get())
+            } else {
+                threads
+            };
+            if let Err(e) = nnue::ftperm::run(&input, &output, &epd, positions, passes, threads) {
+                eprintln!("ftperm: {e}");
+                std::process::exit(1);
+            }
+        }
+        Cmd::Evalbench { epd, rounds } => bench::run_eval(&epd, rounds),
         Cmd::Info => {
             println!("GaiaChess {}", env!("CARGO_PKG_VERSION"));
             println!();
@@ -662,10 +715,11 @@ fn real_main(cmd: Cmd, stdin: ProbedStdin) {
                     ""
                 };
                 println!(
-                    "SIMD:        {} ({how}), nnz {}, move threats {}{threats_forced}{forced}",
+                    "SIMD:        {} ({how}), nnz {}, move threats {}{threats_forced}, quiet moves {}{forced}",
                     d.tier.name(),
                     d.nnz.name(),
                     d.threats.name(),
+                    cpu::effective_movelist().name(),
                 );
                 let slider = cpu::effective_attacks();
                 let setwise = if cpu::effective_setwise512() {

@@ -365,6 +365,7 @@ pub fn noise(score: i32, key: u64, snap: &Snapshot) -> i32 {
 /// A number in `[-window, window]`, taken from the low bits of a mixed hash.
 #[inline]
 fn draw(hash: u64, window: i32) -> i32 {
+    debug_assert!((0..1 << 30).contains(&window), "draw: window {window}");
     (hash % (2 * window as u64 + 1)) as i32 - window
 }
 

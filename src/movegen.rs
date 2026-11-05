@@ -264,7 +264,117 @@ pub fn generate_captures(pos: &Position, buf: &mut ArrayBuf<ScoredMove, MAX_MOVE
 /// Generate pseudo-legal quiet moves (non-captures, including castling). Returns count.
 /// Writes directly into a `ScoredMove` buffer (score = 0, filled later by MovePicker).
 /// The caller must filter with `is_legal()`.
+#[inline]
 pub fn generate_quiets(pos: &Position, buf: &mut ArrayBuf<ScoredMove, MAX_MOVES>) -> usize {
+    // SAFETY: the compression writer runs only where its instructions exist: pinned by
+    // the build target, or elected from CPUID by `cpu::resolve`.
+    unsafe {
+        #[cfg(target_arch = "x86_64")]
+        {
+            if cfg!(all(
+                target_feature = "avx512f",
+                target_feature = "avx512bw",
+                target_feature = "avx512vbmi2"
+            )) {
+                x86::quiets_compress(pos, buf)
+            } else {
+                (crate::cpu::get().generate_quiets)(pos, buf)
+            }
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            generate_quiets_with::<Serial>(pos, buf)
+        }
+    }
+}
+
+/// [`generate_quiets`] writing one move at a time: the dispatch entry of CPUs without
+/// byte compression.
+#[cfg(target_arch = "x86_64")]
+pub(crate) unsafe fn quiets_serial(
+    pos: &Position,
+    buf: &mut ArrayBuf<ScoredMove, MAX_MOVES>,
+) -> usize {
+    // SAFETY: the serial writer uses no instruction beyond the build target.
+    unsafe { generate_quiets_with::<Serial>(pos, buf) }
+}
+
+/// How the quiet generator writes the moves of a target set: one bit at a time, or the
+/// whole set at once. Both write the same moves in the same order.
+trait Splat {
+    /// Append `Move::new(from, to)` for every `to` of `targets`, lowest square first.
+    /// The set holds at most `8 * CHUNKS` squares.
+    unsafe fn moves<const CHUNKS: usize>(
+        buf: &mut ArrayBuf<ScoredMove, MAX_MOVES>,
+        count: &mut usize,
+        from: Square,
+        targets: u64,
+    );
+
+    /// Append `Move::new(to - back, to)` for every `to` of `targets`, lowest square
+    /// first: the pushes of at most 8 pawns.
+    unsafe fn pushes(
+        buf: &mut ArrayBuf<ScoredMove, MAX_MOVES>,
+        count: &mut usize,
+        back: i8,
+        targets: u64,
+    );
+}
+
+/// One move per bit, the loop exit taken after the last.
+struct Serial;
+
+impl Splat for Serial {
+    #[inline(always)]
+    unsafe fn moves<const CHUNKS: usize>(
+        buf: &mut ArrayBuf<ScoredMove, MAX_MOVES>,
+        count: &mut usize,
+        from: Square,
+        mut targets: u64,
+    ) {
+        while targets != 0 {
+            let to = pop_lsb(&mut targets);
+            emit_scored(buf, count, Move::new(from, to));
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn pushes(
+        buf: &mut ArrayBuf<ScoredMove, MAX_MOVES>,
+        count: &mut usize,
+        back: i8,
+        mut targets: u64,
+    ) {
+        while targets != 0 {
+            let to = pop_lsb(&mut targets);
+            emit_scored(buf, count, Move::new(Square((to.0 as i8 - back) as u8), to));
+        }
+    }
+}
+
+/// The moves of every piece of `pieces` to the squares of `targets` it attacks, at most
+/// `8 * CHUNKS` per piece.
+#[inline(always)]
+unsafe fn piece_moves<S: Splat, const CHUNKS: usize>(
+    buf: &mut ArrayBuf<ScoredMove, MAX_MOVES>,
+    count: &mut usize,
+    mut pieces: u64,
+    targets: u64,
+    attacks: impl Fn(Square) -> u64,
+) {
+    while pieces != 0 {
+        let from = pop_lsb(&mut pieces);
+        // SAFETY: the caller vouches for the instructions of `S`.
+        unsafe { S::moves::<CHUNKS>(buf, count, from, attacks(from) & targets) };
+    }
+}
+
+/// [`generate_quiets`] through the writer `S`.
+#[inline(always)]
+unsafe fn generate_quiets_with<S: Splat>(
+    pos: &Position,
+    buf: &mut ArrayBuf<ScoredMove, MAX_MOVES>,
+) -> usize {
     let mut count = 0;
     let us = pos.side_to_move;
     let occupied = pos.occupied();
@@ -276,11 +386,8 @@ pub fn generate_quiets(pos: &Position, buf: &mut ArrayBuf<ScoredMove, MAX_MOVES>
 
     if num_checkers > 1 {
         // Double check: only king quiet moves
-        let mut attacks = king_attacks(ksq) & empty;
-        while attacks != 0 {
-            let to = pop_lsb(&mut attacks);
-            emit_scored(buf, &mut count, Move::new(ksq, to));
-        }
+        // SAFETY (every `S` call below): the caller vouches for the instructions of `S`.
+        unsafe { S::moves::<1>(buf, &mut count, ksq, king_attacks(ksq) & empty) };
         return count;
     } else if num_checkers == 1 {
         let checker_sq = lsb(pos.checkers);
@@ -302,26 +409,18 @@ pub fn generate_quiets(pos: &Position, buf: &mut ArrayBuf<ScoredMove, MAX_MOVES>
     let push_dir = pawn_push(us);
 
     let single_push = pawn_push_bb(pawns, us) & empty;
-    let mut bb = single_push & !promo_rank & check_mask;
-    while bb != 0 {
-        let to = pop_lsb(&mut bb);
-        emit_scored(
+    unsafe {
+        S::pushes(
             buf,
             &mut count,
-            Move::new(Square((to.0 as i8 - push_dir) as u8), to),
-        );
-    }
+            push_dir,
+            single_push & !promo_rank & check_mask,
+        )
+    };
 
     // Double push
-    let mut bb = pawn_push_bb(single_push & third_rank, us) & empty & check_mask;
-    while bb != 0 {
-        let to = pop_lsb(&mut bb);
-        emit_scored(
-            buf,
-            &mut count,
-            Move::new(Square((to.0 as i8 - 2 * push_dir) as u8), to),
-        );
-    }
+    let double_push = pawn_push_bb(single_push & third_rank, us) & empty & check_mask;
+    unsafe { S::pushes(buf, &mut count, 2 * push_dir, double_push) };
 
     // Push underpromotions (R/B/N) — queen already in generate_captures
     let push_promos = pawn_push_bb(pawns, us) & empty & promo_rank & check_mask;
@@ -346,38 +445,43 @@ pub fn generate_quiets(pos: &Position, buf: &mut ArrayBuf<ScoredMove, MAX_MOVES>
         );
     }
 
-    // Piece quiet moves
+    // Piece quiet moves: at most 8 targets for a knight, 13 for a bishop, 14 for a
+    // rook and 27 for a queen.
     let quiet_targets = empty & check_mask;
-    for pt in [
-        PieceType::Knight,
-        PieceType::Bishop,
-        PieceType::Rook,
-        PieceType::Queen,
-    ] {
-        let mut bb = pos.piece_type_bb(pt, us);
-        while bb != 0 {
-            let from = pop_lsb(&mut bb);
-            let attacks = match pt {
-                PieceType::Knight => knight_attacks(from),
-                PieceType::Bishop => bishop_attacks(from, occupied),
-                PieceType::Rook => rook_attacks(from, occupied),
-                PieceType::Queen => queen_attacks(from, occupied),
-                _ => unreachable!(),
-            };
-            let mut moves = attacks & quiet_targets;
-            while moves != 0 {
-                let to = pop_lsb(&mut moves);
-                emit_scored(buf, &mut count, Move::new(from, to));
-            }
-        }
+    let piece_bb = |pt| pos.piece_type_bb(pt, us);
+    unsafe {
+        piece_moves::<S, 1>(
+            buf,
+            &mut count,
+            piece_bb(PieceType::Knight),
+            quiet_targets,
+            knight_attacks,
+        );
+        piece_moves::<S, 2>(
+            buf,
+            &mut count,
+            piece_bb(PieceType::Bishop),
+            quiet_targets,
+            |from| bishop_attacks(from, occupied),
+        );
+        piece_moves::<S, 2>(
+            buf,
+            &mut count,
+            piece_bb(PieceType::Rook),
+            quiet_targets,
+            |from| rook_attacks(from, occupied),
+        );
+        piece_moves::<S, 4>(
+            buf,
+            &mut count,
+            piece_bb(PieceType::Queen),
+            quiet_targets,
+            |from| queen_attacks(from, occupied),
+        );
     }
 
     // King quiet moves
-    let mut attacks = king_attacks(ksq) & empty;
-    while attacks != 0 {
-        let to = pop_lsb(&mut attacks);
-        emit_scored(buf, &mut count, Move::new(ksq, to));
-    }
+    unsafe { S::moves::<1>(buf, &mut count, ksq, king_attacks(ksq) & empty) };
 
     // Castling (only when not in check)
     if num_checkers == 0 {
@@ -768,23 +872,40 @@ pub fn is_legal(pos: &Position, m: Move) -> bool {
         debug_assert!(pos.castling_rights & right != 0);
         debug_assert!(to == pos.castle_rook_sq(right));
         let king_path = pos.castling_king_path[castling_idx(right)];
-        // Remove king and rook so sliders x-ray through both moving pieces
-        let occ = pos.occupied() ^ ksq.bb() ^ to.bb();
-        let mut path = king_path;
-        while path != 0 {
-            let sq = pop_lsb(&mut path);
-            if attackers_to_color(sq, them, occ, &pos.pieces) != 0 {
-                return false;
-            }
-        }
-        return true;
+        // `pos.threats` already sees through our king. It still has the rook, and
+        // lifting the rook can only open its own rank — which matters in Chess960
+        // alone, where an enemy slider may stand behind it: exactly when the rook
+        // is pinned to the king, every square between them being empty.
+        let legal = king_path & pos.threats == 0 && pos.pinned & to.bb() == 0;
+        debug_assert_eq!(
+            legal,
+            {
+                let occ = pos.occupied() ^ ksq.bb() ^ to.bb();
+                let mut path = king_path;
+                let mut safe = true;
+                while path != 0 {
+                    let sq = pop_lsb(&mut path);
+                    safe &= attackers_to_color(sq, them, occ, &pos.pieces) == 0;
+                }
+                safe
+            },
+            "is_legal: castling {} disagrees with the attack scan",
+            m.to_uci_960(true)
+        );
+        return legal;
     }
 
-    // King move: check destination not attacked
+    // King move: `pos.threats` holds every square the opponent attacks with our king
+    // lifted off the board, so a king never hides behind itself.
     if from == ksq {
-        let them = !us;
-        let occ = pos.occupied() ^ ksq.bb(); // remove king to see through
-        return attackers_to_color(to, them, occ, &pos.pieces) == 0;
+        let legal = pos.threats & to.bb() == 0;
+        debug_assert_eq!(
+            legal,
+            attackers_to_color(to, !us, pos.occupied() ^ ksq.bb(), &pos.pieces) == 0,
+            "is_legal: king move {} disagrees with the attack scan",
+            m.to_uci()
+        );
+        return legal;
     }
 
     // Pinned piece: can only move along pin ray
@@ -885,6 +1006,11 @@ pub fn is_pseudo_legal(pos: &Position, m: Move) -> bool {
         let checker_sq = lsb(pos.checkers);
         let check_mask = between_bb(pos.king_sq(us), checker_sq) | checker_sq.bb();
         if mt == MT_EN_PASSANT {
+            // Only the EP square has a pawn behind it: any other target would put the
+            // captured square off the board (and it is refused below anyway).
+            if to != pos.ep_square {
+                return false;
+            }
             // EP: also accept if captured pawn IS the checker
             let cap_sq = Square((to.0 as i8 - pawn_push(us)) as u8);
             if to.bb() & check_mask == 0 && cap_sq.bb() & pos.checkers == 0 {
@@ -911,13 +1037,16 @@ pub fn is_pseudo_legal(pos: &Position, m: Move) -> bool {
         if to.rank() != promo_rank {
             return false;
         }
-        // Push-promotion (same file) or capture-promotion (adjacent file)
+        // Push-promotion (one square ahead) or capture-promotion (a square the pawn
+        // attacks). Both put the pawn on the rank before the last: a2b8 is no promotion.
         if from.file() == to.file() {
             // push: target must be empty
-            return dest_pc == Piece::NONE;
+            return to.0 as i8 == from.0 as i8 + pawn_push(us) && dest_pc == Piece::NONE;
         } else {
             // capture: target must be enemy
-            return dest_pc != Piece::NONE && dest_pc.color() == them;
+            return (pawn_attacks(from, us) & to.bb()) != 0
+                && dest_pc != Piece::NONE
+                && dest_pc.color() == them;
         }
     }
 
@@ -966,6 +1095,125 @@ pub fn is_pseudo_legal(pos: &Position, m: Move) -> bool {
     (attacks & to.bb()) != 0
 }
 
+// ============================================================
+// x86-64: the quiet moves written by byte compression
+// ============================================================
+
+#[cfg(target_arch = "x86_64")]
+#[allow(unsafe_op_in_unsafe_fn)]
+pub(crate) mod x86 {
+    use super::*;
+    use std::arch::x86_64::*;
+
+    // An entry is the 64-bit lane `move << 32`: the score (0) in the low half, the move
+    // in the high one, as `ScoredMove` lays them out.
+    const _: () = assert!(std::mem::size_of::<ScoredMove>() == 8);
+    const _: () = assert!(std::mem::offset_of!(ScoredMove, score) == 0);
+    const _: () = assert!(std::mem::offset_of!(ScoredMove, mv) == 4);
+    const _: () = assert!(std::mem::size_of::<Move>() == 2);
+
+    #[repr(align(64))]
+    struct Lanes([u8; 64]);
+
+    /// Byte `i` holds `i`: compressed by a bitboard, the squares of its bits in order.
+    static ASCENDING: Lanes = {
+        let mut s = [0u8; 64];
+        let mut i = 0usize;
+        while i < 64 {
+            s[i] = i as u8;
+            i += 1;
+        }
+        Lanes(s)
+    };
+
+    /// The whole target set at once: its squares compressed into the low bytes of a
+    /// register, widened 8 at a time to entries, and stored under a mask that ends at
+    /// the last move. No slot past the count is written, so the bad captures waiting at
+    /// the far end of the move picker's buffer are safe, and no exit depends on the
+    /// size of the set.
+    struct Compress;
+
+    /// Append one move per square of `targets`, lowest first: `to + k`, or for a pawn
+    /// push (`PUSH`) `to * 65 + k`, which puts `to - back` in the origin field when
+    /// `k = -64 * back`.
+    #[inline]
+    #[target_feature(enable = "avx512f,avx512bw,avx512vbmi2")]
+    unsafe fn store<const CHUNKS: usize, const PUSH: bool>(
+        buf: &mut ArrayBuf<ScoredMove, MAX_MOVES>,
+        count: &mut usize,
+        targets: u64,
+        k: i64,
+    ) {
+        const { assert!(CHUNKS >= 1 && CHUNKS <= 4) };
+        let n = targets.count_ones() as usize;
+        debug_assert!(n <= 8 * CHUNKS, "store: {n} moves for {CHUNKS} chunks");
+        debug_assert!(*count + n <= MAX_MOVES, "store: overflow at {}", *count);
+        let squares =
+            _mm512_maskz_compress_epi8(targets, _mm512_load_si512(ASCENDING.0.as_ptr().cast()));
+        let low = _mm512_castsi512_si128(squares);
+        let high = _mm512_extracti32x4_epi32::<1>(squares);
+        let k = _mm512_set1_epi64(k);
+        let live = (1u64 << n) - 1;
+        // Chunks past the last move are stored under an empty mask: their address is
+        // computed but never touched.
+        let dst = buf.as_mut_ptr().wrapping_add(*count).cast::<i64>();
+        for c in 0..CHUNKS {
+            let bytes = match c {
+                0 => low,
+                1 => _mm_unpackhi_epi64(low, low),
+                2 => high,
+                _ => _mm_unpackhi_epi64(high, high),
+            };
+            let to = _mm512_cvtepu8_epi64(bytes);
+            let mv = if PUSH {
+                _mm512_add_epi64(_mm512_slli_epi64::<6>(to), to)
+            } else {
+                to
+            };
+            let entries = _mm512_slli_epi64::<32>(_mm512_add_epi64(mv, k));
+            _mm512_mask_storeu_epi64(
+                dst.wrapping_add(8 * c),
+                (live >> (8 * c)) as __mmask8,
+                entries,
+            );
+        }
+        *count += n;
+    }
+
+    impl Splat for Compress {
+        #[inline]
+        #[target_feature(enable = "avx512f,avx512bw,avx512vbmi2")]
+        unsafe fn moves<const CHUNKS: usize>(
+            buf: &mut ArrayBuf<ScoredMove, MAX_MOVES>,
+            count: &mut usize,
+            from: Square,
+            targets: u64,
+        ) {
+            store::<CHUNKS, false>(buf, count, targets, (from.0 as i64) << 6);
+        }
+
+        #[inline]
+        #[target_feature(enable = "avx512f,avx512bw,avx512vbmi2")]
+        unsafe fn pushes(
+            buf: &mut ArrayBuf<ScoredMove, MAX_MOVES>,
+            count: &mut usize,
+            back: i8,
+            targets: u64,
+        ) {
+            store::<1, true>(buf, count, targets, -((back as i64) << 6));
+        }
+    }
+
+    /// [`generate_quiets`] writing each target set by compression.
+    #[target_feature(enable = "avx512f,avx512bw,avx512vbmi2")]
+    pub(crate) unsafe fn quiets_compress(
+        pos: &Position,
+        buf: &mut ArrayBuf<ScoredMove, MAX_MOVES>,
+    ) -> usize {
+        generate_quiets_with::<Compress>(pos, buf)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -985,5 +1233,126 @@ mod tests {
         assert!(!is_playable_table_move(&pos, Move::new(Square::A7, Square::A6)));
         // The one move that is legal.
         assert!(is_playable_table_move(&pos, Move::new(Square::G7, Square::G6)));
+    }
+
+    type QuietWriter = unsafe fn(&Position, &mut ArrayBuf<ScoredMove, MAX_MOVES>) -> usize;
+
+    unsafe fn quiets_one_by_one(
+        pos: &Position,
+        buf: &mut ArrayBuf<ScoredMove, MAX_MOVES>,
+    ) -> usize {
+        unsafe { generate_quiets_with::<Serial>(pos, buf) }
+    }
+
+    /// Every quiet writer this machine can run, the serial one first.
+    fn quiet_writers() -> Vec<(&'static str, QuietWriter)> {
+        #[cfg_attr(not(target_arch = "x86_64"), allow(unused_mut))]
+        let mut v: Vec<(&'static str, QuietWriter)> = vec![("serial", quiets_one_by_one)];
+        #[cfg(target_arch = "x86_64")]
+        if std::arch::is_x86_feature_detected!("avx512f")
+            && std::arch::is_x86_feature_detected!("avx512bw")
+            && std::arch::is_x86_feature_detected!("avx512vbmi2")
+        {
+            v.push(("compress", x86::quiets_compress));
+        }
+        v
+    }
+
+    /// A slot no generator writes: tells a write past the count from a clean buffer.
+    const UNTOUCHED: ScoredMove = ScoredMove {
+        score: 0x5EED,
+        mv: Move(0xFFFF),
+    };
+
+    /// Every quiet writer gives the same moves in the same order and leaves the slots
+    /// past its count alone; with the captures, the legal ones are exactly the legal
+    /// moves, each once.
+    fn check_position(pos: &Position, writers: &[(&'static str, QuietWriter)]) {
+        let fen = pos.to_fen();
+        let mut reference: Option<Vec<Move>> = None;
+        for &(name, write) in writers {
+            let mut buf = ArrayBuf::<ScoredMove, MAX_MOVES>::new();
+            for i in 0..MAX_MOVES {
+                buf.set(i, UNTOUCHED);
+            }
+            // SAFETY: `quiet_writers` lists only what this CPU runs.
+            let n = unsafe { write(pos, &mut buf) };
+            let moves: Vec<Move> = (0..n).map(|i| buf[i].mv).collect();
+            assert!(
+                (0..n).all(|i| buf[i].score == 0),
+                "{fen}: {name} left a score"
+            );
+            for i in n..MAX_MOVES {
+                assert!(
+                    buf[i].score == UNTOUCHED.score && buf[i].mv == UNTOUCHED.mv,
+                    "{fen}: {name} wrote slot {i} past its count {n}"
+                );
+            }
+            match &reference {
+                None => reference = Some(moves),
+                Some(r) => assert!(*r == moves, "{fen}: {name} differs from the serial writer"),
+            }
+        }
+
+        let mut caps = ArrayBuf::<ScoredMove, MAX_MOVES>::new();
+        let nc = generate_captures(pos, &mut caps);
+        let mut generated: Vec<u16> = (0..nc)
+            .map(|i| caps[i].mv)
+            .chain(reference.unwrap())
+            .filter(|&m| is_legal(pos, m))
+            .map(|m| m.0)
+            .collect();
+        let mut legal = ArrayBuf::<Move, MAX_MOVES>::new();
+        let nl = generate_legal_moves(pos, &mut legal);
+        let mut expected: Vec<u16> = legal.filled(nl).iter().map(|m| m.0).collect();
+        generated.sort_unstable();
+        expected.sort_unstable();
+        assert_eq!(
+            generated, expected,
+            "{fen}: captures and quiets against the legal moves"
+        );
+    }
+
+    #[test]
+    fn the_quiet_writers_agree_and_the_stages_cover_the_legal_moves() {
+        let writers = quiet_writers();
+        let fens = [
+            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+            "r3k2r/Pppp1ppp/1b3nbN/nP6/BBP1P3/q4N2/Pp1P2PP/R2Q1RK1 w kq - 0 1",
+            "rnbqkbnr/ppp1pppp/8/3pP3/8/8/PPPP1PPP/RNBQKBNR w KQkq d6 0 3",
+            "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1",
+            // Promotions by push and by capture, both sides.
+            "1n2k2r/P6P/8/8/8/8/6K1/8 w k - 0 1",
+            "8/6k1/8/8/8/8/p6p/1N2K2R b K - 0 1",
+            // Single and double check.
+            "4k3/8/8/8/8/8/8/r3K3 w - - 0 1",
+            "4k3/8/8/8/8/5n2/8/4K2r w - - 0 1",
+            // The most moves on record (218), every slot of a queen's four chunks used.
+            "R6R/3Q4/1Q4Q1/4Q3/2Q4Q/Q4Q2/pp1Q4/kBNN1KB1 w - - 0 1",
+        ];
+        for fen in fens {
+            check_position(&Position::from_fen(fen).unwrap(), &writers);
+        }
+
+        // Random games reach what the fixed positions miss.
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        for start in [fens[0], fens[1], fens[2]] {
+            for _ in 0..8 {
+                let mut pos = Position::from_fen(start).unwrap();
+                for _ in 0..200 {
+                    check_position(&pos, &writers);
+                    let mut legal = ArrayBuf::<Move, MAX_MOVES>::new();
+                    let n = generate_legal_moves(&pos, &mut legal);
+                    if n == 0 {
+                        break;
+                    }
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    pos.make_move(legal[(state % n as u64) as usize]);
+                }
+            }
+        }
     }
 }

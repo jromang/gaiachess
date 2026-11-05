@@ -27,6 +27,8 @@ pub const I32_LANES: usize = size_of::<v128>() / size_of::<i32>();
 /// Number of f32 elements per SIMD register.
 pub const F32_LANES: usize = size_of::<v128>() / size_of::<f32>();
 pub const DPBUSD_CHAINS: usize = 1;
+/// `mul_add_f32` multiplies, then adds: simd128 has no deterministic fused form.
+pub const MUL_ADD_FUSED: bool = false;
 
 // ============================================================
 // i16 operations (accumulator, FT activation)
@@ -62,20 +64,14 @@ pub unsafe fn min_i16(a: v128, b: v128) -> v128 {
     i16x8_min(a, b)
 }
 
+/// The pairwise FT product `(left * right) >> 9` (`FT_SHIFT`), for `left` in
+/// `0..=FT_QUANT`: the high half of `(left << 7) * right`, from two widening
+/// multiplies (simd128 has no high-half multiply).
 #[inline(always)]
-pub unsafe fn shift_left_i16<const SHIFT: i32>(a: v128) -> v128 {
-    i16x8_shl(a, SHIFT as u32)
-}
-
-/// Multiply high: (a * b) >> 16 for each i16 lane.
-///
-/// No direct instruction. The widening multiplies give the full 32-bit products in two
-/// registers; the shuffle then keeps the upper half of each, which is the same as a
-/// shift by 16 followed by a narrow, at one instruction instead of three.
-#[inline(always)]
-pub unsafe fn mul_high_i16(a: v128, b: v128) -> v128 {
-    let lo = i32x4_extmul_low_i16x8(a, b);
-    let hi = i32x4_extmul_high_i16x8(a, b);
+pub unsafe fn ft_product(left: v128, right: v128) -> v128 {
+    let shifted = i16x8_shl(left, 7);
+    let lo = i32x4_extmul_low_i16x8(shifted, right);
+    let hi = i32x4_extmul_high_i16x8(shifted, right);
     i8x16_shuffle::<2, 3, 6, 7, 10, 11, 14, 15, 18, 19, 22, 23, 26, 27, 30, 31>(lo, hi)
 }
 
@@ -94,12 +90,23 @@ pub unsafe fn permute(a: v128) -> v128 {
     a
 }
 
-/// Load I16_LANES (8) i8 values from `ptr` and sign-extend to i16.
-///
-/// Used for threat accumulator: i8 weights → i16 additions.
+/// Two registers of i16 from 16 bytes of each of two i8 rows, summed lane by
+/// lane. Linear order: no lane crossing.
 #[inline(always)]
-pub unsafe fn load_i8_as_i16(ptr: *const i8) -> v128 {
-    i16x8_load_extend_i8x8(ptr)
+pub unsafe fn widen_i8_pair(a: *const i8, b: *const i8) -> [v128; 2] {
+    let wa = v128_load(a as *const v128);
+    let wb = v128_load(b as *const v128);
+    [
+        i16x8_add(i16x8_extend_low_i8x16(wa), i16x8_extend_low_i8x16(wb)),
+        i16x8_add(i16x8_extend_high_i8x16(wa), i16x8_extend_high_i8x16(wb)),
+    ]
+}
+
+/// One i8 row alone, widened into two registers.
+#[inline(always)]
+pub unsafe fn widen_i8(a: *const i8) -> [v128; 2] {
+    let w = v128_load(a as *const v128);
+    [i16x8_extend_low_i8x16(w), i16x8_extend_high_i8x16(w)]
 }
 
 /// Multiply pairs of adjacent i16 and accumulate into i32.
@@ -227,12 +234,13 @@ pub unsafe fn clamp_f32(x: v128, min: v128, max: v128) -> v128 {
 
 /// Horizontal sum of four f32 vectors → scalar f32.
 ///
-/// Reduces 4 × v128 (16 f32 total) to a single scalar.
+/// Reduces 4 × v128 (16 f32 total, e0..e15 in lane order) to a single scalar, in the
+/// tree every other path uses: t_i = (e_i + e_i+8) + (e_i+4 + e_i+12), then
+/// (t0 + t2) + (t1 + t3). Float addition does not associate; in this order the module
+/// evaluates exactly like the scalar build, which also multiplies and adds unfused.
 #[inline(always)]
 pub unsafe fn horizontal_sum(x: [v128; 4]) -> f32 {
-    let sum01 = f32x4_add(x[0], x[1]);
-    let sum23 = f32x4_add(x[2], x[3]);
-    let sum = f32x4_add(sum01, sum23);
+    let sum = f32x4_add(f32x4_add(x[0], x[2]), f32x4_add(x[1], x[3]));
     // Shuffles move bits, not numbers, and there is no `f32x4_shuffle`: the 32-bit lane
     // shuffle is the same instruction whatever the lanes are taken to mean.
     let pairs = f32x4_add(sum, i32x4_shuffle::<2, 3, 0, 1>(sum, sum));
@@ -242,3 +250,65 @@ pub unsafe fn horizontal_sum(x: [v128; 4]) -> f32 {
 
 /// Number of v128 vectors needed for horizontal_sum input.
 pub const HSUM_VECS: usize = 4;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn wasm_sum(e: [f32; 16]) -> f32 {
+        unsafe {
+            let v = |i: usize| v128_load(e[i..].as_ptr().cast());
+            horizontal_sum([v(0), v(4), v(8), v(12)])
+        }
+    }
+
+    #[test]
+    fn horizontal_sum_adds_in_the_scalar_order() {
+        // e0 + e4 first would round the 1 away; e0 + e8 first keeps both ones.
+        let mut e = [0.0f32; 16];
+        (e[0], e[4], e[8], e[12]) = (1e8, 1.0, -1e8, 1.0);
+        assert_eq!(wasm_sum(e), 2.0);
+
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        for _ in 0..10_000 {
+            let mut e = [0.0f32; 16];
+            for x in &mut e {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                let mantissa = (state >> 40) as f32 / (1u64 << 24) as f32 - 0.5;
+                *x = mantissa * 10f32.powi((state % 13) as i32 - 4);
+            }
+            let want = unsafe { crate::nnue::simd::scalar::horizontal_sum(e) };
+            assert_eq!(wasm_sum(e).to_bits(), want.to_bits(), "{e:?}");
+        }
+    }
+}
+
+// ============================================================
+// i32 operations (integer dense layers)
+// ============================================================
+
+/// Arithmetic right shift of every i32 lane: a floor division by `2^n`.
+#[inline(always)]
+pub unsafe fn srai_i32(a: v128, n: i32) -> v128 {
+    i32x4_shr(a, n as u32)
+}
+
+/// Clamp every i32 lane to `[lo, hi]`.
+#[inline(always)]
+pub unsafe fn clamp_i32(x: v128, lo: v128, hi: v128) -> v128 {
+    i32x4_min(i32x4_max(x, lo), hi)
+}
+
+/// Low 32 bits of each lane's product.
+#[inline(always)]
+pub unsafe fn mullo_i32(a: v128, b: v128) -> v128 {
+    i32x4_mul(a, b)
+}
+
+/// Four registers of i32 in `0..=255` narrowed to sixteen u8, in order.
+#[inline(always)]
+pub unsafe fn narrow_u8(a: v128, b: v128, c: v128, d: v128) -> v128 {
+    u8x16_narrow_i16x8(i16x8_narrow_i32x4(a, b), i16x8_narrow_i32x4(c, d))
+}

@@ -6,6 +6,13 @@ fn main() {
     {
         let raw = std::fs::read(&model_path)
             .unwrap_or_else(|e| panic!("Failed to read MODEL={model_path}: {e}"));
+        // The engine refuses a network without its integrity footer: said here rather
+        // than by a binary that panics on its first evaluation.
+        assert!(
+            raw.ends_with(b"GN2\0"),
+            "MODEL={model_path} has no GN2 integrity footer: not a network of this \
+             architecture"
+        );
 
         let compressed = zstd::encode_all(&raw[..], 22).expect("Failed to compress NNUE with zstd");
 
@@ -14,6 +21,17 @@ fn main() {
         std::fs::write(&out_path, &compressed).unwrap();
 
         println!("cargo:rustc-env=MODEL_ZST={out_path}");
+
+        // The file's length and last 16 bytes, kept apart from the compressed image:
+        // a footered network declares its digest there, so the engine can name its
+        // shared image, and map a peer's, without decoding 87 MB first.
+        let tail = &raw[raw.len().saturating_sub(16)..];
+        let meta = format!(
+            "pub const EMBEDDED_LEN: usize = {};\npub static EMBEDDED_TAIL: &[u8] = &{:?};\n",
+            raw.len(),
+            tail
+        );
+        std::fs::write(format!("{out_dir}/model_meta.rs"), meta).unwrap();
         // Whether a network is baked into the binary is a property of the build, not of
         // the feature set: the engine can be compiled with the NNUE code and no weights,
         // which is what a build that receives them at run time wants.
@@ -33,6 +51,9 @@ fn main() {
     // binary serves every CPU. Without it, attack selection stays compile-time
     // — local, OpenBench and test builds keep today's branchless codegen.
     println!("cargo:rustc-check-cfg=cfg(gaia_dist)");
+    // `cargo fuzz` passes `--cfg fuzzing`: it exposes the private parsers to the
+    // targets under `fuzz/` and is absent from every other build.
+    println!("cargo:rustc-check-cfg=cfg(fuzzing)");
     println!("cargo:rerun-if-env-changed=MODEL");
 
     // GaiaTB (DTM tablebases, 3+4 pieces)

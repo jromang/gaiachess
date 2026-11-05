@@ -123,11 +123,13 @@ readme() { # readme <dir> <platform lines...>
         echo "straight away."
         echo
         echo "Free software: GNU General Public Licence version 3 or later, and it comes"
-        echo "with no warranty. The full text is in LICENSE, beside this file."
+        echo "with no warranty. The full text is in LICENSE, beside this file, and the"
+        echo "licences of the libraries compiled into it in THIRD-PARTY-LICENSES.txt."
         echo "Source, other builds, and the browser version:"
         echo "  https://github.com/jromang/gaiachess"
     } > "$dir/README.txt"
     cp "$ROOT/LICENSE" "$dir/LICENSE"
+    cp "$ROOT/THIRD-PARTY-LICENSES.txt" "$dir/THIRD-PARTY-LICENSES.txt"
 }
 
 echo "== staging =="

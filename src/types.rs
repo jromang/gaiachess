@@ -513,6 +513,13 @@ impl<T: Copy, const N: usize> ArrayBuf<T, N> {
         self.data[dst] = self.data[src];
     }
 
+    /// The storage as a raw pointer, for writers that fill several slots in one
+    /// store. Every slot they write counts as written.
+    #[inline(always)]
+    pub fn as_mut_ptr(&mut self) -> *mut T {
+        self.data.as_mut_ptr().cast()
+    }
+
     /// The first `len` entries as a slice. The caller vouches that all of them
     /// have been written.
     #[inline(always)]
@@ -667,6 +674,9 @@ pub const fn mated_in(ply: i32) -> i32 {
 #[inline(always)]
 pub fn dtm_score(ply: i32, dtm: i32) -> i32 {
     debug_assert!(ply >= 0, "dtm_score: negative ply {ply}");
+    // Its magnitude would come back negative from the cast below, and the result
+    // still a mate: every caller bounds the distance first.
+    debug_assert!(dtm != i32::MIN, "dtm_score: distance i32::MIN");
     if dtm == 0 {
         return mated_in(ply);
     }
