@@ -459,6 +459,11 @@ impl UciSession {
                         .start_search_armed(&self.pos, limits, &search_moves);
                 // No legal move: there is nothing to wait for, the answer is final.
                 wait_for_release(ponder_requested, infinite && best.is_ok());
+                crate::mostat::print();
+                #[cfg(feature = "stats")]
+                crate::ttstat::print(&self.pool.shared.tt);
+                #[cfg(feature = "stats")]
+                crate::qsstat::print();
                 self.pool.print_final_uci_info();
                 if !best.is_ok() {
                     // No legal move (mate or stalemate). The protocol's nullmove is 0000.

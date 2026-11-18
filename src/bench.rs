@@ -173,6 +173,12 @@ pub fn run(depth_override: Option<i32>, threads: Option<usize>) {
     // Aggregated search statistics on stderr (never pollutes the UCI stream)
     #[cfg(feature = "stats")]
     eprint!("{}", agg_stats.emit_text());
+    // The transposition table's telemetry, over the 27 positions.
+    #[cfg(feature = "stats")]
+    crate::ttstat::print(&shared.tt);
+    // The quiescence's telemetry, over the 27 positions.
+    #[cfg(feature = "stats")]
+    crate::qsstat::print();
     // Throwaway debug slots (silent when unused)
     crate::stats::dbg::print();
 }

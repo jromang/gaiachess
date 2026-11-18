@@ -8,6 +8,9 @@
 // every module below.
 #[macro_use]
 pub mod out;
+pub mod mostat;
+pub mod ttstat;
+pub mod qsstat;
 
 pub mod bitboard;
 pub mod book;

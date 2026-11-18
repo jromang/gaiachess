@@ -259,6 +259,9 @@ define_stats! {
     probcut: TechDepth;
     /// IIR depth reductions applied.
     iir_applied: u64;
+    /// Child evaluation of the best quiets: [nodes, children evaluated, skipped for a
+    /// TT entry, skipped for a check].
+    child_eval: [u64; 4];
     /// Hindsight depth increments (parent over-reduced).
     hindsight_inc: u64;
     /// Hindsight depth decrements (comfortable position).
@@ -497,6 +500,11 @@ impl SearchStats {
             out,
             "nmp verif    {}  iir {}  hindsight +{} -{}",
             self.nmp_verif_runs, self.iir_applied, self.hindsight_inc, self.hindsight_dec
+        );
+        let _ = writeln!(
+            out,
+            "child eval   nodes {}  evals {}  tt skips {}  check skips {}",
+            self.child_eval[0], self.child_eval[1], self.child_eval[2], self.child_eval[3]
         );
 
         // Per-move pruning by depth

@@ -1986,6 +1986,13 @@ impl ThreadPool {
         if pos.is_draw(1) {
             return None;
         }
+        #[cfg(feature = "stats")]
+        let _ = crate::ttstat::probe(
+            &self.shared.tt,
+            crate::ttstat::OTHER,
+            pos.key,
+            self.shared.tt.probe(pos.key, 0, pos.halfmove_clock).as_ref(),
+        );
         let reply = self.shared.tt.probe(pos.key, 0, pos.halfmove_clock)?.mv;
         movegen::is_playable_table_move(&pos, reply).then_some(reply)
     }

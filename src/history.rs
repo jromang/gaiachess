@@ -10,8 +10,22 @@ use std::sync::atomic::{AtomicI16, Ordering};
 use crate::types::{Color, MAX_PLY, Move, Piece, PieceType, Square};
 use crate::largemem::{LargeBox, LargeMem};
 
-/// Maximum history value for gravity formula.
-const MAX_HISTORY: i32 = 16384;
+/// Largest bound any move-ordering table may be given: values are stored as i16.
+const MAX_HISTORY: i32 = 32000;
+
+/// Gravity update towards `±max`: `val += bonus - val * |bonus| / max`, the bonus
+/// first clamped to the table's bound.
+#[inline(always)]
+fn gravity(entry: &mut i16, bonus: i32, max: i32) {
+    debug_assert!(
+        max > 0 && max <= MAX_HISTORY,
+        "history bound {max} outside (0, {MAX_HISTORY}]"
+    );
+    let bonus = bonus.clamp(-max, max);
+    let val = *entry as i32;
+    let new_val = val + bonus - val * bonus.abs() / max;
+    *entry = new_val.clamp(-max, max) as i16;
+}
 
 /// Maximum correction history value for gravity formula.
 pub const CORRHIST_LIMIT: i32 = 1024;
@@ -34,7 +48,7 @@ const CORRHIST_SIZE: usize = 65536;
 /// attacked by the opponent. This captures escape (from threatened) and walking
 /// into danger (to threatened) patterns.
 ///
-/// Gravity-based updates keep values in `[-MAX_HISTORY, MAX_HISTORY]`.
+/// Gravity-based updates keep values in `[-HIST_MAX_BUTTERFLY, HIST_MAX_BUTTERFLY]`.
 /// Size: 2 * 2 * 2 * 4096 * 2 bytes = 64 KB.
 pub struct ButterflyHistory {
     table: [[[[i16; 64 * 64]; 2]; 2]; 2],
@@ -79,7 +93,7 @@ impl ButterflyHistory {
         self.table[color.index()][from_thr][to_thr][Self::index(m)] as i32
     }
 
-    /// Gravity update: `val += bonus - val * |bonus| / MAX_HISTORY`.
+    /// Gravity update towards the butterfly bound (see [`gravity`]).
     #[inline]
     pub fn update(&mut self, color: Color, m: Move, threats: u64, bonus: i32) {
         debug_assert!(
@@ -94,13 +108,7 @@ impl ButterflyHistory {
         let from_thr = ((threats >> m.from_sq().index()) & 1) as usize;
         let to_thr = ((threats >> m.to_sq().index()) & 1) as usize;
         let entry = &mut self.table[color.index()][from_thr][to_thr][Self::index(m)];
-        debug_assert!(
-            bonus.abs() <= MAX_HISTORY,
-            "history bonus {bonus} beyond the gravity bound"
-        );
-        let val = *entry as i32;
-        let new_val = val + bonus - val * bonus.abs() / MAX_HISTORY;
-        *entry = new_val.clamp(-MAX_HISTORY, MAX_HISTORY) as i16;
+        gravity(entry, bonus, crate::tune::HIST_MAX_BUTTERFLY());
     }
 }
 
@@ -148,13 +156,7 @@ impl PawnHistory {
         );
         debug_assert!(to.0 < 64, "PawnHistory::update: to sq {} OOB", to.0);
         let entry = &mut self.table[pawn_key as usize % PAWN_HIST_SIZE][piece.index()][to.index()];
-        debug_assert!(
-            bonus.abs() <= MAX_HISTORY,
-            "history bonus {bonus} beyond the gravity bound"
-        );
-        let val = *entry as i32;
-        let new_val = val + bonus - val * bonus.abs() / MAX_HISTORY;
-        *entry = new_val.clamp(-MAX_HISTORY, MAX_HISTORY) as i16;
+        gravity(entry, bonus, crate::tune::HIST_MAX_PAWN());
     }
 }
 
@@ -217,57 +219,65 @@ pub fn stat_malus(depth: i32) -> i32 {
         .min(crate::tune::STAT_MALUS_MAX())
 }
 
-/// Capture history table: `[piece][to_sq][captured_piece_type]`.
+/// Capture history table: `[piece][to_sq][to_threatened][captured_piece_type]`.
 ///
 /// Learns which captures succeed (cause beta cutoffs) beyond static MVV-LVA.
-/// Size: 12 * 64 * 6 * 2 bytes = 9,216 bytes (~9 KB).
+/// The destination square's threat bit (is the victim defended?) splits each
+/// entry in two, read and written on the same `threats` bitboard as the
+/// butterfly history.
+/// Size: 12 * 64 * 2 * 6 * 2 bytes = 18,432 bytes (~18 KB).
 pub struct CaptureHistory {
-    table: [[[i16; PieceType::NUM]; Square::NUM]; Piece::NUM],
+    table: [[[[i16; PieceType::NUM]; 2]; Square::NUM]; Piece::NUM],
 }
 
 impl CaptureHistory {
     pub fn new() -> Self {
         CaptureHistory {
-            table: [[[0i16; PieceType::NUM]; Square::NUM]; Piece::NUM],
+            table: [[[[0i16; PieceType::NUM]; 2]; Square::NUM]; Piece::NUM],
         }
     }
 
     pub fn clear(&mut self) {
         for piece in &mut self.table {
             for sq in piece.iter_mut() {
-                sq.fill(0);
+                for thr in sq.iter_mut() {
+                    thr.fill(0);
+                }
             }
         }
     }
 
     #[inline]
-    pub fn get(&self, piece: Piece, to: Square, captured_pt: PieceType) -> i32 {
+    pub fn get(&self, threats: u64, piece: Piece, to: Square, captured_pt: PieceType) -> i32 {
         debug_assert!(piece.0 < 12, "CaptureHistory::get: piece NONE");
         debug_assert!(to.0 < 64, "CaptureHistory::get: sq OOB {}", to.0);
         debug_assert!(
             (captured_pt as usize) < 6,
             "CaptureHistory::get: captured_pt OOB"
         );
-        self.table[piece.index()][to.index()][captured_pt.index()] as i32
+        let to_thr = ((threats >> to.index()) & 1) as usize;
+        self.table[piece.index()][to.index()][to_thr][captured_pt.index()] as i32
     }
 
     /// Gravity update (same formula as ButterflyHistory).
     #[inline]
-    pub fn update(&mut self, piece: Piece, to: Square, captured_pt: PieceType, bonus: i32) {
+    pub fn update(
+        &mut self,
+        threats: u64,
+        piece: Piece,
+        to: Square,
+        captured_pt: PieceType,
+        bonus: i32,
+    ) {
         debug_assert!(piece.0 < 12, "CaptureHistory::update: piece NONE");
         debug_assert!(to.0 < 64, "CaptureHistory::update: sq OOB {}", to.0);
         debug_assert!(
             (captured_pt as usize) < 6,
             "CaptureHistory::update: captured_pt OOB"
         );
-        let entry = &mut self.table[piece.index()][to.index()][captured_pt.index()];
-        debug_assert!(
-            bonus.abs() <= MAX_HISTORY,
-            "history bonus {bonus} beyond the gravity bound"
-        );
-        let val = *entry as i32;
-        let new_val = val + bonus - val * bonus.abs() / MAX_HISTORY;
-        *entry = new_val.clamp(-MAX_HISTORY, MAX_HISTORY) as i16;
+        let to_thr = ((threats >> to.index()) & 1) as usize;
+        let entry = &mut self.table[piece.index()][to.index()][to_thr][captured_pt.index()];
+        gravity(entry, bonus, crate::tune::HIST_MAX_CAPTURE());
     }
 }
 
@@ -344,13 +354,39 @@ impl ContinuationHistory {
         debug_assert!(piece.0 < 12, "ContinuationHistory::update: piece NONE");
         debug_assert!(to.0 < 64, "ContinuationHistory::update: sq OOB {}", to.0);
         let entry = unsafe { &mut (*subtable_ptr)[piece.index()][to.index()] };
+        gravity(entry, bonus, crate::tune::HIST_MAX_CONT());
+    }
+
+    /// Gravity update against a shared base: `val += bonus - base * |bonus| / gravity`.
+    /// The base is the move's combined score over several tables, so that every one
+    /// of them saturates together with the score the move is ordered by.
+    #[inline]
+    pub fn update_with_base(
+        subtable_ptr: *mut PieceToTable,
+        piece: Piece,
+        to: Square,
+        bonus: i32,
+        base: i32,
+        gravity: i32,
+    ) {
         debug_assert!(
-            bonus.abs() <= MAX_HISTORY,
-            "history bonus {bonus} beyond the gravity bound"
+            !subtable_ptr.is_null(),
+            "ContinuationHistory::update_with_base: null ptr"
         );
+        debug_assert!(piece.0 < 12, "ContinuationHistory::update_with_base: piece NONE");
+        debug_assert!(to.0 < 64, "ContinuationHistory::update_with_base: sq OOB {}", to.0);
+        debug_assert!(gravity > 0, "gravity divisor {gravity}");
+        let max = crate::tune::HIST_MAX_CONT();
+        debug_assert!(
+            max > 0 && max <= MAX_HISTORY,
+            "history bound {max} outside (0, {MAX_HISTORY}]"
+        );
+        debug_assert!(base.abs() <= 8 * max, "combined base {base} out of range");
+        let bonus = bonus.clamp(-max, max);
+        let entry = unsafe { &mut (*subtable_ptr)[piece.index()][to.index()] };
         let val = *entry as i32;
-        let new_val = val + bonus - val * bonus.abs() / MAX_HISTORY;
-        *entry = new_val.clamp(-MAX_HISTORY, MAX_HISTORY) as i16;
+        let new_val = val + bonus - base * bonus.abs() / gravity;
+        *entry = new_val.clamp(-max, max) as i16;
     }
 }
 

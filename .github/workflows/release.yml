@@ -30,15 +30,11 @@ jobs:
           # full text, so the loss happened past the shell. --notes-file round-trips
           # byte for byte.
           cat > "$RUNNER_TEMP/release-notes.md" <<'NOTES'
-          ## What's new in 4.4.3
+          ## What's new in 4.4.4
 
-          - **New network architecture** and its first network, `gaianet-t7`: about
-            +10 Elo at 2+0.1 over 4.4.2's network. Networks from earlier releases no
-            longer load (`EvalFile`).
-          - **Stronger search**: all 209 search parameters retuned, and ProbCut tried
-            less often.
-          - **Robustness fixes** for malformed input: FEN, clock values, damaged
-            tablebase files, networks without their integrity footer.
+          - **Stronger search**: move ordering reworked and search parameters retuned.
+            About +20 Elo over 4.4.3 at 2+0.1, in self-play.
+          - Same network as 4.4.3 (`gaianet-t7`).
 
           ## Download
 

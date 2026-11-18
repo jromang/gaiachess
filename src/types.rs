@@ -100,16 +100,19 @@ impl Piece {
         Piece((pt as u8) * 2 + c as u8)
     }
 
+    /// The type of the piece; `Piece::NONE` reads as a king.
+    ///
+    /// Computed, not matched: inlined into a hot caller, a `match` here became an
+    /// indirect jump through a table, one target per piece type, mispredicted
+    /// whenever the piece changes from one call to the next.
     #[inline(always)]
     pub const fn piece_type(self) -> PieceType {
-        match self.0 >> 1 {
-            0 => PieceType::Pawn,
-            1 => PieceType::Knight,
-            2 => PieceType::Bishop,
-            3 => PieceType::Rook,
-            4 => PieceType::Queen,
-            _ => PieceType::King,
-        }
+        debug_assert!(self.0 <= Piece::NONE.0, "piece_type: not a piece");
+        let t = self.0 >> 1;
+        let t = if t < PieceType::King as u8 { t } else { PieceType::King as u8 };
+        // SAFETY: `t <= King`, and `PieceType` is `repr(u8)` with the discriminants
+        // 0..=5, none missing.
+        unsafe { core::mem::transmute::<u8, PieceType>(t) }
     }
 
     #[inline(always)]
@@ -922,6 +925,24 @@ mod tests {
         assert_eq!(bk.0, 11);
         assert_eq!(bk.piece_type(), PieceType::King);
         assert_eq!(bk.color(), Color::Black);
+    }
+
+    #[test]
+    fn every_piece_reads_back_its_type_and_none_reads_as_a_king() {
+        let types = [
+            PieceType::Pawn,
+            PieceType::Knight,
+            PieceType::Bishop,
+            PieceType::Rook,
+            PieceType::Queen,
+            PieceType::King,
+        ];
+        for pt in types {
+            for c in [Color::White, Color::Black] {
+                assert_eq!(Piece::new(pt, c).piece_type(), pt);
+            }
+        }
+        assert_eq!(Piece::NONE.piece_type(), PieceType::King);
     }
 
     #[test]

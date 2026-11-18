@@ -166,103 +166,109 @@ macro_rules! fixed {
 
 // ─── Parameter declarations ─────────────────────────────────────────────────
 // tunable! = exported to SPSA tuners
-// fixed!   = locked, not exported (currently only MOVE_OVERHEAD, which is its own atomic)
+// fixed!   = locked, not exported (MOVE_OVERHEAD is its own atomic, outside both blocks)
 
 tunable! {
     // === Aspiration windows (5) ===
     /// Initial aspiration window half-width (search units).
-    ASP_INITIAL_DELTA = 18, 5, 40, 2;
+    ASP_INITIAL_DELTA = 19, 5, 40, 2;
     /// Minimum depth to enable aspiration windows.
     ASP_MIN_DEPTH = 5, 2, 8, 1;
     /// Divisor for avg_score contribution to delta.
-    ASP_SCORE_DIV = 90, 32, 512, 16;
+    ASP_SCORE_DIV = 97, 32, 512, 16;
     /// Delta threshold to fall back to full window.
-    ASP_FALLBACK_DELTA = 340, 200, 1000, 50;
+    ASP_FALLBACK_DELTA = 306, 200, 1000, 50;
     /// Widening divisor: `delta += delta / X`.
-    ASP_WIDEN_DIV = 6, 2, 10, 1;
+    ASP_WIDEN_DIV = 5, 2, 10, 1;
 
     // === Reverse futility pruning (3) ===
     /// Maximum depth for reverse futility pruning.
-    RFP_MAX_DEPTH = 14, 4, 20, 1;
+    RFP_MAX_DEPTH = 13, 4, 20, 1;
     /// RFP margin per ply (search units).
-    RFP_MARGIN = 90, 20, 200, 10;
+    RFP_MARGIN = 80, 20, 200, 10;
     /// RFP minimum margin (search units).
-    RFP_MIN = 15, 0, 100, 5;
+    RFP_MIN = 24, 0, 100, 5;
     /// RFP ttHit multiplier: reduce the RFP margin multiplier when there is no TT hit.
     RFP_NO_TT_DISCOUNT = 27, 10, 40, 2;
 
     // === Razoring (3) ===
     /// Razoring base margin (search units).
-    RAZOR_BASE = 339, 100, 600, 25;
+    RAZOR_BASE = 330, 100, 600, 25;
     /// Razoring quadratic depth² coefficient (search units).
-    RAZOR_QUAD = 226, 100, 500, 25;
+    RAZOR_QUAD = 207, 100, 500, 25;
     /// Razoring alpha max: do not razor in decisive positions.
-    RAZOR_ALPHA_MAX = 1818, 512, 4096, 128;
+    RAZOR_ALPHA_MAX = 1762, 512, 4096, 128;
 
     // === SEE pruning in search (3) ===
     /// SEE quiet move margin per lmr_depth^2 (centipawns, negative).
-    SEE_QUIET_MARGIN = -7, -60, 0, 5;
+    SEE_QUIET_MARGIN = -6, -60, 0, 5;
     /// SEE capture move margin per depth (centipawns, negative).
     SEE_CAPTURE_MARGIN = -94, -200, 0, 10;
     /// History divisor in lmr_depth for quiet SEE pruning.
-    PRUNE_HIST_DIV = 5923, 3000, 16000, 650;
+    PRUNE_HIST_DIV = 5534, 3000, 16000, 650;
 
     // === Full-depth search gating (3) ===
     /// Reduction-signal addend when no TT move backs the position.
-    EMR_NOTM = 886, 0, 2000, 100;
+    EMR_NOTM = 924, 0, 2000, 100;
     /// Reduction-signal threshold for the first ply cut in full-depth search.
-    EMR_R_ONE = 4482, 2000, 8000, 200;
+    EMR_R_ONE = 4440, 2000, 8000, 200;
     /// Reduction-signal threshold for the second ply cut in full-depth search.
-    EMR_R_TWO = 5619, 3000, 10000, 200;
+    EMR_R_TWO = 5529, 3000, 10000, 200;
 
     // === Futility pruning (3) ===
     /// Maximum depth to apply futility pruning.
     FP_MAX_DEPTH = 11, 4, 16, 1;
     /// Futility pruning margin per depth (search units).
-    FP_COEFF = 108, 30, 200, 10;
+    FP_COEFF = 110, 30, 200, 10;
     /// Futility pruning base margin subtracted (search units).
     FP_BASE = 107, 30, 300, 15;
 
     // === Bad-noisy futility pruning (4) ===
     /// Apply BNFP while lmr_depth in 1024ths of a ply is at most X (~8.9 ply).
-    BNFP_DEPTH_LIMIT = 9558, 1024, 16384, 256;
+    BNFP_DEPTH_LIMIT = 9487, 1024, 16384, 256;
     /// BNFP base margin added to static eval (search units).
-    BNFP_BASE = 138, 0, 400, 16;
+    BNFP_BASE = 139, 0, 400, 16;
     /// BNFP margin per 1024ths of lmr_depth.
-    BNFP_MULT = 76, 0, 256, 8;
+    BNFP_MULT = 79, 0, 256, 8;
     /// BNFP captured-piece term: `value * X / 1024`.
-    BNFP_CAPTURED = 1064, 256, 2048, 64;
+    BNFP_CAPTURED = 1089, 256, 2048, 64;
 
     // === History pruning (1) ===
     /// History pruning margin: prune quiets with
     /// `history < (X + HIST_PRUNE_DEPTH * depth / 1024) * (depth + improving - 1)`.
-    HIST_PRUNE_MARGIN = -2826, -10000, -1000, 500;
+    HIST_PRUNE_MARGIN = -2213, -10000, -1000, 500;
     /// History pruning depth gradient: `HIST_PRUNE_MARGIN + X * depth / 1024`.
-    HIST_PRUNE_DEPTH = 3690, -5000, 5000, 500;
+    HIST_PRUNE_DEPTH = 3486, -5000, 5000, 500;
 
     // === Opponent worsening + hindsight (5) ===
     /// Opponent worsening threshold: static_eval + prev_eval > X.
-    OW_THRESHOLD = 22, -50, 100, 5;
+    OW_THRESHOLD = 20, -50, 100, 5;
     /// RFP bonus when opponent position is worsening (search units).
-    RFP_OW_BONUS = 4, 0, 100, 5;
+    RFP_OW_BONUS = 8, 0, 100, 5;
     /// Min prior reduction (plies) for hindsight depth++.
-    HINDSIGHT_INC_MIN_R = 2, 1, 5, 1;
+    HINDSIGHT_INC_MIN_R = 1, 1, 5, 1;
     /// Min prior reduction (plies) for hindsight depth--.
     HINDSIGHT_DEC_MIN_R = 1, 1, 4, 1;
     /// Eval sum threshold for hindsight depth--.
-    HINDSIGHT_DEC_THRESHOLD = 102, 0, 300, 15;
+    HINDSIGHT_DEC_THRESHOLD = 104, 0, 300, 15;
 
     // === Static history (eval change bonus) (3) ===
     /// Static history factor: X * -(eval + prev_eval) / 128.
-    STATIC_HIST_FACTOR = 870, 200, 2000, 50;
+    STATIC_HIST_FACTOR = 896, 200, 2000, 50;
     /// Static history minimum clamp.
-    STATIC_HIST_MIN = -124, -500, 0, 20;
+    STATIC_HIST_MIN = -93, -500, 0, 20;
     /// Static history maximum clamp.
-    STATIC_HIST_MAX = 351, 50, 1000, 30;
+    STATIC_HIST_MAX = 364, 50, 1000, 30;
+    /// Pawn history share of the static history bonus, in 1/1024 (non-pawn,
+    /// non-promotion previous move, no TT hit).
+    STATIC_PAWN_HIST_MUL = 1412, 0, 3000, 120;
 
-    // === Late move pruning (1) ===
+    // === Late move pruning (2) ===
     /// Base in LMP threshold: `(d^2 + base) / (2 - improving)`.
     LMP_BASE = 15, 1, 20, 1;
+    /// History term of the LMP threshold, in 1/1024 move: `+ X * history / 1024` (quiets),
+    /// the threshold then rounded to the nearest move.
+    LMP_HIST_MUL = 40, 0, 150, 6;
 
     // === Singular extensions (5) ===
     /// Minimum depth to attempt singular extension.
@@ -270,19 +276,19 @@ tunable! {
     /// TT depth margin for SE: `tt_depth >= depth - X`.
     SE_TT_DEPTH_MARGIN = 3, 1, 8, 1;
     /// Double extension margin below singular_beta (search units).
-    SE_DOUBLE_MARGIN = 14, 1, 60, 3;
+    SE_DOUBLE_MARGIN = 18, 1, 60, 3;
     /// Double extension depth gradient: `SE_DOUBLE_MARGIN + X * depth / 1024`.
-    SE_DOUBLE_DEPTH = -48, -120, 60, 5;
+    SE_DOUBLE_DEPTH = -49, -120, 60, 5;
     /// Triple extension margin below singular_beta (search units).
-    SE_TRIPLE_MARGIN = 108, 30, 300, 15;
+    SE_TRIPLE_MARGIN = 96, 30, 300, 15;
     /// Triple extension depth gradient: `SE_TRIPLE_MARGIN + X * depth / 1024`.
-    SE_TRIPLE_DEPTH = 136, -200, 400, 20;
+    SE_TRIPLE_DEPTH = 145, -200, 400, 20;
     /// Max cumulative double+ extensions along a path.
     SE_MAX_DOUBLE_EXT = 9, 2, 12, 1;
     /// Extra depth-proportional SE margin on ex-PV nodes (tt_pv && !PV).
     /// Wider singular-extension margin where the node was once on the PV.
     /// Units: 1/128 of depth (128 = one extra depth).
-    SE_TTPV_DEPTH = 89, 0, 300, 15;
+    SE_TTPV_DEPTH = 96, 0, 300, 15;
     /// Divisor for |correction_value| in the SE double/triple margin adjustment.
     /// When |correction_value| is large, the static eval is unreliable → extend more.
     /// Smaller divisor = stronger margin adjustment.
@@ -290,15 +296,15 @@ tunable! {
 
     // === Correction history (6) ===
     /// Pawn correction history weight.
-    PAWN_CORR_FACTOR = 5298, 2000, 12000, 500;
+    PAWN_CORR_FACTOR = 5020, 2000, 12000, 500;
     /// Continuation correction history weight.
-    CONT_CORR_FACTOR = 7099, 1000, 12000, 500;
+    CONT_CORR_FACTOR = 7472, 1000, 12000, 500;
     /// Non-pawn correction history weight (sum of white + black lookups).
-    NON_PAWN_CORR_FACTOR = 6744, 1000, 12000, 500;
+    NON_PAWN_CORR_FACTOR = 6760, 1000, 12000, 500;
     /// Minor piece correction history weight (N+B+K combined key).
-    MINOR_CORR_FACTOR = 2737, 1000, 12000, 500;
+    MINOR_CORR_FACTOR = 2913, 1000, 12000, 500;
     /// Correction history update scaling factor.
-    CORR_UPDATE_FACTOR = 169, 30, 300, 15;
+    CORR_UPDATE_FACTOR = 161, 30, 300, 15;
     /// Fifty-move rule scaling denominator.
     FIFTY_MOVE_SCALE = 232, 100, 500, 20;
 
@@ -310,11 +316,11 @@ tunable! {
     /// Depth divisor: `depth / X` added to R.
     NMP_DEPTH_DIV = 3, 2, 6, 1;
     /// Eval divisor: `(eval - beta) / X`.
-    NMP_EVAL_DIV = 274, 50, 500, 25;
+    NMP_EVAL_DIV = 271, 50, 500, 25;
     /// Max eval-based R bonus.
     NMP_EVAL_MAX = 5, 1, 10, 1;
     /// Minimum depth for NMP verification search.
-    NMP_VERIF_DEPTH = 17, 8, 24, 2;
+    NMP_VERIF_DEPTH = 16, 8, 24, 2;
     /// Null move entry margin: the static eval must beat beta by
     /// `NMP_MARGIN_BASE - NMP_MARGIN_DEPTH * depth - NMP_MARGIN_IMPROVING * improving`
     /// (the form most references use, at about two thirds of their scale: the
@@ -323,9 +329,9 @@ tunable! {
     /// reply search misses the mate net that a real move would have to face.
     /// No floor on beta: forbidding the null move in lost windows was measured
     /// and costs mates (the eval bonus is already capped by `NMP_EVAL_MAX`).
-    NMP_MARGIN_BASE = 139, 0, 1200, 60;
-    NMP_MARGIN_DEPTH = 3, 0, 60, 4;
-    NMP_MARGIN_IMPROVING = 19, 0, 200, 15;
+    NMP_MARGIN_BASE = 175, 0, 1200, 60;
+    NMP_MARGIN_DEPTH = 4, 0, 60, 4;
+    NMP_MARGIN_IMPROVING = 14, 0, 200, 15;
 
     // === ProbCut (3) ===
     /// Minimum depth for ProbCut pruning.
@@ -345,53 +351,53 @@ tunable! {
     /// Base LMR: `X * LMR_LN[move_count] * LMR_LN[depth] / 1024`.
     /// Initial value was a least-squares fit to the previous ilog2-product form
     /// over a leaf-weighted (mc, depth) domain (bias ~0); SPSA settled slightly above it.
-    LMR_LOG_MUL = 629, 256, 1280, 40;
+    LMR_LOG_MUL = 692, 256, 1280, 40;
     /// Constant offset added to the LMR log-log term (1/1024 ply).
-    LMR_LOG_BASE = -47, -512, 512, 32;
+    LMR_LOG_BASE = -32, -512, 512, 32;
     /// Quiet move base penalty (1/1024 ply).
-    LMR_QUIET_BASE = 1738, 1000, 3000, 100;
+    LMR_QUIET_BASE = 1635, 1000, 3000, 100;
     /// Quiet history: `X * combined_history / 1024` subtracted.
-    LMR_QUIET_HIST_MUL = 66, 0, 400, 20;
+    LMR_QUIET_HIST_MUL = 137, 0, 400, 20;
     /// Capture base penalty (1/1024 ply).
-    LMR_CAPTURE_BASE = 1183, 500, 2500, 100;
+    LMR_CAPTURE_BASE = 1115, 500, 2500, 100;
     /// Capture history: `X * cap_hist / 1024` subtracted.
-    LMR_CAPTURE_HIST_MUL = 170, 30, 300, 15;
+    LMR_CAPTURE_HIST_MUL = 150, 30, 300, 15;
     /// PV window scaling: `X * (beta-alpha) / root_delta`.
-    LMR_PV_WINDOW_MUL = 513, 100, 800, 40;
+    LMR_PV_WINDOW_MUL = 547, 100, 800, 40;
     /// TT PV score bonus: `X * (tt_score > alpha)`.
-    LMR_TTPV_SCORE_MUL = 434, 200, 1200, 50;
+    LMR_TTPV_SCORE_MUL = 457, 200, 1200, 50;
     /// TT PV depth bonus: `X * (tt_depth >= depth)`.
-    LMR_TTPV_DEPTH_MUL = 1295, 300, 3000, 60;
+    LMR_TTPV_DEPTH_MUL = 1315, 300, 3000, 60;
     /// TT PV depth-linear term: `X * depth`.
-    LMR_TTPV_DEPTH_LIN = 18, 0, 64, 8;
+    LMR_TTPV_DEPTH_LIN = 10, 0, 64, 8;
     /// Cut node depth gradient: `X * depth / 1024` (the flat part lives in the factorized term).
-    LMR_CUTNODE_DEPTH = -538, -2000, 2000, 200;
+    LMR_CUTNODE_DEPTH = -431, -2000, 2000, 200;
     /// Not-improving depth gradient: `X * depth / 1024` (the flat part lives in the factorized term).
-    LMR_NOT_IMPROVING_DEPTH = -46, -800, 800, 80;
+    LMR_NOT_IMPROVING_DEPTH = 25, -800, 800, 80;
     /// Not-improving scale: `X * improvement / 128`.
-    LMR_NOT_IMPROVING_MUL = 112, 80, 900, 30;
+    LMR_NOT_IMPROVING_MUL = 57, 0, 900, 30;
     /// Max not-improving penalty.
     /// Cap on the not-improving magnitude term. 1080 = the former 1300 less the
     /// 220 flat part that moved into the factorized intercept.
-    LMR_NOT_IMPROVING_MAX = 949, 0, 2500, 100;
+    LMR_NOT_IMPROVING_MAX = 953, 0, 2500, 100;
     /// Bad TT score penalty added to R.
-    LMR_BAD_TT_SCORE = 234, 0, 1200, 50;
+    LMR_BAD_TT_SCORE = 224, 0, 1200, 50;
     /// LMR penalty when TT depth is shallower than current depth (1/1024 ply).
     /// A shallow TT entry is weaker evidence for the move, so reduce it more.
-    LMR_TT_SHALLOW_DEPTH = 198, 50, 800, 40;
+    LMR_TT_SHALLOW_DEPTH = 152, 50, 800, 40;
     /// Correction history LMR: reduce less when |correction_value| is large.
     /// Positions with strong correction are hard to evaluate statically → search deeper.
     /// Scales the LMR adjustment derived from the correction magnitude.
-    LMR_CORR_HIST_MUL = 3102, 500, 5000, 200;
+    LMR_CORR_HIST_MUL = 3020, 500, 5000, 200;
 
     /// LMR overextension for strongly boosted early moves.
     /// Reduction threshold r (in 1/1024 plies) that triggers the overextension.
     /// The move must accumulate 3.5+ plies of net bonuses (history/PV/check).
-    LMR_OVEREXT_THRESHOLD = -3824, -6144, -1024, 256;
+    LMR_OVEREXT_THRESHOLD = -3985, -6144, -1024, 256;
     /// Max move_count allowed for LMR overextension.
-    LMR_OVEREXT_MAX_MC = 5, 1, 8, 1;
+    LMR_OVEREXT_MAX_MC = 6, 1, 8, 1;
     /// LMR recapture bonus: reduce less for noisy recaptures (plies in units of 1/1024).
-    RECAPTURE_LMR_BONUS = 983, 256, 1536, 32;
+    RECAPTURE_LMR_BONUS = 964, 256, 1536, 32;
 
     // === LMR terms the reference engine has and we did not (4) ===
     // All default to zero, so the search is unchanged until they are tuned; the
@@ -400,179 +406,271 @@ tunable! {
     /// Reduce more when the TT move is a capture, at the reference value. The -110 the
     /// SPSA found earlier was learned on a signal read from the child's board, true for
     /// nearly every TT move (P28 of TODO_SEARCH_BUGS).
-    LMR_TTM_CAPTURE = 1060, -1024, 1536, 64;
+    LMR_TTM_CAPTURE = 1066, -1024, 1536, 64;
     /// Reduce less for a killer move (reference: -1084 on both killers, never
     /// the countermove — the exclusion is deliberate there).
-    LMR_KILLER_SUB = 44, -1024, 2048, 64;
+    LMR_KILLER_SUB = 87, -1024, 2048, 64;
     /// Parent reduction fed back into the child's reduction, in 1/1024 ply per
     /// ply the parent was reduced (reference: +199).
     LMR_PARENT_RED_MUL = 18, -256, 512, 24;
     /// Extra reduction for captures the picker already ranked as losing (T35;
     /// the reference gives noisy moves a flat base, 2896 against 188).
-    LMR_BADCAP_EXTRA = 145, -1024, 4096, 128;
+    LMR_BADCAP_EXTRA = 53, -1024, 4096, 128;
 
     /// Reduce more for every time alpha was raised at this node (1/1024 ply
     /// per raise): once the node has found improvements, the rest is late.
-    LMR_ALPHA_RAISE_MUL = 114, 0, 2048, 64;
+    LMR_ALPHA_RAISE_MUL = 124, 0, 2048, 64;
 
     // >>> generated: factorized LMR (tools/scripts/gen_factorized_lmr.py)
     // One weight per canonical subset of the context booleans, in 1/1024
     // ply; positive reduces more. Seeded with the reference values.
-    LMR_F_BASE = 157, -3072, 3072, 128;
-    LMR_F_PV = -100, -3072, 3072, 128;
-    LMR_F_CUTNODE = 2635, -3072, 4096, 128;
-    LMR_F_IMPROVING = -138, -3072, 3072, 128;
-    LMR_F_TTMOVE = -98, -3072, 3072, 128;
-    LMR_F_TTPV = -270, -3072, 3072, 128;
-    LMR_F_QUIET = 46, -3072, 3072, 128;
-    LMR_F_GIVESCHECK = -291, -3072, 3072, 128;
-    LMR_F_ROOT = 348, -3072, 3072, 128;
-    LMR_F_FH2 = 93, -3072, 3072, 128;
-    LMR_F_PV_IMPROVING = -399, -3072, 3072, 128;
-    LMR_F_PV_TTMOVE = -38, -3072, 3072, 128;
-    LMR_F_PV_QUIET = -13, -3072, 3072, 128;
-    LMR_F_PV_GIVESCHECK = 165, -3072, 3072, 128;
-    LMR_F_PV_FH2 = 0, -3072, 3072, 128;
-    LMR_F_CUTNODE_IMPROVING = 7, -3072, 3072, 128;
-    LMR_F_CUTNODE_TTMOVE = -1229, -3072, 3072, 128;
-    LMR_F_CUTNODE_TTPV = -2209, -3072, 3072, 128;
-    LMR_F_CUTNODE_QUIET = -602, -3072, 3072, 128;
-    LMR_F_CUTNODE_GIVESCHECK = 72, -3072, 3072, 128;
-    LMR_F_CUTNODE_FH2 = 120, -3072, 3072, 128;
-    LMR_F_IMPROVING_TTMOVE = -38, -3072, 3072, 128;
-    LMR_F_IMPROVING_TTPV = 48, -3072, 3072, 128;
-    LMR_F_IMPROVING_QUIET = 246, -3072, 3072, 128;
-    LMR_F_IMPROVING_GIVESCHECK = -349, -3072, 3072, 128;
-    LMR_F_IMPROVING_FH2 = -37, -3072, 3072, 128;
-    LMR_F_TTMOVE_TTPV = 323, -3072, 3072, 128;
-    LMR_F_TTMOVE_QUIET = 88, -3072, 3072, 128;
-    LMR_F_TTMOVE_GIVESCHECK = -64, -3072, 3072, 128;
-    LMR_F_TTMOVE_ROOT = -185, -3072, 3072, 128;
-    LMR_F_TTMOVE_FH2 = 151, -3072, 3072, 128;
-    LMR_F_TTPV_QUIET = 68, -3072, 3072, 128;
-    LMR_F_TTPV_GIVESCHECK = -131, -3072, 3072, 128;
-    LMR_F_TTPV_FH2 = 105, -3072, 3072, 128;
-    LMR_F_QUIET_GIVESCHECK = 289, -3072, 3072, 128;
-    LMR_F_QUIET_ROOT = 262, -3072, 3072, 128;
-    LMR_F_QUIET_FH2 = -29, -3072, 3072, 128;
-    LMR_F_GIVESCHECK_ROOT = 32, -3072, 3072, 128;
-    LMR_F_GIVESCHECK_FH2 = 147, -3072, 3072, 128;
-    LMR_F_ROOT_FH2 = 612, -3072, 3072, 128;
-    LMR_F_PV_IMPROVING_TTMOVE = -107, -3072, 3072, 128;
-    LMR_F_PV_IMPROVING_QUIET = 217, -3072, 3072, 128;
-    LMR_F_PV_IMPROVING_GIVESCHECK = -419, -3072, 3072, 128;
-    LMR_F_PV_IMPROVING_FH2 = 31, -3072, 3072, 128;
-    LMR_F_PV_TTMOVE_QUIET = 88, -3072, 3072, 128;
-    LMR_F_PV_TTMOVE_GIVESCHECK = 259, -3072, 3072, 128;
-    LMR_F_PV_TTMOVE_FH2 = 77, -3072, 3072, 128;
-    LMR_F_PV_QUIET_GIVESCHECK = 26, -3072, 3072, 128;
-    LMR_F_PV_QUIET_FH2 = -172, -3072, 3072, 128;
-    LMR_F_PV_GIVESCHECK_FH2 = -137, -3072, 3072, 128;
-    LMR_F_CUTNODE_IMPROVING_TTMOVE = 22, -3072, 3072, 128;
-    LMR_F_CUTNODE_IMPROVING_TTPV = -214, -3072, 3072, 128;
-    LMR_F_CUTNODE_IMPROVING_QUIET = 21, -3072, 3072, 128;
-    LMR_F_CUTNODE_IMPROVING_GIVESCHECK = -184, -3072, 3072, 128;
-    LMR_F_CUTNODE_IMPROVING_FH2 = 108, -3072, 3072, 128;
-    LMR_F_CUTNODE_TTMOVE_TTPV = 1103, -3072, 3072, 128;
-    LMR_F_CUTNODE_TTMOVE_QUIET = -40, -3072, 3072, 128;
-    LMR_F_CUTNODE_TTMOVE_GIVESCHECK = 214, -3072, 3072, 128;
-    LMR_F_CUTNODE_TTMOVE_FH2 = -168, -3072, 3072, 128;
-    LMR_F_CUTNODE_TTPV_QUIET = 12, -3072, 3072, 128;
-    LMR_F_CUTNODE_TTPV_GIVESCHECK = 198, -3072, 3072, 128;
-    LMR_F_CUTNODE_TTPV_FH2 = -392, -3072, 3072, 128;
-    LMR_F_CUTNODE_QUIET_GIVESCHECK = -57, -3072, 3072, 128;
-    LMR_F_CUTNODE_QUIET_FH2 = 79, -3072, 3072, 128;
-    LMR_F_CUTNODE_GIVESCHECK_FH2 = 304, -3072, 3072, 128;
-    LMR_F_IMPROVING_TTMOVE_TTPV = 100, -3072, 3072, 128;
-    LMR_F_IMPROVING_TTMOVE_QUIET = -409, -3072, 3072, 128;
-    LMR_F_IMPROVING_TTMOVE_GIVESCHECK = 49, -3072, 3072, 128;
-    LMR_F_IMPROVING_TTMOVE_FH2 = -6, -3072, 3072, 128;
-    LMR_F_IMPROVING_TTPV_QUIET = 117, -3072, 3072, 128;
-    LMR_F_IMPROVING_TTPV_GIVESCHECK = -114, -3072, 3072, 128;
-    LMR_F_IMPROVING_TTPV_FH2 = 132, -3072, 3072, 128;
-    LMR_F_IMPROVING_QUIET_GIVESCHECK = -584, -3072, 3072, 128;
-    LMR_F_IMPROVING_QUIET_FH2 = -58, -3072, 3072, 128;
-    LMR_F_IMPROVING_GIVESCHECK_FH2 = 80, -3072, 3072, 128;
-    LMR_F_TTMOVE_TTPV_QUIET = -21, -3072, 3072, 128;
-    LMR_F_TTMOVE_TTPV_GIVESCHECK = -259, -3072, 3072, 128;
-    LMR_F_TTMOVE_TTPV_FH2 = 173, -3072, 3072, 128;
-    LMR_F_TTMOVE_QUIET_GIVESCHECK = -50, -3072, 3072, 128;
-    LMR_F_TTMOVE_QUIET_ROOT = 69, -3072, 3072, 128;
-    LMR_F_TTMOVE_QUIET_FH2 = 48, -3072, 3072, 128;
-    LMR_F_TTMOVE_GIVESCHECK_ROOT = -393, -3072, 3072, 128;
-    LMR_F_TTMOVE_GIVESCHECK_FH2 = 144, -3072, 3072, 128;
-    LMR_F_TTMOVE_ROOT_FH2 = 19, -3072, 3072, 128;
-    LMR_F_TTPV_QUIET_GIVESCHECK = 35, -3072, 3072, 128;
-    LMR_F_TTPV_QUIET_FH2 = -204, -3072, 3072, 128;
-    LMR_F_TTPV_GIVESCHECK_FH2 = -29, -3072, 3072, 128;
-    LMR_F_QUIET_GIVESCHECK_ROOT = -420, -3072, 3072, 128;
-    LMR_F_QUIET_GIVESCHECK_FH2 = -352, -3072, 3072, 128;
-    LMR_F_QUIET_ROOT_FH2 = -258, -3072, 3072, 128;
-    LMR_F_GIVESCHECK_ROOT_FH2 = 341, -3072, 3072, 128;
+    LMR_F_BASE = 245, -3072, 3072, 128;
+    LMR_F_PV = -54, -3072, 3072, 128;
+    LMR_F_CUTNODE = 2649, -3072, 4096, 128;
+    LMR_F_IMPROVING = -84, -3072, 3072, 128;
+    LMR_F_TTMOVE = 53, -3072, 3072, 128;
+    LMR_F_TTPV = -303, -3072, 3072, 128;
+    LMR_F_QUIET = 71, -3072, 3072, 128;
+    LMR_F_GIVESCHECK = -150, -3072, 3072, 128;
+    LMR_F_ROOT = 281, -3072, 3072, 128;
+    LMR_F_FH2 = 162, -3072, 3072, 128;
+    LMR_F_PV_IMPROVING = -513, -3072, 3072, 128;
+    LMR_F_PV_TTMOVE = 105, -3072, 3072, 128;
+    LMR_F_PV_QUIET = -17, -3072, 3072, 128;
+    LMR_F_PV_GIVESCHECK = 156, -3072, 3072, 128;
+    LMR_F_PV_FH2 = -32, -3072, 3072, 128;
+    LMR_F_CUTNODE_IMPROVING = 25, -3072, 3072, 128;
+    LMR_F_CUTNODE_TTMOVE = -1180, -3072, 3072, 128;
+    LMR_F_CUTNODE_TTPV = -2184, -3072, 3072, 128;
+    LMR_F_CUTNODE_QUIET = -618, -3072, 3072, 128;
+    LMR_F_CUTNODE_GIVESCHECK = 77, -3072, 3072, 128;
+    LMR_F_CUTNODE_FH2 = 86, -3072, 3072, 128;
+    LMR_F_IMPROVING_TTMOVE = 7, -3072, 3072, 128;
+    LMR_F_IMPROVING_TTPV = 172, -3072, 3072, 128;
+    LMR_F_IMPROVING_QUIET = 260, -3072, 3072, 128;
+    LMR_F_IMPROVING_GIVESCHECK = -316, -3072, 3072, 128;
+    LMR_F_IMPROVING_FH2 = 83, -3072, 3072, 128;
+    LMR_F_TTMOVE_TTPV = 291, -3072, 3072, 128;
+    LMR_F_TTMOVE_QUIET = 72, -3072, 3072, 128;
+    LMR_F_TTMOVE_GIVESCHECK = 14, -3072, 3072, 128;
+    LMR_F_TTMOVE_ROOT = -261, -3072, 3072, 128;
+    LMR_F_TTMOVE_FH2 = 231, -3072, 3072, 128;
+    LMR_F_TTPV_QUIET = 17, -3072, 3072, 128;
+    LMR_F_TTPV_GIVESCHECK = -101, -3072, 3072, 128;
+    LMR_F_TTPV_FH2 = -3, -3072, 3072, 128;
+    LMR_F_QUIET_GIVESCHECK = 234, -3072, 3072, 128;
+    LMR_F_QUIET_ROOT = 310, -3072, 3072, 128;
+    LMR_F_QUIET_FH2 = 2, -3072, 3072, 128;
+    LMR_F_GIVESCHECK_ROOT = 73, -3072, 3072, 128;
+    LMR_F_GIVESCHECK_FH2 = 72, -3072, 3072, 128;
+    LMR_F_ROOT_FH2 = 667, -3072, 3072, 128;
+    LMR_F_PV_IMPROVING_TTMOVE = -149, -3072, 3072, 128;
+    LMR_F_PV_IMPROVING_QUIET = 121, -3072, 3072, 128;
+    LMR_F_PV_IMPROVING_GIVESCHECK = -354, -3072, 3072, 128;
+    LMR_F_PV_IMPROVING_FH2 = 60, -3072, 3072, 128;
+    LMR_F_PV_TTMOVE_QUIET = 95, -3072, 3072, 128;
+    LMR_F_PV_TTMOVE_GIVESCHECK = 192, -3072, 3072, 128;
+    LMR_F_PV_TTMOVE_FH2 = 197, -3072, 3072, 128;
+    LMR_F_PV_QUIET_GIVESCHECK = -3, -3072, 3072, 128;
+    LMR_F_PV_QUIET_FH2 = -111, -3072, 3072, 128;
+    LMR_F_PV_GIVESCHECK_FH2 = -165, -3072, 3072, 128;
+    LMR_F_CUTNODE_IMPROVING_TTMOVE = 41, -3072, 3072, 128;
+    LMR_F_CUTNODE_IMPROVING_TTPV = -276, -3072, 3072, 128;
+    LMR_F_CUTNODE_IMPROVING_QUIET = 163, -3072, 3072, 128;
+    LMR_F_CUTNODE_IMPROVING_GIVESCHECK = -135, -3072, 3072, 128;
+    LMR_F_CUTNODE_IMPROVING_FH2 = 67, -3072, 3072, 128;
+    LMR_F_CUTNODE_TTMOVE_TTPV = 1141, -3072, 3072, 128;
+    LMR_F_CUTNODE_TTMOVE_QUIET = -10, -3072, 3072, 128;
+    LMR_F_CUTNODE_TTMOVE_GIVESCHECK = 321, -3072, 3072, 128;
+    LMR_F_CUTNODE_TTMOVE_FH2 = -116, -3072, 3072, 128;
+    LMR_F_CUTNODE_TTPV_QUIET = 212, -3072, 3072, 128;
+    LMR_F_CUTNODE_TTPV_GIVESCHECK = 32, -3072, 3072, 128;
+    LMR_F_CUTNODE_TTPV_FH2 = -393, -3072, 3072, 128;
+    LMR_F_CUTNODE_QUIET_GIVESCHECK = 7, -3072, 3072, 128;
+    LMR_F_CUTNODE_QUIET_FH2 = -7, -3072, 3072, 128;
+    LMR_F_CUTNODE_GIVESCHECK_FH2 = 216, -3072, 3072, 128;
+    LMR_F_IMPROVING_TTMOVE_TTPV = 121, -3072, 3072, 128;
+    LMR_F_IMPROVING_TTMOVE_QUIET = -450, -3072, 3072, 128;
+    LMR_F_IMPROVING_TTMOVE_GIVESCHECK = 88, -3072, 3072, 128;
+    LMR_F_IMPROVING_TTMOVE_FH2 = 32, -3072, 3072, 128;
+    LMR_F_IMPROVING_TTPV_QUIET = 88, -3072, 3072, 128;
+    LMR_F_IMPROVING_TTPV_GIVESCHECK = -63, -3072, 3072, 128;
+    LMR_F_IMPROVING_TTPV_FH2 = 85, -3072, 3072, 128;
+    LMR_F_IMPROVING_QUIET_GIVESCHECK = -632, -3072, 3072, 128;
+    LMR_F_IMPROVING_QUIET_FH2 = -23, -3072, 3072, 128;
+    LMR_F_IMPROVING_GIVESCHECK_FH2 = 82, -3072, 3072, 128;
+    LMR_F_TTMOVE_TTPV_QUIET = -30, -3072, 3072, 128;
+    LMR_F_TTMOVE_TTPV_GIVESCHECK = -128, -3072, 3072, 128;
+    LMR_F_TTMOVE_TTPV_FH2 = 190, -3072, 3072, 128;
+    LMR_F_TTMOVE_QUIET_GIVESCHECK = -35, -3072, 3072, 128;
+    LMR_F_TTMOVE_QUIET_ROOT = 25, -3072, 3072, 128;
+    LMR_F_TTMOVE_QUIET_FH2 = 92, -3072, 3072, 128;
+    LMR_F_TTMOVE_GIVESCHECK_ROOT = -372, -3072, 3072, 128;
+    LMR_F_TTMOVE_GIVESCHECK_FH2 = 72, -3072, 3072, 128;
+    LMR_F_TTMOVE_ROOT_FH2 = 70, -3072, 3072, 128;
+    LMR_F_TTPV_QUIET_GIVESCHECK = 95, -3072, 3072, 128;
+    LMR_F_TTPV_QUIET_FH2 = -132, -3072, 3072, 128;
+    LMR_F_TTPV_GIVESCHECK_FH2 = 115, -3072, 3072, 128;
+    LMR_F_QUIET_GIVESCHECK_ROOT = -465, -3072, 3072, 128;
+    LMR_F_QUIET_GIVESCHECK_FH2 = -279, -3072, 3072, 128;
+    LMR_F_QUIET_ROOT_FH2 = -244, -3072, 3072, 128;
+    LMR_F_GIVESCHECK_ROOT_FH2 = 308, -3072, 3072, 128;
     // <<< generated: factorized LMR
 
     // === Adaptive re-search (3) ===
     // Two-tiered do-deeper re-search, plus reduced-depth shallower re-search.
     /// Deeper tier 1 base: `score > best_score + X`.
-    DEEPER_BASE = 71, 10, 150, 5;
+    DEEPER_BASE = 68, 10, 150, 5;
     /// Deeper tier 2 base: `score > best_score + X` → +2 depth for major tactical moves.
-    DEEPER2_BASE = 901, 400, 1200, 50;
+    DEEPER2_BASE = 814, 400, 1200, 50;
     /// Shallower base: `score < best_score + X + reduced_depth`.
-    SHALLOWER_BASE = 18, 0, 60, 3;
+    SHALLOWER_BASE = 15, 0, 60, 3;
 
     // === Qsearch pruning (3) ===
     /// Qsearch futility margin: captures with SEE < 1 are pruned when `stand_pat + X <= alpha`.
     QS_FUTILITY_BASE = 358, 50, 500, 25;
     /// Qsearch SEE pruning threshold (centipawns, negative).
-    QS_SEE_THRESHOLD = -68, -200, 0, 10;
+    QS_SEE_THRESHOLD = -67, -200, 0, 10;
     /// Divisor adjusting the qsearch SEE threshold by the move's history.
     /// (good history relaxes the SEE margin, bad history tightens it)
-    QS_SEE_HIST_DIV = 65, 16, 128, 8;
+    QS_SEE_HIST_DIV = 66, 16, 128, 8;
     /// Non-PV qsearch move count limit.
     QS_MOVE_COUNT_LIMIT = 3, 2, 10, 1;
 
     // === IIR (1) ===
     /// IIR depth threshold: `depth >= X + 2 * cut_node`.
-    IIR_DEPTH = 3, 1, 6, 1;
+    IIR_DEPTH = 4, 1, 6, 1;
+
+    // === Transposition table cutoff (1) ===
+    /// Up to this depth a fail-high is taken from the table only at an expected
+    /// cut node; a fail-low is taken everywhere. 0 turns the guard off. Played at
+    /// every depth against neighbours tuned without it, it gained nothing
+    /// measurable, hence the zero; the range stops there.
+    TT_CUT_GUARD_DEPTH = 1, 0, 12, 1;
 
     // === History bonus/malus (6) ===
     /// History bonus: `X * depth + offset`.
-    STAT_BONUS_MUL = 136, 50, 400, 15;
+    STAT_BONUS_MUL = 149, 50, 400, 15;
     /// History bonus offset: `mul * depth + X`.
-    STAT_BONUS_ADD = -12, -50, 100, 8;
+    STAT_BONUS_ADD = -10, -50, 100, 8;
     /// History bonus max: `.min(X)`.
-    STAT_BONUS_MAX = 1649, 500, 3000, 100;
+    STAT_BONUS_MAX = 1681, 500, 3000, 100;
     /// History malus: `X * depth - offset`.
-    STAT_MALUS_MUL = 247, 50, 400, 15;
+    STAT_MALUS_MUL = 236, 50, 400, 15;
     /// History malus offset: `mul * depth - X`.
-    STAT_MALUS_SUB = 57, -50, 100, 8;
+    STAT_MALUS_SUB = 56, -50, 100, 8;
     /// History malus max: `.min(X)`.
-    STAT_MALUS_MAX = 672, 200, 2500, 100;
+    STAT_MALUS_MAX = 435, 200, 2500, 100;
+
+    // === History table bounds (4) ===
+    // Each move-ordering table saturates at its own bound under the gravity update.
+    /// Butterfly history bound.
+    HIST_MAX_BUTTERFLY = 8549, 2048, 32000, 512;
+    /// Capture history bound.
+    HIST_MAX_CAPTURE = 8471, 2048, 32000, 512;
+    /// Continuation history bound.
+    HIST_MAX_CONT = 7177, 2048, 32000, 1024;
+    /// Pawn history bound.
+    HIST_MAX_PAWN = 8528, 2048, 32000, 512;
 
     // === Non-PV best-move history bonus scaled by move count ===
     /// Divisor scaling the bonus by the number of moves tried at non-PV nodes.
     /// Smaller = stronger effect, larger = weaker effect.
-    BESTMOVE_MC_DIV = 350, 64, 1024, 32;
+    BESTMOVE_MC_DIV = 343, 64, 1024, 32;
+    /// Cutoff bonus and malus scaled by the node's fail-high re-searches: cap of the count.
+    NFH_CAP = 4, 1, 6, 1;
+    /// Cutoff bonus and malus scaled by `1 + min(n, cap) * 10 / X` (X in tenths).
+    NFH_DIV10 = 31, 10, 120, 5;
+    /// History update one ply deeper when the cutoff beats beta by more than X.
+    HIST_HIGH_MARGIN = 402, 0, 1000, 40;
 
-    // === Move ordering (6) ===
+    // === Continuation history gravity on the combined score (1) ===
+    /// Gravity divisor of the continuation update, applied to the move's combined
+    /// continuation score: `val += bonus - sum * |bonus| / X`.
+    CONT_GRAVITY = 12975, 4096, 65536, 1024;
+
+    // === Move ordering (24) ===
     /// MVV multiplier in capture scoring: `PIECE_VALUE[victim] * X`.
-    MVV_MULTIPLIER = 13, 1, 64, 4;
+    MVV_MULTIPLIER = 10, 1, 64, 4;
     /// Good/bad capture split: base SEE threshold (centipawns, negative).
-    GOOD_CAP_BASE = -122, -300, 0, 16;
+    GOOD_CAP_BASE = -127, -300, 0, 16;
     /// Good/bad capture split: capture history divisor shifting the threshold.
-    GOOD_CAP_HIST_DIV = 28, 8, 96, 4;
+    GOOD_CAP_HIST_DIV = 27, 8, 96, 4;
     /// Movepicker bonus for quiet moves that give direct check.
-    MOVEPICK_CHECK_BONUS = 11206, 4000, 20000, 1000;
-    /// Learned look-ahead: TT child eval multiplier (numerator).
-    LOOKAHEAD_BONUS_MUL = 14, 0, 32, 2;
-    /// Learned look-ahead: TT child eval divisor (denominator).
-    LOOKAHEAD_BONUS_DIV = 1, 1, 8, 1;
+    MOVEPICK_CHECK_BONUS = 11523, 4000, 20000, 1000;
+    /// Movepicker score bonus for the first killer among the quiets.
+    MOVEPICK_KILLER1_BONUS = 11996, 0, 24000, 1000;
+    /// Movepicker score bonus for the second killer among the quiets.
+    MOVEPICK_KILLER2_BONUS = 11972, 0, 24000, 1000;
+    /// Movepicker score bonus for the countermove among the quiets.
+    MOVEPICK_COUNTER_BONUS = 12265, 0, 24000, 1000;
+    /// Quiets scored below this are held back until after the bad captures.
+    MOVEPICK_BAD_QUIET_THRESHOLD = -4170, -30000, 0, 1000;
+    /// Learned look-ahead: TT child eval multiplier, in 1/LOOKAHEAD_BONUS_DIV
+    /// (sixteenths) of history units per eval unit.
+    LOOKAHEAD_BONUS_MUL = 246, 0, 512, 32;
     /// Learned look-ahead: minimum depth to enable TT child probing.
-    LOOKAHEAD_MIN_DEPTH = 3, 1, 12, 1;
+    LOOKAHEAD_MIN_DEPTH = 5, 1, 12, 1;
+    /// Weight of the butterfly history in the quiet score at depth 1-2 (and quiescence evasions) (1/1024).
+    QUIET_W_MAIN_D1 = 2032, 0, 4096, 64;
+    /// Weight of the butterfly history in the quiet score at depth 3-4 (1/1024).
+    QUIET_W_MAIN_D3 = 2057, 0, 4096, 64;
+    /// Weight of the butterfly history in the quiet score at depth 5-7 (1/1024).
+    QUIET_W_MAIN_D5 = 1040, 0, 4096, 64;
+    /// Weight of the butterfly history in the quiet score at depth 8 and more (1/1024).
+    QUIET_W_MAIN_D8 = 1025, 0, 4096, 64;
+    /// Weight of the pawn history in the quiet score at depth 1-2 (and quiescence evasions) (1/1024).
+    QUIET_W_PAWN_D1 = 2080, 0, 4096, 64;
+    /// Weight of the pawn history in the quiet score at depth 3-4 (1/1024).
+    QUIET_W_PAWN_D3 = 2031, 0, 4096, 64;
+    /// Weight of the pawn history in the quiet score at depth 5-7 (1/1024).
+    QUIET_W_PAWN_D5 = 1049, 0, 4096, 64;
+    /// Weight of the pawn history in the quiet score at depth 8 and more (1/1024).
+    QUIET_W_PAWN_D8 = 1058, 0, 4096, 64;
+    /// Weight of the continuation history one ply back in the quiet score at depth 1-2 (and quiescence evasions) (1/1024).
+    QUIET_W_CONT1_D1 = 1550, 0, 4096, 64;
+    /// Weight of the continuation history one ply back in the quiet score at depth 3-4 (1/1024).
+    QUIET_W_CONT1_D3 = 1477, 0, 4096, 64;
+    /// Weight of the continuation history one ply back in the quiet score at depth 5-7 (1/1024).
+    QUIET_W_CONT1_D5 = 938, 0, 4096, 64;
+    /// Weight of the continuation history one ply back in the quiet score at depth 8 and more (1/1024).
+    QUIET_W_CONT1_D8 = 958, 0, 4096, 64;
+    /// Weight of the continuation history two plies back in the quiet score at depth 1-2 (and quiescence evasions) (1/1024).
+    QUIET_W_CONT2_D1 = 1010, 0, 4096, 64;
+    /// Weight of the continuation history two plies back in the quiet score at depth 3-4 (1/1024).
+    QUIET_W_CONT2_D3 = 965, 0, 4096, 64;
+    /// Weight of the continuation history two plies back in the quiet score at depth 5-7 (1/1024).
+    QUIET_W_CONT2_D5 = 1058, 0, 4096, 64;
+    /// Weight of the continuation history two plies back in the quiet score at depth 8 and more (1/1024).
+    QUIET_W_CONT2_D8 = 1069, 0, 4096, 64;
+    /// Weight of the continuation history four plies back in the quiet score (1/1024).
+    QUIET_W_CONT4 = 1006, 0, 4096, 64;
+    /// Weight of the continuation history six plies back in the quiet score (1/1024).
+    QUIET_W_CONT6 = 1044, 0, 4096, 64;
+    /// Child evaluation: minimum depth of a node without a TT move at which the best
+    /// quiets whose child has no TT entry get their child evaluated by the network.
+    CHILD_EVAL_MIN_DEPTH = 12, 4, 16, 1;
+    /// Child evaluation: how many of the best quiets are looked at.
+    CHILD_EVAL_COUNT = 64, 1, 64, 1;
+    /// Child evaluation: multiplier of the child term (score units per eval unit).
+    CHILD_EVAL_MUL = 198, 0, 512, 16;
+    /// Child evaluation, variant: 1 = term relative to the node's raw eval (the
+    /// evaluated quiets do not move as a block against the others).
+    CHILD_EVAL_CENTER = 1, 0, 1, 1;
+    /// Child evaluation, variant: 1 = store the child eval in the TT (eval-only entry).
+    CHILD_EVAL_STORE = 1, 0, 1, 1;
+    /// Child evaluation, variant: 1 = the child's value is a null-window quiescence
+    /// search at the node's beta instead of its static evaluation.
+    CHILD_EVAL_QS = 0, 0, 1, 1;
+    /// Child evaluation, quiescence variant: bonus for a quiet whose child fails low
+    /// at beta (the quiet holds beta once captures are resolved).
+    CHILD_EVAL_QS_BONUS = 0, 0, 65536, 2048;
+    /// Child evaluation, variant: 0 = also look at quiets whose child has a TT entry.
+    CHILD_EVAL_SKIP_TT = 1, 0, 1, 1;
 
     // === Lazy eval (1) ===
     /// PeSTO score threshold to skip NNUE forward pass (centipawns, absolute).
-    LAZY_EVAL_THRESHOLD = 680, 200, 1500, 50;
+    LAZY_EVAL_THRESHOLD = 743, 200, 1500, 50;
 
     // === Optimism (4) ===
     /// Optimism sigmoid numerator.
@@ -580,22 +678,28 @@ tunable! {
     /// Optimism sigmoid offset.
     OPT_OFFSET = 209, 50, 400, 10;
     /// Material scale base for raw eval.
-    OPT_MAT_SCALE = 877, 200, 2000, 50;
+    OPT_MAT_SCALE = 944, 200, 2000, 50;
     /// Material base for optimism weight.
-    OPT_MAT_BASE = 1639, 500, 4000, 200;
+    OPT_MAT_BASE = 1804, 500, 4000, 200;
 
     // === Prior Countermove Bonus on Unexpected All-Nodes (2) ===
     // Bonus to the parent's quiet move when this node fails low
     // unexpectedly (predicted cut or PV but the result is an all-node).
     /// Butterfly history factor: PCM_ALLNODE_FACTOR * stat_bonus(depth) / 128.
-    PCM_ALLNODE_FACTOR = 160, 50, 400, 16;
+    PCM_ALLNODE_FACTOR = 162, 50, 400, 16;
     /// Continuation history factor: PCM_ALLNODE_CONTHIST_FACTOR * stat_bonus(depth) / 128.
-    PCM_ALLNODE_CONTHIST_FACTOR = 96, 30, 300, 16;
+    PCM_ALLNODE_CONTHIST_FACTOR = 101, 30, 300, 16;
 
     // === Prior Capture Move Bonus on Unexpected All-Nodes ===
     // Capture history bonus for the parent's capture move at unexpected all-nodes.
     /// Capture history factor: PCM_ALLNODE_CAPTURE_FACTOR * stat_bonus(depth) / 128.
-    PCM_ALLNODE_CAPTURE_FACTOR = 59, 16, 200, 12;
+    PCM_ALLNODE_CAPTURE_FACTOR = 61, 16, 200, 12;
+
+    // === Quiescence history update (2) ===
+    /// Capture history bonus to the noisy move that fails high in quiescence.
+    QS_CAP_HIST_BONUS = 101, 0, 400, 20;
+    /// Capture history malus to the other noisy moves searched before it.
+    QS_CAP_HIST_MALUS = 171, 0, 400, 20;
 }
 
 // === Move Overhead — standalone, exposed as UCI option ===
@@ -620,11 +724,15 @@ pub fn set_move_overhead(value: i32) {
     MOVE_OVERHEAD_VALUE.store(value.clamp(0, 5000), std::sync::atomic::Ordering::Relaxed);
 }
 
-// Empty on purpose. The time-management scalars that used to live here are now
-// the reals of `timeman.rs`, tuned as a set rather than one at a time. The
-// invocation stays because it is what defines `set_param_fixed`, and because the
-// next parameter that must not reach a tuner belongs here.
-fixed! {}
+// Parameters that must not reach a tuner. The time-management scalars that used
+// to live here are now the reals of `timeman.rs`, tuned as a set rather than one
+// at a time. The invocation also defines `set_param_fixed`.
+fixed! {
+    /// Learned look-ahead: fixed denominator of LOOKAHEAD_BONUS_MUL. A tunable
+    /// divisor only duplicated the multiplier, and its lower bound biased the
+    /// SPSA gradient; a fixed 16 lets the multiplier move in sixteenths.
+    LOOKAHEAD_BONUS_DIV = 16, 16, 16, 1;
+}
 
 /// Set a parameter (tunable or fixed) by name. Returns `true` if found.
 #[cfg(feature = "spsa")]
@@ -640,23 +748,36 @@ pub fn set_param(name: &str, value: i32) -> bool {
 mod tests {
     use super::*;
 
+    /// With the `spsa` feature the parameters live in global storage, and the
+    /// harness runs tests on several threads: the tests that read default
+    /// values hold this lock, so that they never see the value
+    /// `test_set_param` writes for a moment.
+    static PARAM_VALUES: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn lock_param_values() -> std::sync::MutexGuard<'static, ()> {
+        // A failed test must not fail the others through a poisoned lock.
+        PARAM_VALUES.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     #[test]
     fn test_tunable_defaults() {
+        let _values = lock_param_values();
         // Spot-check that getter functions return the declared defaults.
-        assert_eq!(ASP_INITIAL_DELTA(), 18);
-        assert_eq!(RFP_MARGIN(), 90);
-        assert_eq!(SEE_QUIET_MARGIN(), -7);
-        assert_eq!(LMR_LOG_MUL(), 629);
+        assert_eq!(ASP_INITIAL_DELTA(), 19);
+        assert_eq!(RFP_MARGIN(), 80);
+        assert_eq!(SEE_QUIET_MARGIN(), -6);
+        assert_eq!(LMR_LOG_MUL(), 692);
         assert_eq!(NMP_BASE_R(), 4);
-        assert_eq!(STAT_BONUS_MUL(), 136);
-        assert_eq!(MVV_MULTIPLIER(), 13);
-        assert_eq!(BNFP_BASE(), 138);
-        assert_eq!(BNFP_DEPTH_LIMIT(), 9558);
-        assert_eq!(QS_SEE_THRESHOLD(), -68);
+        assert_eq!(STAT_BONUS_MUL(), 149);
+        assert_eq!(MVV_MULTIPLIER(), 10);
+        assert_eq!(BNFP_BASE(), 139);
+        assert_eq!(BNFP_DEPTH_LIMIT(), 9487);
+        assert_eq!(QS_SEE_THRESHOLD(), -67);
     }
 
     #[test]
     fn test_fixed_defaults() {
+        let _values = lock_param_values();
         assert_eq!(MOVE_OVERHEAD(), 40);
     }
 
@@ -755,10 +876,14 @@ mod tests {
     #[cfg(feature = "spsa")]
     #[test]
     fn test_set_param() {
-        // Verify runtime mutation works for tunable params.
+        let _values = lock_param_values();
+        // Verify runtime mutation works for tunable params. The probe is
+        // derived from the default and not written as a literal: refreshing
+        // the witness values of test_tunable_defaults must not rewrite it.
         let old = RFP_MARGIN();
-        assert!(set_param("RFP_MARGIN", 100));
-        assert_eq!(RFP_MARGIN(), 90);
+        let probe = old + 10;
+        assert!(set_param("RFP_MARGIN", probe));
+        assert_eq!(RFP_MARGIN(), probe);
         assert!(set_param("RFP_MARGIN", old));
         assert_eq!(RFP_MARGIN(), old);
 

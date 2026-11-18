@@ -166,6 +166,9 @@ pub struct TTHit {
     pub depth: i32,
     pub bound: Bound,
     pub pv: bool,
+    /// The slot it was read from, cluster * 3 + entry (statistics only).
+    #[cfg(feature = "stats")]
+    pub slot: usize,
 }
 
 /// The transposition table.
@@ -185,6 +188,9 @@ pub struct TT {
     /// Clusters in `mem`.
     len: usize,
     age: AtomicU8,
+    /// The full key and the writer of every slot (statistics only, see `ttstat`).
+    #[cfg(feature = "stats")]
+    shadow: crate::ttstat::Shadow,
 }
 
 // SAFETY: during a search the clusters are only reached through shared references to
@@ -205,6 +211,8 @@ impl TT {
             mem: LargeMem::zeroed(len * std::mem::size_of::<Cluster>(), false),
             len,
             age: AtomicU8::new(0),
+            #[cfg(feature = "stats")]
+            shadow: crate::ttstat::Shadow::new(len * 3),
         }
     }
 
@@ -223,6 +231,10 @@ impl TT {
         self.mem = LargeMem::zeroed(len * std::mem::size_of::<Cluster>(), giga_pages);
         self.len = len;
         *self.age.get_mut() = 0;
+        #[cfg(feature = "stats")]
+        {
+            self.shadow = crate::ttstat::Shadow::new(len * 3);
+        }
     }
 
     /// Size in megabytes.
@@ -256,6 +268,8 @@ impl TT {
         // SAFETY: the range lies within the table, and callers clear disjoint slices
         // while no search reads them. An all-zero cluster is the empty cluster.
         unsafe { std::ptr::write_bytes(self.cluster_ptr(start), 0, end - start) };
+        #[cfg(feature = "stats")]
+        self.shadow.clear(start * 3, end * 3);
     }
 
     /// Reset the age counter (with a full clear).
@@ -332,6 +346,9 @@ impl TT {
                     depth: entry.depth as i32,
                     bound,
                     pv: entry.pv(),
+                    #[cfg(feature = "stats")]
+                    slot: self.index(key) * 3
+                        + cluster.entries.iter().position(|e| std::ptr::eq(e, slot)).unwrap_or(0),
                 });
             }
         }
@@ -383,6 +400,13 @@ impl TT {
         let cluster = unsafe { &*self.cluster_ptr(idx) };
         let verify = verification_key(key);
         let tt_age = self.age.load(Ordering::Relaxed);
+        // The cluster as the write finds it, for the statistics.
+        #[cfg(feature = "stats")]
+        let before: [TTEntry; 3] = std::array::from_fn(|i| cluster.entries[i].load());
+        #[cfg(feature = "stats")]
+        let stat = |r: usize, outcome: StoreOutcome| {
+            self.store_stat(key, idx, r, &before, tt_age, depth, bound, mv, pv, outcome)
+        };
 
         // Find the best replacement slot, reading only what the choice needs.
         let mut replace_idx = 0usize;
@@ -413,6 +437,8 @@ impl TT {
         // An evaluation alone adds nothing to an entry of the same position, which
         // already holds one beside its score.
         if bound == Bound::None && entry.key == verify && !entry.is_empty() {
+            #[cfg(feature = "stats")]
+            stat(replace_idx, StoreOutcome::EvalIgnored);
             return;
         }
 
@@ -443,6 +469,8 @@ impl TT {
             slot.depth.store(depth.clamp(i8::MIN as i32, i8::MAX as i32) as i8, Ordering::Relaxed);
             let flags = (bound as u8) | ((pv as u8) << 2) | (tt_age << 3);
             slot.flags.store(flags, Ordering::Relaxed);
+            #[cfg(feature = "stats")]
+            stat(replace_idx, StoreOutcome::Rewritten);
         } else if entry.depth >= 5
             && entry.bound() != Bound::Exact
             && is_decisive(entry.score as i32)
@@ -452,6 +480,189 @@ impl TT {
             // found nearer the root, or a shorter mate, can take its place instead
             // of being refused for ever by the depth of a stale bound.
             slot.depth.store(entry.depth - 1, Ordering::Relaxed);
+            #[cfg(feature = "stats")]
+            stat(replace_idx, StoreOutcome::Refused { aged: true });
+        } else {
+            #[cfg(feature = "stats")]
+            stat(replace_idx, StoreOutcome::Refused { aged: false });
+        }
+    }
+
+    /// The age of the current search (statistics only).
+    #[cfg(feature = "stats")]
+    pub fn stat_age(&self) -> u8 {
+        self.age.load(Ordering::Relaxed)
+    }
+
+    /// The shadow of the table (statistics only).
+    #[cfg(feature = "stats")]
+    pub fn stat_shadow(&self) -> &crate::ttstat::Shadow {
+        &self.shadow
+    }
+
+    /// Every slot of the table, as the search left it (statistics only).
+    #[cfg(feature = "stats")]
+    pub fn stat_scan(&self) -> crate::ttstat::Scan {
+        let mut scan = crate::ttstat::Scan::default();
+        let age = self.age.load(Ordering::Relaxed);
+        for c in 0..self.len {
+            // SAFETY: within the table; the fields are atomics, shared freely.
+            let cluster = unsafe { &*self.cluster_ptr(c) };
+            for (i, slot) in cluster.entries.iter().enumerate() {
+                let e = slot.load();
+                let rel_age = (AGE_CYCLE + age - e.age()) & AGE_MASK;
+                let meta = self.shadow.meta(c * 3 + i);
+                scan.add(e.is_empty(), e.bound(), e.depth as i32, rel_age, e.pv(), meta);
+            }
+        }
+        scan
+    }
+
+    /// Classifies one write for the statistics and keeps the shadow in step with the
+    /// table: `r` is the slot of cluster `idx` the write chose, `before` the cluster as
+    /// the write found it.
+    #[cfg(feature = "stats")]
+    #[allow(clippy::too_many_arguments)]
+    fn store_stat(
+        &self,
+        key: u64,
+        idx: usize,
+        r: usize,
+        before: &[TTEntry; 3],
+        tt_age: u8,
+        depth: i32,
+        bound: Bound,
+        mv: Move,
+        pv: bool,
+        outcome: StoreOutcome,
+    ) {
+        use crate::ttstat::{self as ts, C, inc};
+        debug_assert!(r < 3 && idx < self.len);
+        let meta = ts::take_origin();
+        let origin = ts::meta_origin(meta);
+        let verify = verification_key(key);
+        let slot = idx * 3 + r;
+        let e = &before[r];
+        inc(&C.st_origin[origin as usize]);
+
+        // How the slot was chosen: the first one holding the key or empty, else the victim.
+        let choice = if e.is_empty() {
+            1
+        } else if e.key == verify {
+            0
+        } else {
+            2
+        };
+        inc(&C.st_choice[choice]);
+        let alias = choice == 0 && self.shadow.key(slot) != key;
+        // `store` writes the move unless it has none for a slot holding its 16-bit key.
+        let moved = mv != Move::NONE || e.key != verify;
+        let class = match outcome {
+            StoreOutcome::Rewritten => 0,
+            StoreOutcome::EvalIgnored => 1,
+            StoreOutcome::Refused { .. } if moved => 2,
+            StoreOutcome::Refused { .. } => 3,
+        };
+        // (Single-threaded, a refusal is on the slot of its key; racing writers break that.)
+        // Whose move the slot holds after the write. A rewrite without a move keeps the
+        // move already there: another position's when the slot was an alias. A refused
+        // write with a move puts it in the entry of the position the slot keeps.
+        // (`foreign_after` is the state a rewrite leaves, read only when the data is written.)
+        let foreign_after = if moved {
+            false
+        } else if alias {
+            e.mv != 0
+        } else {
+            ts::meta_foreign_move(self.shadow.meta(slot))
+        };
+        if class == 0 && alias && !moved && e.mv != 0 {
+            inc(&C.st_foreign[0]);
+        }
+        if class == 2 {
+            if alias {
+                inc(&C.st_foreign[1]);
+            }
+            self.shadow.set_foreign_move(slot, alias);
+        }
+        if alias {
+            inc(&C.st_alias[class]);
+        } else if choice == 0 {
+            inc(&C.st_same[class]);
+            if class == 0 {
+                let clause = if bound == Bound::Exact {
+                    0
+                } else if e.key != verify {
+                    1
+                } else if depth + 2 * (pv as i32) > e.depth as i32 - 4 {
+                    2
+                } else {
+                    3
+                };
+                inc(&C.st_clause[clause]);
+            }
+            if class >= 2 {
+                inc(&C.st_refused_origin[origin as usize]);
+            }
+        }
+        if let StoreOutcome::Refused { aged: true } = outcome {
+            inc(&C.st_aging[0]);
+        }
+
+        // The victim: what it was, how old, and whether it had been read.
+        if choice == 2 {
+            let rel_age = (AGE_CYCLE + tt_age - e.age()) & AGE_MASK;
+            let k = ts::kind(e.bound(), e.depth as i32);
+            let d = ts::depth_bin(e.bound(), e.depth as i32);
+            let vmeta = self.shadow.meta(slot);
+            let read = ts::meta_read(vmeta);
+            let ever = ts::meta_ever(vmeta);
+            if rel_age == 0 {
+                inc(&C.st_vic_cur[k]);
+                inc(&C.st_vic_dcur[d]);
+                inc(&C.st_vic_rcur[read]);
+                inc(&C.st_vic_ecur[ever]);
+            } else {
+                inc(&C.st_vic_old[k]);
+                inc(&C.st_vic_dold[d]);
+                inc(&C.st_vic_rold[read]);
+                inc(&C.st_vic_eold[ever]);
+            }
+        }
+
+        // A quiescence PV node writing its pv flag.
+        if (origin == ts::O_STANDPAT || origin == ts::O_QS) && ts::meta_pv_node(meta) {
+            inc(&C.pv_qs[0]);
+            if class == 0 {
+                inc(&C.pv_qs[1]);
+                if choice == 0 && !alias {
+                    if !e.pv() {
+                        inc(&C.pv_qs[2]);
+                    }
+                } else {
+                    inc(&C.pv_qs[3]);
+                }
+            }
+        }
+
+        // What the write found, for the quiescence telemetry.
+        let qs_class = if alias {
+            5
+        } else if choice == 1 {
+            0
+        } else if choice == 2 {
+            4
+        } else if class != 0 {
+            3
+        } else if e.bound() == Bound::None || (e.depth as i32) <= 0 {
+            1
+        } else {
+            2
+        };
+        crate::qsstat::set_last_store(qs_class);
+
+        // The shadow follows the 16-bit key: written exactly when it is.
+        if class == 0 {
+            self.shadow.write(slot, key, meta, foreign_after);
         }
     }
 
@@ -490,6 +701,19 @@ impl Default for TT {
 #[inline]
 fn verification_key(key: u64) -> u16 {
     key as u16
+}
+
+/// What a write did, for the statistics.
+#[cfg(feature = "stats")]
+#[derive(Clone, Copy)]
+enum StoreOutcome {
+    /// An evaluation alone, for a slot already holding the key: nothing written.
+    EvalIgnored,
+    /// The data was written.
+    Rewritten,
+    /// The data was refused (the move may still have been written); `aged` when the
+    /// refusal took a ply off a deep decisive bound.
+    Refused { aged: bool },
 }
 
 /// Adjust score for TT storage: convert mate/TB-from-root to mate/TB-from-position.

@@ -16,6 +16,7 @@ use crate::nnue;
 use crate::position::Position;
 use crate::skill;
 use crate::stats::st;
+use crate::qsstat::qss;
 use crate::threads::{PONDER, SS_OFFSET, STOP, SharedState, ThreadData};
 use crate::timeman::{
     TM_EFFORT_MUL, TM_EFFORT_THRESHOLD, TM_FALL_BASE, TM_FALL_ITER, TM_FALL_MAX, TM_FALL_MIN,
@@ -177,6 +178,130 @@ fn settle_accumulators(td: &mut ThreadData, owed: &mut bool) {
     }
 }
 
+/// Child evaluation: at a deep node without a TT move, the look-ahead of the move
+/// picker sees little, because the children of its quiets have no TT entry yet. The
+/// best `CHILD_EVAL_COUNT` quiets (the killers and the countermove among them) whose
+/// child has none get it evaluated by the network (make, evaluate, unmake). What the
+/// move gains on the node's own raw evaluation is added to its score, scaled by
+/// `CHILD_EVAL_MUL`, so the history and the refutation bonuses keep their say and the
+/// evaluated quiets do not move as a block against the others (with
+/// `CHILD_EVAL_CENTER` at 0, the child's evaluation alone, as the look-ahead adds it;
+/// with `CHILD_EVAL_QS`, a null-window quiescence search at beta instead of the
+/// static evaluation). The child's evaluation is stored as an eval-only TT entry: when
+/// the child is searched it does not ask the network again, and the look-ahead of
+/// later iterations sees it.
+#[inline(never)]
+fn child_eval_rescore(
+    td: &mut ThreadData,
+    shared: &SharedState,
+    picker: &mut MovePicker,
+    ply: usize,
+    node_raw_eval: i32,
+    beta: i32,
+) {
+    debug_assert!(td.pos.checkers == 0, "child eval: node in check");
+    debug_assert!(node_raw_eval != SCORE_NONE && !is_beyond_eval(node_raw_eval));
+    debug_assert!(ply + 1 < MAX_PLY, "child eval: ply {ply} at the limit");
+    st!(td, s, s.child_eval[0] += 1;);
+    let n = picker
+        .pending_quiets()
+        .min(tune::CHILD_EVAL_COUNT().max(0) as usize);
+    let mut changed = false;
+    for i in 0..n {
+        let m = picker.pending_quiet(i).mv;
+        let piece = td.pos.board[m.from_sq().index()];
+        debug_assert!(piece != Piece::NONE, "child eval: no piece for {}", m.to_uci());
+        // A child with an entry has had its look-ahead term already.
+        if tune::CHILD_EVAL_SKIP_TT() != 0
+            && shared
+                .tt
+                .probe(child_key(&td.pos, m, piece), ply as i32 + 1, 0)
+                .is_some()
+        {
+            st!(td, s, s.child_eval[2] += 1;);
+            continue;
+        }
+        if !movegen::is_legal(&td.pos, m) {
+            continue;
+        }
+        if tune::CHILD_EVAL_QS() != 0 {
+            // The child's value once captures are resolved: a null-window quiescence
+            // search at beta, fail-soft. Its nodes count against the budget.
+            let saved = *td.ss(ply);
+            {
+                let conthist_ptr = td.cont_history.subtable_ptr(false, piece, m.to_sq());
+                let cont_corr_ptr = td.cont_correction.subtable_ptr(piece, m.to_sq());
+                let se = td.ss_mut(ply);
+                se.played_move = m;
+                se.moved_piece = piece;
+                se.is_capture = false;
+                se.conthist_ptr = conthist_ptr;
+                se.cont_corr_ptr = cont_corr_ptr;
+            }
+            td.nnue.push(m, &td.pos);
+            td.pos.make_move(m);
+            let v = -quiescence::<NonPv>(td, shared, -beta, -beta + 1, ply + 1);
+            td.pos.unmake_move(m);
+            td.nnue.pop();
+            *td.ss_mut(ply) = saved;
+            if td.should_stop() {
+                return;
+            }
+            st!(td, s, s.child_eval[1] += 1;);
+            let v = v.clamp(-SCORE_EVAL_MAX, SCORE_EVAL_MAX);
+            let gain = if tune::CHILD_EVAL_CENTER() != 0 { v - node_raw_eval } else { v };
+            let mut delta = gain * tune::CHILD_EVAL_MUL();
+            if v >= beta {
+                delta += tune::CHILD_EVAL_QS_BONUS();
+            }
+            picker.adjust_pending_quiet(i, delta);
+            changed = true;
+            continue;
+        }
+        td.nnue.push(m, &td.pos);
+        td.pos.make_move(m);
+        let child = if td.pos.checkers == 0 {
+            let ev = evaluate_pos(td, false);
+            Some((ev, td.pos.key, td.used_lazy_eval))
+        } else {
+            None
+        };
+        td.pos.unmake_move(m);
+        td.nnue.pop();
+        let Some((ev, key, lazy)) = child else {
+            st!(td, s, s.child_eval[3] += 1;);
+            continue;
+        };
+        st!(td, s, s.child_eval[1] += 1;);
+        debug_assert!(!is_beyond_eval(ev), "child eval: {ev} looks like a proof");
+        if tune::CHILD_EVAL_STORE() != 0 && !lazy {
+            shared.tt.store(
+                key,
+                crate::tt::DEPTH_EVAL_ONLY,
+                ev,
+                SCORE_NONE,
+                Bound::None,
+                Move::NONE,
+                ply as i32 + 1,
+                false,
+            );
+        }
+        let gain = if tune::CHILD_EVAL_CENTER() != 0 {
+            -ev - node_raw_eval
+        } else {
+            -ev
+        };
+        picker.adjust_pending_quiet(
+            i,
+            gain * tune::CHILD_EVAL_MUL(),
+        );
+        changed = true;
+    }
+    if changed {
+        picker.resort_quiets(false);
+    }
+}
+
 /// Lazy eval, in quiescence only (`allow_lazy`): when NNUE is loaded and the
 /// incremental PeSTO score exceeds `LAZY_EVAL_THRESHOLD`, skip the expensive NNUE
 /// forward pass and return PeSTO directly. The main search always asks the
@@ -301,6 +426,9 @@ fn handicapped_eval(td: &mut ThreadData) -> i32 {
 /// Skip distant conthist updates when in check: only offsets 1 and 2 are
 /// updated while in check, avoiding noise in the distant continuation
 /// history tables (offsets 4 and 6).
+///
+/// Every table saturates on the move's combined continuation score, weighted
+/// towards the most recent moves (2, 1, 1, 1/2), not on its own entry alone.
 fn update_continuation_histories(
     td: &mut ThreadData,
     ply: usize,
@@ -309,18 +437,34 @@ fn update_continuation_histories(
     bonus: i32,
     in_check: bool,
 ) {
-    for offset in [1, 2, 4, 6] {
+    const OFFSETS: [usize; 4] = [1, 2, 4, 6];
+    let idx = ply + SS_OFFSET;
+    let mut ptrs = [std::ptr::null_mut(); 4];
+    let mut base = 0;
+    for (k, &offset) in OFFSETS.iter().enumerate() {
+        if idx >= offset {
+            let entry = &td.stack[idx - offset];
+            if entry.played_move != Move::NONE {
+                ptrs[k] = entry.conthist_ptr;
+                let v = ContinuationHistory::get(entry.conthist_ptr, piece, to);
+                // The previous move weighs double, the oldest one half.
+                base += match offset {
+                    1 => 2 * v,
+                    6 => v / 2,
+                    _ => v,
+                };
+            }
+        }
+    }
+    let gravity = tune::CONT_GRAVITY();
+    for (k, &offset) in OFFSETS.iter().enumerate() {
         // While in check, skip writes to the distant continuation histories (ss-4, ss-6)
         if in_check && offset > 2 {
             break;
         }
-        let idx = ply + SS_OFFSET;
-        if idx >= offset {
-            let entry = &td.stack[idx - offset];
-            if entry.played_move != Move::NONE {
-                let ch_bonus = if offset >= 4 { bonus / 2 } else { bonus };
-                ContinuationHistory::update(entry.conthist_ptr, piece, to, ch_bonus);
-            }
+        if !ptrs[k].is_null() {
+            let ch_bonus = if offset >= 4 { bonus / 2 } else { bonus };
+            ContinuationHistory::update_with_base(ptrs[k], piece, to, ch_bonus, base, gravity);
         }
     }
 }
@@ -1580,6 +1724,7 @@ fn alpha_beta<NT: NodeType>(
 
     // Leaf node: drop into quiescence
     if depth <= 0 {
+        qss! { crate::qsstat::call(crate::qsstat::K_LEAF); }
         return quiescence::<NT>(td, shared, alpha, beta, ply);
     }
 
@@ -1688,6 +1833,9 @@ fn alpha_beta<NT: NodeType>(
     let tt_bound;
     let tt_hit;
     let excluded = td.ss(ply).excluded;
+    // What the probe found, for the telemetry later in the node.
+    #[cfg(feature = "stats")]
+    let tinfo: crate::ttstat::HitInfo;
     st!(td, s, s.tt_probes += 1;);
     if let Some(hit) = shared
         .tt
@@ -1706,6 +1854,10 @@ fn alpha_beta<NT: NodeType>(
                 s.tt_move_available += 1;
             }
         });
+        #[cfg(feature = "stats")]
+        {
+            tinfo = tt_telemetry::main_probe::<NT>(td, shared, Some(&hit), depth, alpha, beta, excluded);
+        }
         // TT cutoff: skip at PV nodes, skip during SE search,
         // skip at high halfmove_clock (Graph History Interaction fix).
         // The score is checked as well as the bound: a slot read while another thread
@@ -1723,8 +1875,19 @@ fn alpha_beta<NT: NodeType>(
                 Bound::Upper => hit.score <= alpha,
                 _ => false,
             };
-            if cutoff {
+            // Up to depth TT_CUT_GUARD_DEPTH a fail-high is taken from the table only
+            // where a cutoff is expected: at any other node it contradicts the
+            // expectation and is searched instead. A fail-low is taken everywhere.
+            // At 0 the guard is off, the depth being at least 1 here.
+            debug_assert!(alpha == beta - 1, "TT cutoff outside a null window");
+            debug_assert!(depth >= 1, "TT cutoff at depth {depth}");
+            let guard_depth = tune::TT_CUT_GUARD_DEPTH();
+            debug_assert!(guard_depth >= 0, "TT cutoff guard depth {guard_depth}");
+            let expected = cut_node || hit.score <= alpha || depth > guard_depth;
+            if cutoff && expected {
                 st!(td, s, s.tt_cutoffs += 1;);
+                #[cfg(feature = "stats")]
+                crate::ttstat::inc(&crate::ttstat::C.cut[1]);
                 tree_ret!(td, ply, crate::tree::X_TT_CUTOFF, depth, hit.score);
             }
         }
@@ -1732,6 +1895,10 @@ fn alpha_beta<NT: NodeType>(
         tt_hit = false;
         tt_move = Move::NONE;
         tt_bound = Bound::Upper;
+        #[cfg(feature = "stats")]
+        {
+            tinfo = tt_telemetry::main_probe::<NT>(td, shared, None, depth, alpha, beta, excluded);
+        }
     }
 
     // At the root the move searched first is the one this thread has established for
@@ -1779,6 +1946,8 @@ fn alpha_beta<NT: NodeType>(
         } else {
             Bound::Exact
         };
+        #[cfg(feature = "stats")]
+        crate::ttstat::set_origin(crate::ttstat::O_TB, NT::PV);
         shared.tt.store(
             td.pos.key,
             (depth + 6).min(MAX_PLY as i32 - 1),
@@ -1815,6 +1984,8 @@ fn alpha_beta<NT: NodeType>(
         } else {
             Bound::Exact
         };
+        #[cfg(feature = "stats")]
+        crate::ttstat::set_origin(crate::ttstat::O_TB, NT::PV);
         shared.tt.store(
             td.pos.key,
             (depth + 6).min(MAX_PLY as i32 - 1),
@@ -1850,6 +2021,8 @@ fn alpha_beta<NT: NodeType>(
         } else {
             Bound::Exact
         };
+        #[cfg(feature = "stats")]
+        crate::ttstat::set_origin(crate::ttstat::O_TB, NT::PV);
         shared.tt.store(
             td.pos.key,
             (depth + 6).min(MAX_PLY as i32 - 1),
@@ -1894,6 +2067,8 @@ fn alpha_beta<NT: NodeType>(
             || (bound == Bound::Upper && tb_score <= alpha)
         {
             // Store in TT with depth bonus (depth + 6)
+            #[cfg(feature = "stats")]
+            crate::ttstat::set_origin(crate::ttstat::O_TB, NT::PV);
             shared.tt.store(
                 td.pos.key,
                 (depth + 6).min(MAX_PLY as i32 - 1),
@@ -1964,6 +2139,8 @@ fn alpha_beta<NT: NodeType>(
         td.used_lazy_eval = false;
         raw_eval = if tt_eval != SCORE_NONE {
             st!(td, s, s.tt_eval_reused += 1;);
+            #[cfg(feature = "stats")]
+            tt_telemetry::eval_reuse(crate::ttstat::MAIN, tinfo);
             tt_eval
         } else {
             evaluate_pos(td, false)
@@ -2044,6 +2221,8 @@ fn alpha_beta<NT: NodeType>(
         // final store writes it, so that the correction is applied afresh on reading.
         if !tt_hit && excluded == Move::NONE && !td.used_lazy_eval {
             st!(td, s, s.tt_stores += 1;);
+            #[cfg(feature = "stats")]
+            crate::ttstat::set_origin(crate::ttstat::O_EVAL, NT::PV);
             shared.tt.store(
                 td.pos.key,
                 crate::tt::DEPTH_EVAL_ONLY,
@@ -2117,12 +2296,30 @@ fn alpha_beta<NT: NodeType>(
         let bonus = (tune::STATIC_HIST_FACTOR() * -(static_eval + td.ss(ply - 1).static_eval)
             / 128)
             .clamp(tune::STATIC_HIST_MIN(), tune::STATIC_HIST_MAX());
+        let prev_move = td.ss(ply - 1).played_move;
         td.history.update(
             td.pos.side_to_move.flip(),
-            td.ss(ply - 1).played_move,
+            prev_move,
             td.pos.prior_threats(),
             bonus,
         );
+        // The same signal to the pawn history, when the previous move left the pawn
+        // structure as it was: the current pawn key is then the parent's.
+        let prev_piece = td.ss(ply - 1).moved_piece;
+        if !tt_hit
+            && prev_piece.piece_type() != PieceType::Pawn
+            && prev_move.move_type() != MT_PROMOTION
+        {
+            debug_assert!(prev_piece != Piece::NONE, "static history: no moved piece");
+            debug_assert!(
+                prev_move.move_type() == MT_CASTLING
+                    || td.pos.board[prev_move.to_sq().index()] == prev_piece,
+                "static history: moved piece not on its target square"
+            );
+            let pawn_bonus = bonus * tune::STATIC_PAWN_HIST_MUL() / 1024;
+            td.pawn_history
+                .update(td.pos.pawn_key, prev_piece, prev_move.to_sq(), pawn_bonus);
+        }
     }
 
     // Hindsight depth adjustment:
@@ -2177,6 +2374,8 @@ fn alpha_beta<NT: NodeType>(
         in_check || !is_beyond_eval(eval),
         "alpha_beta: refined eval {eval} beyond the evaluation band"
     );
+    #[cfg(feature = "stats")]
+    tt_telemetry::refine(tinfo, eval, static_eval);
 
     // RFP ttHit multiplier: the RFP multiplier is modulated by ttHit.
     // Without TT info, the discount shrinks the mult → smaller margin →
@@ -2258,7 +2457,10 @@ fn alpha_beta<NT: NodeType>(
             ply,
             crate::tree::X_RAZOR_TO_QS,
             depth,
-            quiescence::<NT>(td, shared, alpha, beta, ply)
+            {
+                qss! { crate::qsstat::call(crate::qsstat::K_RAZOR); }
+                quiescence::<NT>(td, shared, alpha, beta, ply)
+            }
         );
     }
 
@@ -2463,7 +2665,8 @@ fn alpha_beta<NT: NodeType>(
                 break;
             }
 
-            // Manual SEE filter: new_qsearch yields SEE >= 0, ProbCut needs higher
+            // Manual SEE filter: new_qsearch only drops captures under the good/bad split
+            // threshold (GOOD_CAP_BASE - caphist / GOOD_CAP_HIST_DIV), ProbCut needs higher
             if m != pc_tt_move && !crate::see::see(&td.pos, m, see_threshold) {
                 continue;
             }
@@ -2506,6 +2709,7 @@ fn alpha_beta<NT: NodeType>(
             // here as well made the counter skip a value, and a skipped multiple of
             // 512 was a skipped limit check)
             tr!(td, t, t.mv(ply as u8, m.0, 0, 255, crate::tree::A_PROBCUT_QS, 0, 0););
+            qss! { crate::qsstat::call(crate::qsstat::K_PROBCUT); }
             let mut score =
                 -quiescence::<NonPv>(td, shared, -probcut_beta, -probcut_beta + 1, ply + 1);
 
@@ -2538,6 +2742,8 @@ fn alpha_beta<NT: NodeType>(
                 // The depth the cut proves: the child searched at pc_depth, so this
                 // node at one more. A fixed `depth - 3` only matched a reduction of 4,
                 // and the SPSA has moved the reduction since.
+                #[cfg(feature = "stats")]
+                crate::ttstat::set_origin(crate::ttstat::O_PROBCUT, NT::PV);
                 shared.tt.store(
                     td.pos.key,
                     pc_depth + 1,
@@ -2570,6 +2776,7 @@ fn alpha_beta<NT: NodeType>(
 
     let stm = td.pos.side_to_move;
     let mut best_score = syzygy_min; // -SCORE_INFINITE, or TB lower bound if set
+    let mut mo_probe = crate::mostat::NodeProbe::new(depth, alpha, tt_move != Move::NONE);
     let mut best_move = Move::NONE;
     let mut move_count = 0u32;
 
@@ -2578,10 +2785,16 @@ fn alpha_beta<NT: NodeType>(
     let mut quiet_count: usize = 0;
     // How many moves at this node have already raised alpha.
     let mut alpha_raises = 0i32;
+    // The alpha the best move was searched against: on a fail-high, `alpha` itself
+    // has already taken the score.
+    let mut alpha_before_best = alpha;
 
     // Track capture moves searched (for capture history malus on cutoff)
     let mut captures_searched: ArrayBuf<Move, MAX_CAPTURES_SEARCHED> = ArrayBuf::new();
     let mut capture_count: usize = 0;
+    // Reduced searches that failed high at this node, and PV null-window searches
+    // at full depth that landed inside the window.
+    let mut fail_high_researches = 0i32;
 
     // Look up countermove from previous ply
     let countermove = if ply >= 1 {
@@ -2616,8 +2829,24 @@ fn alpha_beta<NT: NodeType>(
     // would wrap there into the last entry, not the first.
     debug_assert!(depth >= 1, "move loop entered at depth {depth}");
 
+    // Child evaluation of the best quiets (see `child_eval_rescore`): once, when the
+    // picker reaches the quiets of a deep node without a TT move. The picker pauses
+    // there (it returns no move once), and the quiets are generated and rescored here.
+    let mut child_eval_pending = !in_check
+        && tt_move == Move::NONE
+        && excluded == Move::NONE
+        && depth >= tune::CHILD_EVAL_MIN_DEPTH()
+        && raw_eval != SCORE_NONE
+        && !td.skill.active
+        && ply + 1 < MAX_PLY
+        && nnue::network::has_network();
+
+    if child_eval_pending {
+        picker.pause_before_quiets();
+    }
+
     loop {
-        let m = picker.next::<false>(
+        let mut m = picker.next::<false>(
             &td.pos,
             &td.history,
             &td.cap_history,
@@ -2627,6 +2856,30 @@ fn alpha_beta<NT: NodeType>(
             &td.stack,
             stm,
         );
+        if m == Move::NONE && child_eval_pending && picker.at_quiet_generation() {
+            child_eval_pending = false;
+            picker.generate_quiets(
+                &td.pos,
+                &td.history,
+                &td.pawn_history,
+                &shared.tt,
+                ply,
+                &td.stack,
+                stm,
+            );
+            settle_accumulators(td, &mut accumulators_owed);
+            child_eval_rescore(td, shared, &mut picker, ply, raw_eval, beta);
+            m = picker.next::<false>(
+                &td.pos,
+                &td.history,
+                &td.cap_history,
+                &td.pawn_history,
+                &shared.tt,
+                ply,
+                &td.stack,
+                stm,
+            );
+        }
         if m == Move::NONE {
             break;
         }
@@ -2714,8 +2967,10 @@ fn alpha_beta<NT: NodeType>(
         // Quiet skipping is enforced inside the MovePicker (skip_quiet_moves):
         // once armed, quiet stages are bypassed so skipped quiets never reach
         // this loop nor inflate move_count.
+        let is_refutation =
+            is_quiet_move && (m == killers[0] || m == killers[1] || m == countermove);
         debug_assert!(
-            !(skip_quiets && is_quiet_move),
+            !(skip_quiets && is_quiet_move) || is_refutation,
             "search: picker yielded quiet {} while skip_quiets armed",
             m.to_uci()
         );
@@ -2755,13 +3010,13 @@ fn alpha_beta<NT: NodeType>(
                 + td.conthist(ply, 2, moved_piece, to)
                 + td.conthist(ply, 4, moved_piece, to)
         } else {
-            td.cap_history.get(moved_piece, m.to_sq(), captured_pt)
+            td.cap_history.get(td.pos.threats, moved_piece, m.to_sq(), captured_pt)
         };
 
         // Bad-noisy futility: on the losing-capture stage, if static eval plus
         // a margin that grows with the would-be LMR depth and the captured
         // piece still cannot reach alpha, the remaining worse captures will
-        // not either. Breaks the move loop (last stage).
+        // not either. Skips the rest of the losing-capture stage.
         if !NT::ROOT
             && !in_check
             && !is_quiet_move
@@ -2794,7 +3049,10 @@ fn alpha_beta<NT: NodeType>(
                         best_score = futility;
                     }
                     st!(td, s, s.bnfp_pruned[crate::stats::db(depth)] += 1;);
-                    break;
+                    // The worse captures go too; the held-back bad quiets, if
+                    // any, still come after them.
+                    picker.skip_bad_captures();
+                    continue;
                 }
             }
         }
@@ -2899,17 +3157,28 @@ fn alpha_beta<NT: NodeType>(
 
         // Late move pruning (move count pruning): after enough moves at a shallow
         // depth, remaining quiets are unlikely to be best. Threshold is quadratic
-        // in depth, halved when improving (be more selective).
+        // in depth, halved when not improving (be more selective), and moved by
+        // the move's history: a quiet with a good record waits longer before
+        // the cut, a bad one is cut sooner.
         // Check guard: spares the current move only. Pruning arms
         // skip_quiet_moves(), so quiet checks later in the list are skipped
         // with the other quiets — deliberate: searching them was measured
         // no better.
         //
         // Reference: CPW — Futility Pruning § Move Count Based Pruning
+        let lmp_history = if is_quiet_move { combined_history } else { 0 };
+        debug_assert!(lmp_history.abs() <= 8 * 16384, "lmp history {lmp_history}");
+        // The killers and the countermove are exempt: they used to be searched
+        // before any quiet, ahead of the cut, and keep that protection now that
+        // they are sorted with the other quiets.
         if !NT::PV
             && !in_check
             && !is_loss(best_score)
-            && move_count as i32 >= (depth * depth + tune::LMP_BASE()) / (2 - improving as i32)
+            && !is_refutation
+            && move_count as i32 * 1024
+                >= (depth * depth + tune::LMP_BASE()) / (2 - improving as i32) * 1024
+                    + tune::LMP_HIST_MUL() * lmp_history / 1024
+                    - 512
             && !move_gives_check(&td.pos)
         {
             skip_quiets = true;
@@ -3115,6 +3384,7 @@ fn alpha_beta<NT: NodeType>(
             se.cont_corr_ptr = cont_corr_ptr;
         }
 
+        mo_probe.on_move(td.nodes);
         // Node fraction TM: snapshot before recursive search
         let nodes_before = if NT::ROOT { td.nodes } else { 0 };
 
@@ -3176,7 +3446,9 @@ fn alpha_beta<NT: NodeType>(
             let r = {
                 let ln_mc = LMR_LN[(move_count as usize).min(63)];
                 let ln_d = LMR_LN[(depth as usize).min(63)];
-                let mut r = tune::LMR_LOG_MUL() * ln_mc * ln_d / 1024 + tune::LMR_LOG_BASE();
+                let mut r = tune::LMR_LOG_MUL() * ln_mc * ln_d / 1024
+                    + tune::LMR_LOG_BASE()
+                    + crate::mostat::placebo();
 
                 if is_quiet_move {
                     r += tune::LMR_QUIET_BASE();
@@ -3336,6 +3608,7 @@ fn alpha_beta<NT: NodeType>(
 
                 // Adaptive re-search: adjust depth based on score vs best
                 if s > alpha {
+                    fail_high_researches += 1;
                     if !NT::ROOT {
                         // Only a search that was really reduced is deepened: a
                         // move searched at full depth (or extended) has already
@@ -3399,6 +3672,7 @@ fn alpha_beta<NT: NodeType>(
                     false,
                     !cut_node,
                 );
+                fail_high_researches += (NT::PV && s > alpha && s < beta) as i32;
             }
 
             // PV re-search with full window
@@ -3413,6 +3687,13 @@ fn alpha_beta<NT: NodeType>(
             let mut line = [Move::NONE; MAX_PLY + 1];
             line[0] = m;
             let child_len = td.pv_len[ply + 1].min(MAX_PLY);
+            #[cfg(feature = "stats")]
+            {
+                if child_len == 0 {
+                    let probe = shared.tt.probe(td.pos.key, (ply + 1) as i32, td.pos.halfmove_clock);
+                    let _ = crate::ttstat::probe(&shared.tt, crate::ttstat::OTHER, td.pos.key, probe.as_ref());
+                }
+            }
             let len = if child_len > 0 {
                 line[1..=child_len].copy_from_slice(&td.pv[ply + 1][..child_len]);
                 child_len + 1
@@ -3493,8 +3774,10 @@ fn alpha_beta<NT: NodeType>(
             // The usual form: `if (value > alpha) bestMove = move`.
             if score > alpha {
                 best_move = m;
+                alpha_before_best = alpha;
                 alpha = score;
                 alpha_raises += 1;
+                mo_probe.on_best();
 
                 // A root move overtaking the one the previous iteration liked is
                 // what time management calls instability. Counted on the first PV
@@ -3525,6 +3808,16 @@ fn alpha_beta<NT: NodeType>(
 
                 if score >= beta {
                     let fh = td.ss(ply).failhighs;
+                    if !NT::ROOT && excluded == Move::NONE {
+                        let cat = if m == tt_move {
+                            crate::mostat::CAT_TT
+                        } else if is_quiet_move {
+                            crate::mostat::CAT_QUIET
+                        } else {
+                            crate::mostat::CAT_NOISY
+                        };
+                        mo_probe.on_cut(cat, td.nodes);
+                    }
                     td.ss_mut(ply).failhighs = fh.saturating_add(1);
                     st!(td, s, {
                         s.cutoffs += 1;
@@ -3536,8 +3829,15 @@ fn alpha_beta<NT: NodeType>(
                             crate::stats::move_category(&td.pos, m, tt_move, killers, countermove);
                         s.cutoff_by_cat[cat] += 1;
                     });
-                    let mut bonus = stat_bonus(depth);
-                    let malus = stat_malus(depth);
+                    // A cutoff that clears beta by a wide margin, or that the
+                    // evaluation did not see coming, teaches as a deeper one would:
+                    // one ply more for each, bonus and malus alike.
+                    let hist_depth = depth
+                        + (score > beta + tune::HIST_HIGH_MARGIN()) as i32
+                        + (!in_check && eval <= score) as i32;
+                    debug_assert!(hist_depth >= depth && hist_depth <= depth + 2);
+                    let mut bonus = stat_bonus(hist_depth);
+                    let mut malus = stat_malus(hist_depth);
 
                     // Non-PV best move history bonus move-count scaling:
                     // at non-PV nodes, amplify the bonus in proportion to the
@@ -3550,6 +3850,14 @@ fn alpha_beta<NT: NodeType>(
                         bonus +=
                             (bonus as i64 * total_searched / tune::BESTMOVE_MC_DIV() as i64) as i32;
                     }
+
+                    // The more searches failed high before this cutoff, the more the
+                    // node's order was wrong: bonus and malus grow with their number,
+                    // `1 + min(n, cap) * 10 / div10`.
+                    let fh = fail_high_researches.min(tune::NFH_CAP());
+                    debug_assert!(fh >= 0);
+                    bonus += bonus * fh * 10 / tune::NFH_DIV10();
+                    malus += malus * fh * 10 / tune::NFH_DIV10();
 
                     if is_quiet_move {
                         // Killer + countermove update
@@ -3598,8 +3906,13 @@ fn alpha_beta<NT: NodeType>(
                         }
                     } else {
                         // Capture cutoff: bonus for the best capture
-                        td.cap_history
-                            .update(moved_piece, m.to_sq(), captured_pt, bonus);
+                        td.cap_history.update(
+                            td.pos.threats,
+                            moved_piece,
+                            m.to_sq(),
+                            captured_pt,
+                            bonus,
+                        );
                     }
 
                     // Malus for all non-best captures that were tried
@@ -3608,6 +3921,7 @@ fn alpha_beta<NT: NodeType>(
                             let cap_piece = td.pos.board[cap_m.from_sq().index()];
                             let cap_captured_pt = get_captured_pt(&td.pos, cap_m);
                             td.cap_history.update(
+                                td.pos.threats,
                                 cap_piece,
                                 cap_m.to_sq(),
                                 cap_captured_pt,
@@ -3627,6 +3941,9 @@ fn alpha_beta<NT: NodeType>(
         s.quiet_skips_ungenerated += ungenerated as u64;
     });
 
+    if !NT::ROOT && excluded == Move::NONE {
+        mo_probe.on_exit(NT::PV, best_move != Move::NONE, best_score, beta);
+    }
     // Checkmate or stalemate
     if move_count == 0 {
         if excluded != Move::NONE {
@@ -3657,6 +3974,23 @@ fn alpha_beta<NT: NodeType>(
         } else {
             tree_ret!(td, ply, crate::tree::X_STALEMATE, depth, 0);
         }
+    }
+
+    // Fail-high blend: a score that clears beta is pulled back towards it, `depth`
+    // parts of the score for one of beta, so the shallower the search the less its
+    // overshoot is believed. The blended value is the node's result: what it
+    // returns, what the table stores and what the correction history learns from.
+    // Never when the score, or the alpha it was searched against, is a proof rather
+    // than an evaluation.
+    if best_score >= beta && !is_beyond_eval(best_score) && !is_beyond_eval(alpha_before_best) {
+        debug_assert!(depth >= 1, "fail-high blend at depth {depth}");
+        debug_assert!(best_move != Move::NONE, "fail-high without a move");
+        let blended = (best_score * depth + beta) / (depth + 1);
+        debug_assert!(
+            blended >= beta && blended <= best_score,
+            "fail-high blend {blended} outside [{beta}, {best_score}]"
+        );
+        best_score = blended;
     }
 
     // A PV node in a tablebase loss returns at most the table's value. Capped here,
@@ -3747,6 +4081,7 @@ fn alpha_beta<NT: NodeType>(
                     pcm_cap_bonus
                 );
                 td.cap_history.update(
+                    td.pos.prior_threats(),
                     prev.moved_piece,
                     prior_move.to_sq(),
                     cap_piece.piece_type(),
@@ -3861,6 +4196,8 @@ fn alpha_beta<NT: NodeType>(
             best_move.from_sq().0
         );
         st!(td, s, s.tt_stores += 1;);
+        #[cfg(feature = "stats")]
+        tt_telemetry::final_store(td, bound, best_move, tt_move, NT::PV, NT::ROOT);
         shared.tt.store(
             td.pos.key, depth, raw_eval, best_score, bound, best_move, ply as i32, tt_pv,
         );
@@ -3878,7 +4215,9 @@ fn alpha_beta<NT: NodeType>(
 /// - No null move, no LMR, no extensions
 /// - Stand-pat: use static eval as lower bound (not when in check)
 /// - In check: generate ALL evasions (captures + quiets)
-/// - Not in check: generate captures + queen promotions only
+/// - Not in check: generate captures (every capture-promotion included) and queen
+///   push-promotions, all yielded best score first; the loop's futility and SEE
+///   gates decide which are searched
 ///
 /// Reference: CPW — [Quiescence Search](https://www.chessprogramming.org/Quiescence_Search)
 fn quiescence<NT: NodeType>(
@@ -3908,8 +4247,12 @@ fn quiescence<NT: NodeType>(
         ply
     );
 
+    #[cfg(feature = "stats")]
+    let mut qn = crate::qsstat::Node::enter(NT::PV);
+
     td.check_limits(shared);
     if td.should_stop() {
+        qss! { crate::qsstat::pre_exit(crate::qsstat::X_STOP); }
         return 0;
     }
 
@@ -3930,6 +4273,7 @@ fn quiescence<NT: NodeType>(
 
     // Ply overflow guard
     if ply >= MAX_PLY - 1 {
+        qss! { crate::qsstat::pre_exit(crate::qsstat::X_PLY); }
         return if td.pos.in_check() {
             0
         } else {
@@ -3949,6 +4293,7 @@ fn quiescence<NT: NodeType>(
     if alpha < 0 && td.pos.upcoming_repetition(ply) {
         alpha = 0;
         if alpha >= beta {
+            qss! { crate::qsstat::pre_exit(crate::qsstat::X_UPCOMING); }
             crate::tree::tree_leaf_ret!(
                 td, ply, leaf_flags, alpha_in, beta, crate::tree::X_REPETITION, alpha
             );
@@ -3957,6 +4302,7 @@ fn quiescence<NT: NodeType>(
 
     // Draw detection in qsearch
     if td.pos.is_draw(ply as i32) {
+        qss! { crate::qsstat::pre_exit(crate::qsstat::X_DRAW); }
         crate::tree::tree_leaf_ret!(td, ply, leaf_flags, alpha_in, beta, crate::tree::X_DRAW, 0);
     }
 
@@ -3970,6 +4316,7 @@ fn quiescence<NT: NodeType>(
         && let Some(score) = crate::dtm::probe_position(&td.pos, ply as i32)
     {
         td.tb_hits += 1;
+        qss! { crate::qsstat::pre_exit(crate::qsstat::X_TB); }
         crate::tree::tree_leaf_ret!(
             td, ply, leaf_flags, alpha_in, beta, crate::tree::X_TB_DTM, score
         );
@@ -3979,6 +4326,7 @@ fn quiescence<NT: NodeType>(
     td.qs_nodes += 1;
     td.seldepth = td.seldepth.max(ply as i32 + 1);
     st!(td, s, s.qs_nodes[!NT::PV as usize] += 1;);
+    qss! { qn.counted(td.pos.in_check()); }
     tr!(td, t, {
         let mut f = crate::tree::F_QS;
         if NT::PV {
@@ -4000,6 +4348,9 @@ fn quiescence<NT: NodeType>(
     let mut tt_bound = Bound::None;
     // Propagate the PV flag from the TT (mirrors the TT probe in alpha_beta)
     let mut tt_pv = NT::PV;
+    // What the probe found, for the telemetry later in the node.
+    #[cfg(feature = "stats")]
+    let tinfo: crate::ttstat::HitInfo;
     if let Some(hit) = shared
         .tt
         .probe(td.pos.key, ply as i32, td.pos.halfmove_clock)
@@ -4009,8 +4360,23 @@ fn quiescence<NT: NodeType>(
         tt_score = hit.score;
         tt_bound = hit.bound;
         tt_pv |= hit.pv;
+        #[cfg(feature = "stats")]
+        {
+            tinfo = tt_telemetry::qs_probe(td, shared, Some(&hit), NT::PV, alpha, beta);
+        }
         // TT cutoff: skip at PV nodes, skip at high halfmove_clock (GHI fix), and never
         // on SCORE_NONE, which a racing write can leave under a lower or upper bound
+        qss! {
+            let right = match hit.bound {
+                Bound::Exact => true,
+                Bound::Lower => hit.score >= beta,
+                Bound::Upper => hit.score <= alpha,
+                _ => false,
+            };
+            if !NT::PV && td.pos.halfmove_clock >= 96 && hit.score != SCORE_NONE && right {
+                crate::qsstat::inc(&crate::qsstat::C.tt_cut_hm[0]);
+            }
+        }
         if !NT::PV && td.pos.halfmove_clock < 96 && hit.score != SCORE_NONE {
             let cutoff = match hit.bound {
                 Bound::Exact => true,
@@ -4019,12 +4385,29 @@ fn quiescence<NT: NodeType>(
                 _ => false,
             };
             if cutoff {
+                qss! {
+                    use crate::qsstat::{C, inc};
+                    qn.out(crate::qsstat::O_TT);
+                    inc(&C.tt_cut_depth[crate::qsstat::tt_depth_bucket(hit.depth)]);
+                    inc(&C.tt_cut_bound[match hit.bound {
+                        Bound::Exact => 0,
+                        Bound::Lower => 1,
+                        _ => 2,
+                    }]);
+                    inc(&C.tt_cut_origin[tinfo.origin as usize]);
+                }
                 st!(td, s, s.qs_tt_cutoffs += 1;);
+                #[cfg(feature = "stats")]
+                crate::ttstat::inc(&crate::ttstat::C.qs_cut[1]);
                 tree_ret!(td, ply, crate::tree::X_QS_TT_CUTOFF, 0, hit.score);
             }
         }
     } else {
         tt_move = Move::NONE;
+        #[cfg(feature = "stats")]
+        {
+            tinfo = tt_telemetry::qs_probe(td, shared, None, NT::PV, alpha, beta);
+        }
     }
 
     let in_check = td.pos.in_check();
@@ -4046,16 +4429,44 @@ fn quiescence<NT: NodeType>(
         td.used_lazy_eval = false;
         // Never lazy when the score becomes a training label (datagen, relabel): a
         // decided position would be labelled on PeSTO's scale, half the network's.
+        #[cfg(feature = "stats")]
+        {
+            if tt_eval != SCORE_NONE {
+                tt_telemetry::eval_reuse(crate::ttstat::QS, tinfo);
+            }
+        }
         let raw_eval = if tt_eval != SCORE_NONE {
             tt_eval
         } else {
             evaluate_pos(td, !td.datagen_mode)
         };
         let lazy_eval_qs = td.used_lazy_eval || td.skill.active;
+        qss! {
+            use crate::qsstat::{C, inc};
+            let src = if tt_eval != SCORE_NONE {
+                0
+            } else if td.skill.active {
+                3
+            } else if td.used_lazy_eval {
+                2
+            } else {
+                1
+            };
+            inc(&C.ev[src]);
+            qn.lazy = src == 2;
+            if qn.lazy {
+                inc(&C.acc[3]);
+            }
+        }
         eval_for_tt = if td.used_lazy_eval && !td.skill.active { SCORE_NONE } else { raw_eval };
         // A TT eval leaves the accumulators behind: settled before the first capture
         // is searched, so a stand-pat cutoff skips the update.
         accumulators_owed = tt_eval != SCORE_NONE && nnue::network::has_network();
+        qss! {
+            if accumulators_owed {
+                crate::qsstat::inc(&crate::qsstat::C.acc[0]);
+            }
+        }
         // Lazy eval: PeSTO score used, skip correction history (trained against NNUE)
         let corr_val = if lazy_eval_qs {
             0
@@ -4126,7 +4537,16 @@ fn quiescence<NT: NodeType>(
                 _ => false,
             };
             if use_tt {
+                qss! {
+                    use crate::qsstat::{C, inc};
+                    inc(&C.sp[3]);
+                    if stand_pat >= beta && tt_score < beta {
+                        inc(&C.sp[2]);
+                    }
+                }
                 best_score = tt_score;
+                #[cfg(feature = "stats")]
+                tt_telemetry::standpat_blend(tinfo);
             }
         }
 
@@ -4138,9 +4558,29 @@ fn quiescence<NT: NodeType>(
             } else {
                 best_score
             };
+            qss! {
+                use crate::qsstat::{C, inc};
+                qn.out(crate::qsstat::O_STANDPAT);
+                inc(&C.sp[if stand_pat >= beta { 0 } else { 1 }]);
+                if qn.lazy {
+                    inc(&C.sp[4]);
+                }
+                if ret != best_score {
+                    crate::qsstat::midpoint(&C.sp_mid, best_score, ret);
+                }
+                // Stalemate missed by the stand-pat (#257)
+                inc(&C.stale[3]);
+                let mut buf: ArrayBuf<Move, MAX_MOVES> = ArrayBuf::new();
+                if movegen::generate_legal_moves(&td.pos, &mut buf) == 0 {
+                    inc(&C.stale[0]);
+                }
+                crate::qsstat::take_last_store();
+            }
             // Only store to TT if no prior hit.
             // Overwriting a deeper entry with depth-0 stand-pat pollutes the TT.
             if tt_score == SCORE_NONE {
+                #[cfg(feature = "stats")]
+                crate::ttstat::set_origin(crate::ttstat::O_STANDPAT, NT::PV);
                 shared.tt.store(
                     td.pos.key,
                     0,
@@ -4151,6 +4591,10 @@ fn quiescence<NT: NodeType>(
                     ply as i32,
                     tt_pv,
                 );
+                qss! {
+                    crate::qsstat::inc(&crate::qsstat::C.sp[5]);
+                    crate::qsstat::store_found(&crate::qsstat::C.st_sp);
+                }
             }
             tree_ret!(td, ply, crate::tree::X_QS_STANDPAT, 0, ret);
         }
@@ -4165,6 +4609,7 @@ fn quiescence<NT: NodeType>(
     alpha = alpha.max(mated_in(ply as i32));
     beta = beta.min(mate_in(ply as i32 + 1));
     if alpha >= beta {
+        qss! { qn.out(crate::qsstat::O_MDP); }
         tree_ret!(td, ply, crate::tree::X_QS_MATE_DISTANCE, 0, alpha);
     }
 
@@ -4173,11 +4618,16 @@ fn quiescence<NT: NodeType>(
     let mut picker = if in_check {
         MovePicker::new(tt_move, [Move::NONE; 2], Move::NONE, 0)
     } else {
-        MovePicker::new_qsearch(tt_move)
+        MovePicker::new_qsearch_all(tt_move)
     };
 
     let mut move_count = 0u32;
     let mut skip_quiet_evasions = false;
+    // Noisy moves searched, for the capture history malus on a fail-high
+    let mut qs_captures: ArrayBuf<Move, MAX_CAPTURES_SEARCHED> = ArrayBuf::new();
+    let mut qs_capture_count = 0usize;
+    #[cfg(feature = "stats")]
+    let mut picker_dry = false;
 
     // Futility base: what the stand-pat can reach with a margin, outside the loop
     let futility_base = if !in_check {
@@ -4224,10 +4674,13 @@ fn quiescence<NT: NodeType>(
             )
         };
         if m == Move::NONE {
+            qss! { picker_dry = true; }
             break;
         }
+        qss! { crate::qsstat::inc(&crate::qsstat::C.picked[in_check as usize]); }
 
         if !movegen::is_legal(&td.pos, m) {
+            qss! { crate::qsstat::inc(&crate::qsstat::C.illegal[in_check as usize]); }
             continue;
         }
 
@@ -4244,6 +4697,7 @@ fn quiescence<NT: NodeType>(
             && !in_check
             && !skill::sees_move(&td.skill, td.pos.key, m, ply, easy_to_notice(td, m, ply))
         {
+            qss! { crate::qsstat::inc(&crate::qsstat::C.blind[0]); }
             continue;
         }
 
@@ -4253,6 +4707,15 @@ fn quiescence<NT: NodeType>(
         // The TTMove stage can yield quiets stored from deeper searches; they have
         // no tactical value in qsearch and waste nodes if searched recursively.
         if !in_check && is_quiet(&td.pos, m) {
+            qss! {
+                crate::qsstat::inc(&crate::qsstat::C.ttq_skip[match tt_bound {
+                    Bound::Upper => 1,
+                    Bound::Lower => 2,
+                    Bound::Exact => 3,
+                    _ => 0,
+                }]);
+                qn.ttq_counted = true;
+            }
             continue;
         }
 
@@ -4263,6 +4726,7 @@ fn quiescence<NT: NodeType>(
         // Prevents check chain explosion in Q vs Q endgames.
         let is_quiet_move = is_quiet(&td.pos, m);
         if in_check && skip_quiet_evasions && is_quiet_move {
+            qss! { crate::qsstat::inc(&crate::qsstat::C.evas_skip[0]); }
             continue;
         }
 
@@ -4278,6 +4742,56 @@ fn quiescence<NT: NodeType>(
         // a capture that does not win material (SEE < 1) is not searched. A capture
         // that wins material always is. Exempt recaptures (tactically sharp).
         // (CPW: Futility Pruning)
+        qss! {
+            if !in_check {
+                use crate::qsstat::{C, inc};
+                inc(&C.fut[0]);
+                let ours = !is_recapture
+                    && !is_loss(best_score)
+                    && futility_base <= alpha
+                    && !crate::see::see(&td.pos, m, 1);
+                // The victim-value form, in our units
+                let prev = td.ss(ply - 1).played_move;
+                let sf_exempt = td.pos.gives_check(m)
+                    || (prev != Move::NONE && m.to_sq() == prev.to_sq())
+                    || m.move_type() == MT_PROMOTION;
+                let mut sf = 0;
+                if !sf_exempt && !is_loss(best_score) {
+                    let cap = get_captured_pt(&td.pos, m) as usize;
+                    if futility_base + crate::qsstat::net_value(cap) <= alpha {
+                        sf = 1;
+                    } else {
+                        let thr = ((alpha - futility_base) as i64 * crate::qsstat::NET_PER_CP_DEN as i64
+                            / crate::qsstat::NET_PER_CP_NUM as i64)
+                            .clamp(-20000, 20000) as i32;
+                        if !crate::see::see(&td.pos, m, thr) {
+                            sf = 2;
+                        }
+                    }
+                }
+                inc(&C.sf_fut[match (ours, sf != 0) {
+                    (true, true) => 0,
+                    (true, false) => 1,
+                    (false, true) => 2,
+                    (false, false) => 3,
+                }]);
+                if sf != 0 {
+                    inc(&C.sf_why[sf - 1]);
+                }
+                if ours {
+                    inc(&C.fut[1]);
+                    if td.pos.gives_check(m) {
+                        inc(&C.fut[2]);
+                    }
+                    if m.move_type() == MT_PROMOTION {
+                        inc(&C.fut[3]);
+                    }
+                    if futility_base > best_score {
+                        qn.best_src = crate::qsstat::B_FUTILITY;
+                    }
+                }
+            }
+        }
         if !in_check
             && !is_recapture
             && !is_loss(best_score)
@@ -4308,10 +4822,27 @@ fn quiescence<NT: NodeType>(
         // A quiet evasion never gets here: in check, best_score only stops losing
         // when an evasion holds, and that raises skip_quiet_evasions above.
         // (CPW: Static Exchange Evaluation)
+        qss! {
+            if !is_loss(best_score) {
+                use crate::qsstat::{C, inc};
+                inc(&C.see_pr[4]);
+                let h = td.cap_history.get(td.pos.threats, moved_pc, m.to_sq(), get_captured_pt(&td.pos, m));
+                let with_hist = crate::see::see(&td.pos, m, tune::QS_SEE_THRESHOLD() - h / tune::QS_SEE_HIST_DIV());
+                let plain = crate::see::see(&td.pos, m, tune::QS_SEE_THRESHOLD());
+                if !with_hist {
+                    inc(&C.see_pr[in_check as usize]);
+                    if plain {
+                        inc(&C.see_pr[2]);
+                    }
+                } else if !plain {
+                    inc(&C.see_pr[3]);
+                }
+            }
+        }
         if !is_loss(best_score)
             && !crate::see::see(&td.pos, m, {
                 debug_assert!(!is_quiet_move, "qsearch: quiet evasion reached SEE pruning: {:?}", m);
-                let qs_history = td.cap_history.get(moved_pc, m.to_sq(), get_captured_pt(&td.pos, m));
+                let qs_history = td.cap_history.get(td.pos.threats, moved_pc, m.to_sq(), get_captured_pt(&td.pos, m));
                 tune::QS_SEE_THRESHOLD() - qs_history / tune::QS_SEE_HIST_DIV()
             })
         {
@@ -4348,6 +4879,58 @@ fn quiescence<NT: NodeType>(
             && !is_loss(best_score)
             && !td.pos.gives_check(m)
         {
+            qss! {
+                use crate::qsstat::{C, add, inc};
+                inc(&C.mcb[0]);
+                if qn.ttq_counted {
+                    inc(&C.mcb_why[0]);
+                }
+                if qn.underpromo_counted {
+                    inc(&C.mcb_why[1]);
+                }
+                // The moves the break leaves, the one that triggered it included: the
+                // picker is not used again by the node.
+                let mut left = [0u64; 6];
+                let mut mm = m;
+                loop {
+                    if movegen::is_legal(&td.pos, mm) && !is_quiet(&td.pos, mm) {
+                        left[0] += 1;
+                        if mm.move_type() != MT_CASTLING && mm.to_sq() == recapture_sq {
+                            left[1] += 1;
+                        }
+                        if td.pos.gives_check(mm) {
+                            left[2] += 1;
+                        }
+                        if mm.move_type() == MT_PROMOTION {
+                            left[3] += 1;
+                        }
+                        if crate::see::see(&td.pos, mm, 1) {
+                            left[4] += 1;
+                        }
+                        let pc = td.pos.board[mm.from_sq().index()];
+                        let h = td.cap_history.get(td.pos.threats, pc, mm.to_sq(), get_captured_pt(&td.pos, mm));
+                        if crate::see::see(&td.pos, mm, tune::QS_SEE_THRESHOLD() - h / tune::QS_SEE_HIST_DIV()) {
+                            left[5] += 1;
+                        }
+                    }
+                    mm = picker.next::<true>(
+                        &td.pos,
+                        &td.history,
+                        &td.cap_history,
+                        &td.pawn_history,
+                        &shared.tt,
+                        0,
+                        &td.stack,
+                        stm,
+                    );
+                    if mm == Move::NONE {
+                        break;
+                    }
+                }
+                for i in 0..6 {
+                    add(&C.mcb[i + 1], left[i]);
+                }
+            }
             break;
         }
 
@@ -4365,6 +4948,30 @@ fn quiescence<NT: NodeType>(
         se.conthist_ptr = conthist_ptr;
         se.cont_corr_ptr = cont_corr_ptr;
 
+        qss! {
+            use crate::qsstat::{C, inc};
+            if accumulators_owed && nnue::network::has_network() {
+                inc(&C.acc[1]);
+            }
+            if qn.lazy && qn.searched == 0 {
+                inc(&C.acc[2]);
+            }
+            qn.searched += 1;
+            let k = if m == tt_move {
+                5
+            } else if in_check {
+                if is_quiet_move { 4 } else { 3 }
+            } else if m.move_type() == MT_PROMOTION {
+                if m.promo_type() == PieceType::Queen { 1 } else { 2 }
+            } else {
+                0
+            };
+            inc(&C.srch[k]);
+            if m.move_type() == MT_PROMOTION && m.promo_type() != PieceType::Queen {
+                qn.underpromo_counted = true;
+            }
+            qn.call_child();
+        }
         if nnue::network::has_network() {
             settle_accumulators(td, &mut accumulators_owed);
             td.nnue.push(m, &td.pos);
@@ -4393,11 +5000,18 @@ fn quiescence<NT: NodeType>(
         }
 
         if td.should_stop() {
+            qss! { qn.out(crate::qsstat::O_STOPPED); }
             tree_ret!(td, ply, crate::tree::X_STOPPED, 0, 0);
+        }
+
+        if is_cap && qs_capture_count < MAX_CAPTURES_SEARCHED {
+            qs_captures[qs_capture_count] = m;
+            qs_capture_count += 1;
         }
 
         if score > best_score {
             best_score = score;
+            qss! { qn.best_src = crate::qsstat::B_MOVE; }
 
             // Once any evasion stops losing, capture or not, skip the remaining quiet
             // ones: with no move count limit in check, the only brake on check chains.
@@ -4410,6 +5024,21 @@ fn quiescence<NT: NodeType>(
                 best_move = m;
                 alpha = score;
                 if score >= beta {
+                    qss! {
+                        use crate::qsstat::{C, inc};
+                        inc(&C.fh_idx[(move_count as usize).clamp(1, 12) - 1]);
+                        inc(&C.fh_srch[(qn.searched as usize).clamp(1, 8) - 1]);
+                        let k = if m == tt_move {
+                            0
+                        } else if in_check {
+                            if is_quiet_move { 3 } else { 4 }
+                        } else if m.move_type() == MT_PROMOTION {
+                            2
+                        } else {
+                            1
+                        };
+                        inc(&C.fh_kind[k]);
+                    }
                     st!(td, s, {
                         s.qs_cutoffs += 1;
                         if move_count == 1 {
@@ -4436,6 +5065,7 @@ fn quiescence<NT: NodeType>(
                 ply
             );
         }
+        qss! { qn.out(crate::qsstat::O_MATED); }
         tree_ret!(td, ply, crate::tree::X_QS_MATED, 0, mated_in(ply as i32));
     }
 
@@ -4446,12 +5076,114 @@ fn quiescence<NT: NodeType>(
         ply
     );
 
+    // A noisy move that fails high here is a capture that works: a small capture
+    // history bonus, and optionally a malus to the noisy moves searched before it.
+    if best_score >= beta && best_move != Move::NONE && !is_quiet(&td.pos, best_move) {
+        let bonus = tune::QS_CAP_HIST_BONUS();
+        let malus = tune::QS_CAP_HIST_MALUS();
+        debug_assert!((0..=16384).contains(&bonus) && (0..=16384).contains(&malus));
+        let piece = td.pos.board[best_move.from_sq().index()];
+        debug_assert!(piece != Piece::NONE, "qsearch: best move {:?} has no piece", best_move);
+        let captured_pt = get_captured_pt(&td.pos, best_move);
+        td.cap_history
+            .update(td.pos.threats, piece, best_move.to_sq(), captured_pt, bonus);
+        if malus != 0 {
+            for &cap_m in qs_captures.filled(qs_capture_count) {
+                if cap_m != best_move {
+                    let cap_piece = td.pos.board[cap_m.from_sq().index()];
+                    let cap_pt = get_captured_pt(&td.pos, cap_m);
+                    td.cap_history
+                        .update(td.pos.threats, cap_piece, cap_m.to_sq(), cap_pt, -malus);
+                }
+            }
+        }
+    }
+
     // Beta midpoint: reduce overestimation (½ blending)
     // Never against a bound that is not an evaluation either: with beta the
     // unproven-loss sentinel the midpoint is a ghost score (issue #19).
+    qss! {
+        use crate::qsstat::{C, inc};
+        // Out of check, no fail high: how far the moves took the stand-pat
+        if !in_check && best_score < beta {
+            inc(&C.dres[crate::qsstat::dres_bucket(best_score - stand_pat)]);
+            inc(&C.best_src[qn.best_src as usize]);
+        }
+        // Stalemate missed: no legal capture, and no legal move at all (#257)
+        if !in_check && move_count == 0 {
+            inc(&C.stale[2]);
+            let mut buf: ArrayBuf<Move, MAX_MOVES> = ArrayBuf::new();
+            if movegen::generate_legal_moves(&td.pos, &mut buf) == 0 {
+                inc(&C.stale[1]);
+            }
+        }
+        // The picker ran dry out of check: what the good/bad split kept from the node
+        if !in_check && picker_dry {
+            inc(&C.split[0]);
+            let mut caps: ArrayBuf<crate::types::ScoredMove, MAX_MOVES> = ArrayBuf::new();
+            let n = movegen::generate_captures(&td.pos, &mut caps);
+            let mut first = true;
+            for i in 0..n {
+                let mm = caps[i].mv;
+                if mm == tt_move || !movegen::is_legal(&td.pos, mm) {
+                    continue;
+                }
+                let mt = mm.move_type();
+                let victim = td.pos.board[mm.to_sq().index()];
+                if mt == MT_PROMOTION || (mt != MT_EN_PASSANT && victim == Piece::NONE) {
+                    continue; // threshold 0, and the SEE passes every promotion
+                }
+                let pc = td.pos.board[mm.from_sq().index()];
+                let cpt = get_captured_pt(&td.pos, mm);
+                let h = td.cap_history.get(td.pos.threats, pc, mm.to_sq(), cpt);
+                if crate::see::see(&td.pos, mm, tune::GOOD_CAP_BASE() - h / tune::GOOD_CAP_HIST_DIV()) {
+                    continue;
+                }
+                inc(&C.split[1]);
+                if crate::see::see(&td.pos, mm, 1) {
+                    inc(&C.split[5]);
+                }
+                if crate::see::see(&td.pos, mm, tune::QS_SEE_THRESHOLD() - h / tune::QS_SEE_HIST_DIV()) {
+                    inc(&C.split[2]);
+                    let recap = mm.to_sq() == recapture_sq;
+                    let fut = !recap
+                        && !is_loss(best_score)
+                        && futility_base <= alpha
+                        && !crate::see::see(&td.pos, mm, 1);
+                    if !fut {
+                        inc(&C.split[3]);
+                        if first
+                            && (NT::PV
+                                || recap
+                                || move_count + 1 < tune::QS_MOVE_COUNT_LIMIT() as u32
+                                || td.pos.gives_check(mm))
+                        {
+                            inc(&C.split[4]);
+                        }
+                        first = false;
+                    }
+                }
+            }
+        }
+    }
+    let pre_mid = best_score;
     if best_score >= beta && !is_beyond_eval(best_score) && !is_beyond_eval(beta) {
         best_score = (best_score + beta) / 2;
     }
+    qss! {
+        if pre_mid != best_score {
+            crate::qsstat::midpoint(&crate::qsstat::C.fin_mid, pre_mid, best_score);
+        }
+        qn.out(if best_score >= beta {
+            crate::qsstat::O_FAIL_HIGH
+        } else if best_move != Move::NONE {
+            crate::qsstat::O_RAISED
+        } else {
+            crate::qsstat::O_UPPER
+        });
+        crate::qsstat::take_last_store();
+    }
+    let _ = pre_mid;
 
     // Store to TT
     let bound = if best_score >= beta {
@@ -4459,12 +5191,244 @@ fn quiescence<NT: NodeType>(
     } else {
         Bound::Upper
     };
+    #[cfg(feature = "stats")]
+    crate::ttstat::set_origin(crate::ttstat::O_QS, NT::PV);
     shared.tt.store(
         td.pos.key, 0, eval_for_tt, best_score, bound, best_move, ply as i32, tt_pv,
     );
+    qss! {
+        let found = crate::qsstat::take_last_store();
+        if found < 6 {
+            crate::qsstat::inc(&crate::qsstat::C.st_all[found as usize]);
+            if bound == Bound::Lower {
+                crate::qsstat::inc(&crate::qsstat::C.st_fh[found as usize]);
+            }
+        }
+    }
 
     tr!(td, t, t.exit(ply as u8, crate::tree::X_QS_NORMAL, crate::tree::bound_bits(bound), best_move.0, best_score, move_count, 0););
     best_score
+}
+
+/// Transposition-table telemetry of the search (`--features stats`, see
+/// [`crate::ttstat`]): what the probes of the main search and of the quiescence find,
+/// and what the node does with it. It reads the node and the table, and writes counters
+/// only.
+#[cfg(feature = "stats")]
+mod tt_telemetry {
+    use super::*;
+    use crate::tt::TTHit;
+    use crate::ttstat::{self as ts, C, HitInfo, inc};
+
+    /// Whether a scored entry cuts on the window, ignoring depth.
+    fn right_side(bound: Bound, score: i32, alpha: i32, beta: i32) -> bool {
+        match bound {
+            Bound::Exact => true,
+            Bound::Lower => score >= beta,
+            Bound::Upper => score <= alpha,
+            Bound::None => false,
+        }
+    }
+
+    /// The move of a hit: counted, checked as the picker checks it, and tested for
+    /// legality when it comes from another position. `who` is 0 (main) or 1 (qs).
+    fn hit_move(td: &ThreadData, h: &TTHit, info: HitInfo, who: usize) {
+        if h.mv == Move::NONE {
+            return;
+        }
+        inc(&C.mv_avail[who]);
+        let pseudo_legal = h.mv.is_ok() && movegen::is_pseudo_legal(&td.pos, h.mv);
+        if !pseudo_legal {
+            inc(&C.mv_bad[who]);
+            if info.false_hit {
+                inc(&C.mv_bad_false[who]);
+            }
+        }
+        if info.false_hit && pseudo_legal {
+            inc(&C.false_move[who]);
+            if movegen::is_legal(&td.pos, h.mv) {
+                inc(&C.false_move_legal[who]);
+            }
+        }
+        // A true hit can still hold another position's move: left by a write on its
+        // 16-bit key (see `TT::store_stat`).
+        if info.foreign_move {
+            inc(&C.mv_foreign[who]);
+            if !pseudo_legal {
+                inc(&C.mv_bad_foreign[who]);
+            }
+        }
+    }
+
+    /// The main-search probe of the node: what it found, and whether it cuts.
+    pub(super) fn main_probe<NT: NodeType>(
+        td: &ThreadData,
+        shared: &SharedState,
+        hit: Option<&TTHit>,
+        depth: i32,
+        alpha: i32,
+        beta: i32,
+        excluded: Move,
+    ) -> HitInfo {
+        let mut info = ts::probe(&shared.tt, ts::MAIN, td.pos.key, hit);
+        let b = ts::bucket(depth);
+        inc(&C.main_probe_d[b]);
+        if info.hit {
+            inc(&C.main_hit_d[b]);
+        }
+        // A singular verification searches its node's position again at the same ply.
+        if excluded != Move::NONE {
+            inc(&C.main_probe_se[0]);
+        }
+        let Some(h) = hit else {
+            return info;
+        };
+        hit_move(td, h, info, 0);
+
+        // The pv flag, and whether a quiescence PV node put it there.
+        if h.pv {
+            let from_qs_pv =
+                info.pv_writer && (info.origin == ts::O_STANDPAT || info.origin == ts::O_QS);
+            inc(&C.pv_read[0]);
+            if from_qs_pv {
+                inc(&C.pv_read[1]);
+            }
+            if !NT::PV {
+                inc(&C.pv_read[2]);
+                if from_qs_pv {
+                    inc(&C.pv_read[3]);
+                }
+            }
+        }
+        if info.origin == ts::O_STANDPAT && !info.false_hit {
+            inc(&C.standpat_use[0]);
+        }
+
+        // The cutoff, under the conditions the node checks: non-PV, non-root, no excluded
+        // move, a score.
+        if NT::PV || excluded != Move::NONE || h.score == SCORE_NONE || h.bound == Bound::None {
+            return info;
+        }
+        inc(&C.cut_cand[0]);
+        if h.depth < depth {
+            inc(&C.cut_cand[1]);
+            return info;
+        }
+        inc(&C.cut_cand[2]);
+        if !right_side(h.bound, h.score, alpha, beta) {
+            inc(&C.cut_wrong[0]);
+            if depth > 5 {
+                inc(&C.cut_wrong[1]);
+            }
+            return info;
+        }
+        if td.pos.halfmove_clock >= 96 {
+            inc(&C.cut_cand[3]);
+            return info;
+        }
+        info.cut = true;
+        inc(&C.cut[0]);
+        inc(&C.cut_bound[h.bound as usize - 1]);
+        inc(&C.cut_depth[b]);
+        inc(&C.cut_origin[info.origin as usize]);
+        if info.false_hit {
+            inc(&C.false_cut[0]);
+        }
+        info
+    }
+
+    /// The evaluation a node takes from its entry instead of evaluating.
+    pub(super) fn eval_reuse(consumer: usize, info: HitInfo) {
+        debug_assert!(consumer == ts::MAIN || consumer == ts::QS);
+        let origin = info.origin as usize;
+        if consumer == ts::MAIN {
+            inc(&C.eval_main_origin[origin]);
+        } else {
+            inc(&C.eval_qs_origin[origin]);
+        }
+        if info.false_hit {
+            inc(&C.false_eval[consumer]);
+        }
+    }
+
+    /// The main search's refined eval: the entry's score in place of the static eval.
+    pub(super) fn refine(info: HitInfo, eval: i32, static_eval: i32) {
+        if info.hit && eval != static_eval {
+            inc(&C.refine_origin[info.origin as usize]);
+            if info.origin == ts::O_STANDPAT && !info.false_hit {
+                inc(&C.standpat_use[1]);
+            }
+        }
+    }
+
+    /// The main search's final write: its origin, and whether the TT move was the best one.
+    pub(super) fn final_store(
+        td: &ThreadData,
+        bound: Bound,
+        best_move: Move,
+        tt_move: Move,
+        pv: bool,
+        root: bool,
+    ) {
+        ts::set_origin(ts::O_MAIN, pv);
+        if bound != Bound::Upper
+            && !root
+            && tt_move != Move::NONE
+            && tt_move.is_ok()
+            && movegen::is_pseudo_legal(&td.pos, tt_move)
+        {
+            let i = if bound == Bound::Lower { 0 } else { 2 };
+            inc(&C.mv_best[i]);
+            if tt_move == best_move {
+                inc(&C.mv_best[i + 1]);
+            }
+        }
+    }
+
+    /// The quiescence probe of the node: what it found, and whether it cuts.
+    pub(super) fn qs_probe(
+        td: &ThreadData,
+        shared: &SharedState,
+        hit: Option<&TTHit>,
+        pv: bool,
+        alpha: i32,
+        beta: i32,
+    ) -> HitInfo {
+        let mut info = ts::probe(&shared.tt, ts::QS, td.pos.key, hit);
+        let Some(h) = hit else {
+            return info;
+        };
+        hit_move(td, h, info, 1);
+        if info.origin == ts::O_STANDPAT && !info.false_hit {
+            inc(&C.standpat_use[2]);
+        }
+        if !pv
+            && td.pos.halfmove_clock < 96
+            && h.score != SCORE_NONE
+            && right_side(h.bound, h.score, alpha, beta)
+        {
+            info.cut = true;
+            inc(&C.qs_cut[0]);
+            inc(&C.qs_cut_origin[info.origin as usize]);
+            if info.false_hit {
+                inc(&C.false_cut[1]);
+            }
+            if info.origin == ts::O_STANDPAT && !info.false_hit {
+                inc(&C.standpat_cut[0]);
+                if h.eval == SCORE_NONE {
+                    inc(&C.standpat_cut[1]);
+                }
+            }
+        }
+        info
+    }
+
+    /// The quiescence stand-pat replaced by the entry's score.
+    pub(super) fn standpat_blend(info: HitInfo) {
+        if info.origin == ts::O_STANDPAT && !info.false_hit {
+            inc(&C.standpat_use[3]);
+        }
+    }
 }
 
 #[cfg(test)]
