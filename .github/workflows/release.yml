@@ -13,7 +13,7 @@ jobs:
   # Job 0: Create GitHub release (empty, other jobs upload binaries)
   # ================================================================
   create-release:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
@@ -108,7 +108,7 @@ jobs:
   # ================================================================
   linux-x86:
     needs: create-release
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
@@ -264,7 +264,7 @@ jobs:
   # ================================================================
   linux-arm:
     needs: create-release
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
@@ -343,7 +343,7 @@ jobs:
   # run it. Built headless (--no-default-features): no board, no ALSA.
   android-arm:
     needs: create-release
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
@@ -415,7 +415,7 @@ jobs:
   # ================================================================
   macos-arm:
     needs: create-release
-    runs-on: macos-14
+    runs-on: macos-15
     permissions:
       contents: write
     steps:
@@ -461,7 +461,7 @@ jobs:
   # ================================================================
   web:
     needs: create-release
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
@@ -534,7 +534,7 @@ jobs:
     # Only the public repository publishes. A v* tag pushed anywhere else builds
     # everything and touches nothing on itch.io.
     if: github.repository == 'jromang/gaiachess'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
     steps:
